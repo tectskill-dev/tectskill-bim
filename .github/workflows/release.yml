@@ -1,156 +1,73 @@
 name: Release
 
+# TectSkill BIM: Windows only (ZIP + MSI installer). Push a tag such as v0.7.0
+# (CHANGELOG.md must have a section for that version).
+
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  # Installer tools, pinned (packaging/ holds the files they build from).
+  # Installer tool, pinned (packaging/windows holds the files it builds from).
   WIX_VERSION: "5.0.2"
-  # The AppImage tools are downloaded per architecture (`-<arch>` appended to the URLs).
-  APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool
-  APPIMAGETOOL_SHA256_x86_64: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
-  APPIMAGETOOL_SHA256_aarch64: f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158
-  APPIMAGE_RUNTIME_URL: https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime
-  APPIMAGE_RUNTIME_SHA256_x86_64: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
-  APPIMAGE_RUNTIME_SHA256_aarch64: 00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444
 
 jobs:
   build:
-    name: Build (${{ matrix.target }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: zip
-          # The oldest Ubuntu LTS still in standard support: Linux binaries need
-          # at least the glibc they were built with.
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            archive: tar.gz
-            arch: x86_64
-            deb_arch: amd64
-          - os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            archive: tar.gz
-            arch: aarch64
-            deb_arch: arm64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            archive: tar.gz
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            archive: tar.gz
-    runs-on: ${{ matrix.os }}
+    name: Build (Windows x64)
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-      - run: cargo build --release --locked -p cc_app -p cc_cli --target ${{ matrix.target }}
-      - name: Package
+      - run: cargo build --release --locked -p cc_app -p cc_cli --target x86_64-pc-windows-msvc
+      - name: ZIP (portable)
         shell: bash
         run: |
-          name="constructcad-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          cp README.md README.pt-BR.md LICENSE CHANGELOG.md "dist/$name/"
-          cp examples/casa_simples.ccad "dist/$name/"
-          if [ "${{ matrix.archive }}" = zip ]; then
-            cp "target/${{ matrix.target }}/release/constructcad.exe" "target/${{ matrix.target }}/release/ccad.exe" "dist/$name/"
-            (cd dist && 7z a "$name.zip" "$name" > /dev/null)
-          else
-            cp "target/${{ matrix.target }}/release/constructcad" "target/${{ matrix.target }}/release/ccad" "dist/$name/"
-            tar -C dist -czf "dist/$name.tar.gz" "$name"
-          fi
+          name="tectskill-bim-${GITHUB_REF_NAME}-windows-x64"
+          bin="target/x86_64-pc-windows-msvc/release"
+          mkdir -p "dist/$name/fonts" "dist/$name/examples"
+          cp README.th.md README.md LICENSE CHANGELOG.md "dist/$name/"
+          cp assets/fonts/OFL-Inter.txt assets/fonts/OFL-Sarabun.txt "dist/$name/fonts/"
+          cp examples/casa_simples.ccad "dist/$name/examples/"
+          cp "$bin/tectskill-bim.exe" "$bin/ccad.exe" "dist/$name/"
+          (cd dist && 7z a "$name.zip" "$name" > /dev/null)
           rm -rf "dist/$name"
-
-      # Windows: MSI (WiX v5), per-machine, with an optional PATH entry for ccad.
       - name: Install WiX
-        if: runner.os == 'Windows'
         shell: bash
         run: |
           dotnet tool install --global wix --version "$WIX_VERSION"
           echo "$USERPROFILE\\.dotnet\\tools" >> "$GITHUB_PATH"
           "$USERPROFILE/.dotnet/tools/wix" extension add --global "WixToolset.UI.wixext/$WIX_VERSION"
       - name: MSI installer
-        if: runner.os == 'Windows'
         shell: bash
         run: |
           wix --version
-          version="${GITHUB_REF_NAME#v}"
+          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           python packaging/windows/license_rtf.py LICENSE "$RUNNER_TEMP/License.rtf"
-          wix build packaging/windows/constructcad.wxs -arch x64 -ext WixToolset.UI.wixext \
+          wix build packaging/windows/tectskill-bim.wxs -arch x64 -ext WixToolset.UI.wixext \
             -d "Version=${version%%[-+]*}" \
-            -d "BinDir=target/${{ matrix.target }}/release" \
+            -d "BinDir=target/x86_64-pc-windows-msvc/release" \
             -d "LicenseRtf=$RUNNER_TEMP/License.rtf" \
-            -o "dist/constructcad-${GITHUB_REF_NAME}-x86_64.msi"
-
-      # Linux: .deb (dpkg-deb) and AppImage (appimagetool), built natively on each architecture.
-      - name: Linux packaging tools
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends dpkg-dev desktop-file-utils \
-            patchelf libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 libxcursor1 libxi6
-          desktop-file-validate packaging/linux/constructcad.desktop
-          arch=${{ matrix.arch }}
-          tool_sha="APPIMAGETOOL_SHA256_$arch"
-          runtime_sha="APPIMAGE_RUNTIME_SHA256_$arch"
-          curl -fsSL -o "$RUNNER_TEMP/appimagetool" "$APPIMAGETOOL_URL-$arch.AppImage"
-          curl -fsSL -o "$RUNNER_TEMP/runtime-$arch" "$APPIMAGE_RUNTIME_URL-$arch"
-          echo "${!tool_sha}  $RUNNER_TEMP/appimagetool" | sha256sum -c -
-          echo "${!runtime_sha}  $RUNNER_TEMP/runtime-$arch" | sha256sum -c -
-          chmod +x "$RUNNER_TEMP/appimagetool"
-      - name: Debian package
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          packaging/linux/build-deb.sh "$version" "target/${{ matrix.target }}/release" ${{ matrix.deb_arch }} \
-            "dist/constructcad_${version//-/\~}_${{ matrix.deb_arch }}.deb"
-          dpkg-deb --info dist/*.deb
-          dpkg-deb --contents dist/*.deb
-      - name: AppImage
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          packaging/linux/build-appimage.sh "target/${{ matrix.target }}/release" ${{ matrix.arch }} \
-            "dist/constructcad-${GITHUB_REF_NAME}-${{ matrix.arch }}.AppImage" \
-            "$RUNNER_TEMP/appimagetool" "$RUNNER_TEMP/runtime-${{ matrix.arch }}"
-
-      # macOS: ConstructCAD.app in a .dmg, one per architecture (ccad stays in the archive).
-      - name: DMG
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          packaging/macos/build-dmg.sh "${GITHUB_REF_NAME#v}" "target/${{ matrix.target }}/release/constructcad" \
-            "dist/constructcad-${GITHUB_REF_NAME}-${{ matrix.target }}.dmg"
-
+            -o "dist/tectskill-bim-${GITHUB_REF_NAME}-windows-x64.msi"
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.target }}
+          name: windows-x64
           if-no-files-found: error
           path: |
             dist/*.zip
-            dist/*.tar.gz
             dist/*.msi
-            dist/*.deb
-            dist/*.AppImage
-            dist/*.dmg
 
   release:
     name: Publish release
     needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -176,4 +93,4 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "ConstructCAD $GITHUB_REF_NAME" --notes-file notes.md
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "TectSkill BIM $GITHUB_REF_NAME" --notes-file notes.md
