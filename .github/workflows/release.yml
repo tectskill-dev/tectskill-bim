@@ -88,9 +88,25 @@ jobs:
             echo "::error::CHANGELOG.md has no section for $version"
             exit 1
           fi
+          {
+            echo "TectSkill BIM $GITHUB_REF_NAME — BIM ภาษาไทย ใช้ฟรีและเปิดซอร์สโค้ด พัฒนาต่อจาก ConstructCAD ของ Francis Rebouças"
+            echo
+            echo "ดาวน์โหลดไฟล์ .msi เพื่อติดตั้งบน Windows หรือไฟล์ .zip เพื่อใช้งานโดยไม่ต้องติดตั้ง"
+            echo
+            echo "## การเปลี่ยนแปลงของ ConstructCAD $version"
+            echo
+            cat notes.md
+          } > release-notes.md
       - name: Checksums
         run: cd dist && sha256sum * > SHA256SUMS.txt
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "TectSkill BIM $GITHUB_REF_NAME" --notes-file notes.md
+        # A release made on the website first (which creates the tag) gets the files added.
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+            gh release edit "$GITHUB_REF_NAME" --title "TectSkill BIM $GITHUB_REF_NAME" --notes-file release-notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --title "TectSkill BIM $GITHUB_REF_NAME" --notes-file release-notes.md
+          fi
