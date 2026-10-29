@@ -7,7 +7,7 @@ version = "0.7.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 authors = ["Francis Rebouças <francisreboucas@gmail.com>"]
-repository = "https://github.com/francisreboucas/constructcad"
+repository = "https://github.com/tectskill-dev/tectskill-bim"
 
 [workspace.dependencies]
 cc_core = { path = "crates/cc_core" }
@@ -39,6 +39,10 @@ env_logger = "0.11"
 resvg = { version = "0.45.1", default-features = false }
 # Glyph outlines for raster export (cc_views), the version egui already uses.
 skrifa = { version = "0.44.0", default-features = false, features = ["std"] }
+# Text shaping for exported glyphs (the version egui already uses).
+harfrust = "0.12.0"
+# Font subsets embedded in exported PDFs.
+subsetter = { version = "0.2.6", default-features = false }
 # Update notice (cc_app): HTTPS with rustls, no other TLS stack.
 ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
 

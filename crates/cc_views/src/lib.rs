@@ -17,9 +17,11 @@ mod joins;
 mod legend;
 mod mep;
 pub mod notes;
+mod pdf_fonts;
 mod plan;
 mod projected;
 mod schedule;
+mod shaping;
 mod sheet;
 
 pub use annotate::{DimensionLayout, HIGHLIGHT_ONLY, dimension_layout};

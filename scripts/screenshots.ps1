@@ -29,7 +29,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$app = Join-Path $root 'target/release/constructcad.exe'
+$app = Join-Path $root 'target/release/tectskill-bim.exe'
 $cli = Join-Path $root 'target/release/ccad.exe'
 $macro = Join-Path $root 'examples/showcase.ccmacro'
 foreach ($exe in $app, $cli) {

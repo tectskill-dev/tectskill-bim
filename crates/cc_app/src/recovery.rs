@@ -19,7 +19,7 @@ const CRASH_LOG_LIMIT: u64 = 1 << 20;
 
 /// The app's data folder (where eframe keeps its preferences).
 fn data_dir() -> Option<PathBuf> {
-    eframe::storage_dir("ConstructCAD")
+    eframe::storage_dir("TectSkill BIM")
 }
 
 /// The folder of the recovery copies.
@@ -257,7 +257,7 @@ fn write_crash_entry(path: &Path, what: &str) {
     let backtrace = std::backtrace::Backtrace::force_capture();
     let _ = writeln!(
         file,
-        "--- ConstructCAD {} ({} {}), {} s after the Unix epoch\n{what}\n{backtrace}\n",
+        "--- TectSkill BIM {} ({} {}), {} s after the Unix epoch\n{what}\n{backtrace}\n",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,

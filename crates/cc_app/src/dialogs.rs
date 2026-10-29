@@ -278,7 +278,7 @@ fn about(ctx: &Context, state: &mut AppState) {
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
                     ui.add_space(8.0);
-                    ui.label(RichText::new("ConstructCAD").family(theme::semibold()).size(22.0).color(PALETTE.text));
+                    ui.label(RichText::new("TectSkill BIM").family(theme::semibold()).size(22.0).color(PALETTE.text));
                     let version = format!("{} {}", t!("about-version"), env!("CARGO_PKG_VERSION"));
                     ui.label(RichText::new(version).color(PALETTE.text_muted));
                 });
@@ -291,7 +291,9 @@ fn about(ctx: &Context, state: &mut AppState) {
             ui.add_space(4.0);
             egui::Grid::new("about-info").num_columns(2).striped(false).spacing([16.0, 6.0]).show(ui, |ui| {
                 ui.label(theme::muted(t!("about-author")));
-                ui.label(env!("CARGO_PKG_AUTHORS"));
+                // TectSkill BIM is a fork: the original author stays credited.
+                let original = env!("CARGO_PKG_AUTHORS").split(" <").next().unwrap_or_default();
+                ui.label(format!("TectSkill · ConstructCAD: {original}"));
                 ui.end_row();
                 ui.label(theme::muted(t!("about-license-label")));
                 ui.hyperlink_to("GPL-3.0-or-later", "https://www.gnu.org/licenses/gpl-3.0.html");

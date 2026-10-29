@@ -19,7 +19,7 @@ pub enum Job {
 }
 
 fn dir() -> Option<PathBuf> {
-    eframe::storage_dir("ConstructCAD").map(|d| d.join("thumbnails"))
+    eframe::storage_dir("TectSkill BIM").map(|d| d.join("thumbnails"))
 }
 
 /// FNV-1a: stable file names across runs and platforms.

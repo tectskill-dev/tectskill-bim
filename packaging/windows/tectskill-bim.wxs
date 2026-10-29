@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TectSkill BIM installer (WiX Toolset v5), adapted from ConstructCAD's.
+
+  Per-machine install under Program Files\TectSkill BIM with tectskill-bim.exe,
+  ccad.exe, the documents and the sample project; a Start menu and desktop
+  shortcut; the .ccad extension opens with TectSkill BIM; an optional feature
+  adds the folder to the system PATH so `ccad` runs from any terminal. Newer
+  versions replace older ones (the UpgradeCode below must never change, and
+  differs from ConstructCAD's so both can be installed side by side).
+
+  Build (see .github/workflows/release.yml):
+    wix build packaging/windows/tectskill-bim.wxs -arch x64 -ext WixToolset.UI.wixext
+      -d Version=1.2.3 -d BinDir=<dir with the .exe files> -d LicenseRtf=<License.rtf>
+      -o tectskill-bim.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package
+    Name="TectSkill BIM"
+    Manufacturer="TectSkill"
+    Version="$(var.Version)"
+    UpgradeCode="71D7601A-BB0D-4605-A7A2-4D37D32542E4"
+    Scope="perMachine"
+    Language="1033"
+    Compressed="yes">
+    <SummaryInformation Description="TectSkill BIM - free Thai-language BIM, based on ConstructCAD" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="TectSkillBIM.ico" SourceFile="assets\icons\app-icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="TectSkillBIM.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/tectskill-dev/tectskill-bim" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/tectskill-dev/tectskill-bim/issues" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="TectSkill BIM">
+        <Directory Id="ExamplesFolder" Name="examples" />
+        <Directory Id="FontsFolder" Name="fonts" />
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="ProgramFiles" Directory="INSTALLFOLDER">
+      <Component Id="App">
+        <File Id="tectskill_bim.exe" Source="$(var.BinDir)\tectskill-bim.exe" KeyPath="yes">
+          <Shortcut
+            Id="StartMenuShortcut"
+            Directory="ProgramMenuFolder"
+            Name="TectSkill BIM"
+            Description="Free Thai-language BIM"
+            WorkingDirectory="INSTALLFOLDER"
+            Icon="TectSkillBIM.ico"
+            Advertise="yes" />
+          <Shortcut
+            Id="DesktopShortcut"
+            Directory="DesktopFolder"
+            Name="TectSkill BIM"
+            Description="Free Thai-language BIM"
+            WorkingDirectory="INSTALLFOLDER"
+            Icon="TectSkillBIM.ico"
+            Advertise="yes" />
+        </File>
+        <!-- .ccad projects open with TectSkill BIM. -->
+        <ProgId Id="TectSkillBIM.Project" Description="TectSkill BIM project" Icon="tectskill_bim.exe" IconIndex="0">
+          <Extension Id="ccad" ContentType="application/x-constructcad">
+            <Verb Id="open" Command="Open" TargetFile="tectskill_bim.exe" Argument="&quot;%1&quot;" />
+          </Extension>
+        </ProgId>
+      </Component>
+      <Component Id="Cli">
+        <File Id="ccad.exe" Source="$(var.BinDir)\ccad.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="ReadmeTh">
+        <File Id="README.th.md" Name="README.th.md" Source="README.th.md" KeyPath="yes" />
+      </Component>
+      <Component Id="Readme">
+        <File Id="README.md" Source="README.md" KeyPath="yes" />
+      </Component>
+      <Component Id="Changelog">
+        <File Id="CHANGELOG.md" Source="CHANGELOG.md" KeyPath="yes" />
+      </Component>
+      <Component Id="License">
+        <File Id="LICENSE" Name="LICENSE.txt" Source="LICENSE" KeyPath="yes" />
+      </Component>
+      <Component Id="FontLicenses" Directory="FontsFolder">
+        <File Id="OFL_Inter.txt" Name="OFL-Inter.txt" Source="assets\fonts\OFL-Inter.txt" KeyPath="yes" />
+        <File Id="OFL_Sarabun.txt" Name="OFL-Sarabun.txt" Source="assets\fonts\OFL-Sarabun.txt" />
+      </Component>
+      <Component Id="Sample" Directory="ExamplesFolder">
+        <File Id="casa_simples.ccad" Source="examples\casa_simples.ccad" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- The install folder at the end of the system PATH, for `ccad`. -->
+    <Component Id="PathEntry" Directory="INSTALLFOLDER">
+      <Environment Id="PATH" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set" System="yes" Permanent="no" />
+      <RegistryValue Root="HKLM" Key="Software\TectSkill BIM" Name="CliOnPath" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Feature
+      Id="Main"
+      Title="TectSkill BIM"
+      Description="The TectSkill BIM application, the ccad command line, the documents and the sample project."
+      Level="1"
+      AllowAbsent="no"
+      AllowAdvertise="no"
+      Display="expand"
+      ConfigurableDirectory="INSTALLFOLDER">
+      <ComponentGroupRef Id="ProgramFiles" />
+      <Feature
+        Id="CliPath"
+        Title="Add ccad to the PATH"
+        Description="Lets you run the ccad command line (and its MCP server) from any terminal."
+        Level="1"
+        AllowAdvertise="no">
+        <ComponentRef Id="PathEntry" />
+      </Feature>
+    </Feature>
+
+    <ui:WixUI Id="WixUI_FeatureTree" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+  </Package>
+</Wix>

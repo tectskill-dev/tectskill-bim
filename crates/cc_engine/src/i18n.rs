@@ -16,12 +16,13 @@ pub enum Language {
     It,
     Lo,
     Pl,
+    Th,
     Uk,
     ZhTw,
 }
 
 impl Language {
-    pub const ALL: [Language; 10] = [
+    pub const ALL: [Language; 11] = [
         Language::PtBr,
         Language::En,
         Language::Es,
@@ -30,6 +31,7 @@ impl Language {
         Language::It,
         Language::Lo,
         Language::Pl,
+        Language::Th,
         Language::Uk,
         Language::ZhTw,
     ];
@@ -45,6 +47,7 @@ impl Language {
             Language::It => "it",
             Language::Lo => "lo",
             Language::Pl => "pl",
+            Language::Th => "th",
             Language::Uk => "uk-UA",
             Language::ZhTw => "zh-TW",
         }
@@ -61,6 +64,7 @@ impl Language {
             Language::It => "Italiano",
             Language::Lo => "ພາສາລາວ",
             Language::Pl => "Polski",
+            Language::Th => "ภาษาไทย",
             Language::Uk => "Українська",
             Language::ZhTw => "繁體中文",
         }
@@ -81,6 +85,7 @@ impl Language {
             "it" => Language::It,
             "lo" => Language::Lo,
             "pl" => Language::Pl,
+            "th" => Language::Th,
             "uk" => Language::Uk,
             "zh" if traditional => Language::ZhTw,
             _ => return None,
@@ -104,6 +109,7 @@ impl Language {
             Language::It => include_str!("../../../assets/i18n/it.ftl"),
             Language::Lo => include_str!("../../../assets/i18n/lo.ftl"),
             Language::Pl => include_str!("../../../assets/i18n/pl.ftl"),
+            Language::Th => include_str!("../../../assets/i18n/th.ftl"),
             Language::Uk => include_str!("../../../assets/i18n/uk-UA.ftl"),
             Language::ZhTw => include_str!("../../../assets/i18n/zh-TW.ftl"),
         }
@@ -115,7 +121,7 @@ impl Language {
 
     /// Whether numbers use a decimal comma.
     pub fn decimal_comma(self) -> bool {
-        !matches!(self, Language::En | Language::ZhTw)
+        !matches!(self, Language::En | Language::Th | Language::ZhTw)
     }
 }
 
@@ -200,6 +206,7 @@ mod tests {
         assert_eq!(Language::from_code("it-IT"), Some(Language::It));
         assert_eq!(Language::from_code("lo-LA"), Some(Language::Lo));
         assert_eq!(Language::from_code("pl-PL"), Some(Language::Pl));
+        assert_eq!(Language::from_code("th-TH"), Some(Language::Th));
         assert_eq!(Language::from_code("uk-UA"), Some(Language::Uk));
         assert_eq!(Language::from_code("zh-TW"), Some(Language::ZhTw));
         assert_eq!(Language::from_code("zh_HK"), Some(Language::ZhTw));

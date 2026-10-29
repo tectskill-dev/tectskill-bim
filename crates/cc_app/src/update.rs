@@ -1,5 +1,5 @@
 //! Update notice: at startup (at most once a day) and on request, the app
-//! asks GitHub for the latest release of ConstructCAD in a background thread
+//! asks GitHub for the latest release of TectSkill BIM in a background thread
 //! and, when it is newer than this build, shows a notice with a link to the
 //! release page. It only notifies: nothing is downloaded or installed.
 //!
@@ -16,9 +16,9 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
 /// The GitHub API endpoint of the latest (non-draft, non-prerelease) release.
-pub const RELEASES_API: &str = "https://api.github.com/repos/francisreboucas/constructcad/releases/latest";
+pub const RELEASES_API: &str = "https://api.github.com/repos/tectskill-dev/tectskill-bim/releases/latest";
 /// Release pages; the tag is appended.
-const RELEASE_PAGE: &str = "https://github.com/francisreboucas/constructcad/releases/tag/";
+const RELEASE_PAGE: &str = "https://github.com/tectskill-dev/tectskill-bim/releases/tag/";
 /// Set (to anything but `0` or nothing) to turn every update check off.
 pub const NO_CHECK_ENV: &str = "CONSTRUCTCAD_NO_UPDATE_CHECK";
 /// Time between automatic checks.
@@ -140,7 +140,7 @@ pub fn now() -> u64 {
 fn fetch() -> Result<String, ureq::Error> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(TIMEOUT))
-        .user_agent(format!("ConstructCAD/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("TectSkill-BIM/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .into();
     let mut response = agent
@@ -347,7 +347,7 @@ mod tests {
             evaluate(now, &json("v0.4.0")),
             Outcome::Available(Release {
                 version: v(0, 4, 0),
-                url: "https://github.com/francisreboucas/constructcad/releases/tag/v0.4.0".into()
+                url: "https://github.com/tectskill-dev/tectskill-bim/releases/tag/v0.4.0".into()
             })
         );
         assert_eq!(evaluate(now, &json("v0.3.0")), Outcome::UpToDate);

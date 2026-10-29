@@ -1,6 +1,7 @@
 //! Vector export of drawings in paper millimeters (composed sheets) to SVG
 //! and PDF. Both writers are self-contained: the PDF uses the standard
-//! Helvetica font, so no font is embedded.
+//! Helvetica font for the text it can show, and embeds subsets of Inter,
+//! Sarabun and the system's fallback fonts for the rest (Thai, Lao, CJK).
 
 use crate::{Anchor, Drawing2D, Prim};
 use glam::DVec2;
@@ -197,6 +198,8 @@ pub fn to_pdf(drawing: &Drawing2D, paper: DVec2) -> Vec<u8> {
     const PT_PER_MM: f64 = 72.0 / 25.4;
     let mut alphas: Vec<u8> = Vec::new();
     let mut content: Vec<u8> = Vec::new();
+    // Read only when some text needs it.
+    let mut embedded: Option<crate::pdf_fonts::EmbeddedFonts> = None;
     // Work in millimeters with the origin at the bottom-left corner.
     let _ = writeln!(Utf8(&mut content), "{} 0 0 {} 0 0 cm 1 J 1 j", num(PT_PER_MM), num(PT_PER_MM));
     for prim in &drawing.prims {
@@ -238,10 +241,15 @@ pub fn to_pdf(drawing: &Drawing2D, paper: DVec2) -> Vec<u8> {
                 let _ = writeln!(Utf8(&mut content), "q {gs}{} rg {path}h f Q", rgb([r, g, b]));
             }
             Prim::Text { pos, text, size, anchor, angle, .. } => {
-                let bytes: Vec<u8> = text.chars().map(win_ansi).collect();
                 if text.trim().is_empty() {
                     continue;
                 }
+                if !text.chars().all(|c| c == '?' || win_ansi(c) != b'?') {
+                    let fonts = embedded.get_or_insert_with(crate::pdf_fonts::EmbeddedFonts::new);
+                    shaped_text(&mut content, fonts, *pos, text, *size, *anchor, *angle);
+                    continue;
+                }
+                let bytes: Vec<u8> = text.chars().map(win_ansi).collect();
                 let (base, frac) = anchor_offsets(*anchor);
                 let width = helvetica_width(&bytes) * size;
                 let (sin, cos) = angle.sin_cos();
@@ -271,11 +279,14 @@ pub fn to_pdf(drawing: &Drawing2D, paper: DVec2) -> Vec<u8> {
     for (i, a) in alphas.iter().enumerate() {
         let _ = write!(ext, "/GS{i} << /Type /ExtGState /ca {} >> ", num(*a as f64 / 255.0));
     }
+    // Embedded fonts follow Helvetica (object 5).
+    let embedded = embedded.filter(|e| !e.is_empty());
+    let font_resources = embedded.as_ref().map(|e| e.resources(6)).unwrap_or_default();
     let mut objects: Vec<Vec<u8>> = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
         format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Resources << /Font << /F1 5 0 R >> /ExtGState << {ext}>> >> /Contents 4 0 R >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Resources << /Font << /F1 5 0 R {font_resources}>> /ExtGState << {ext}>> >> /Contents 4 0 R >>",
             num(w),
             num(h)
         )
@@ -286,6 +297,9 @@ pub fn to_pdf(drawing: &Drawing2D, paper: DVec2) -> Vec<u8> {
     stream.extend(b"\nendstream");
     objects.push(stream);
     objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec());
+    if let Some(e) = &embedded {
+        objects.extend(e.objects(6));
+    }
     objects.push(b"<< /Producer (ConstructCAD) >>".to_vec());
 
     let mut out: Vec<u8> = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n".to_vec();
@@ -311,6 +325,51 @@ pub fn to_pdf(drawing: &Drawing2D, paper: DVec2) -> Vec<u8> {
     out
 }
 
+/// Text Helvetica cannot show, shaped and drawn glyph by glyph from the
+/// embedded fonts, placed like Helvetica text (`size` millimeters, anchored
+/// and rotated).
+fn shaped_text(
+    content: &mut Vec<u8>,
+    fonts: &mut crate::pdf_fonts::EmbeddedFonts,
+    pos: DVec2,
+    text: &str,
+    size: f64,
+    anchor: Anchor,
+    angle: f64,
+) {
+    let (glyphs, width) = fonts.shape(text);
+    let (base, frac) = anchor_offsets(anchor);
+    let (sin, cos) = angle.sin_cos();
+    let along = DVec2::new(cos, sin);
+    let up = DVec2::new(-sin, cos);
+    let origin = pos - along * (width * size * frac) - up * (base * size);
+    let g = num(TEXT_GRAY as f64 / 255.0);
+    // The text as written, for search and copy (glyphs can stand for parts
+    // of characters, as in Thai's sara am).
+    let actual: String = std::iter::once(0xFEFF).chain(text.encode_utf16()).map(|u| format!("{u:04X}")).collect();
+    let _ = write!(Utf8(content), "/Span << /ActualText <{actual}> >> BDC BT {g} g ");
+    let mut current = None;
+    for glyph in glyphs {
+        if current != Some(glyph.resource) {
+            let _ = write!(Utf8(content), "/T{} {} Tf ", glyph.resource, num(size));
+            current = Some(glyph.resource);
+        }
+        let p = origin + along * (glyph.x * size) + up * (glyph.y * size);
+        let _ = write!(
+            Utf8(content),
+            "{} {} {} {} {} {} Tm <{:04X}> Tj ",
+            num(cos),
+            num(sin),
+            num(-sin),
+            num(cos),
+            num(p.x),
+            num(p.y),
+            glyph.cid
+        );
+    }
+    content.extend(b"ET EMC\n");
+}
+
 /// `fmt::Write` adapter for building ASCII content into a byte buffer.
 struct Utf8<'a>(&'a mut Vec<u8>);
 
@@ -325,7 +384,7 @@ impl std::fmt::Write for Utf8<'_> {
 /// sheet at 300 dpi).
 pub const MAX_PIXELS: u64 = 160_000_000;
 
-const INTER: &[u8] = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
+pub(crate) const INTER: &[u8] = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
 
 /// Writes glyph outlines as SVG path data, through `at` (glyph to page).
 struct GlyphPen<'a> {
@@ -365,10 +424,10 @@ impl skrifa::outline::OutlinePen for GlyphPen<'_> {
     }
 }
 
-/// SVG path data of `text` set in `fonts` (each character from the first
-/// font that has it; no kerning), placed like the SVG writer's text: `size`
-/// millimeters high, anchored and rotated, on a page `page_h` high (SVG's
-/// y runs down).
+/// SVG path data of `text` set in `fonts` (shaped: each run from the first
+/// font that has it, with the fonts' marks, ligatures and kerning), placed
+/// like the SVG writer's text: `size` millimeters high, anchored and
+/// rotated, on a page `page_h` high (SVG's y runs down).
 fn glyph_path(
     fonts: &[skrifa::FontRef],
     text: &str,
@@ -383,38 +442,25 @@ fn glyph_path(
     use skrifa::outline::DrawSettings;
     let em = Size::new(size as f32);
     let location = LocationRef::default();
-    let charmaps: Vec<_> = fonts.iter().map(|f| f.charmap()).collect();
-    let metrics: Vec<_> = fonts.iter().map(|f| f.glyph_metrics(em, location)).collect();
     let outlines: Vec<_> = fonts.iter().map(|f| f.outline_glyphs()).collect();
-    let glyphs: Vec<(usize, skrifa::GlyphId)> = text.chars().map(|c| pick_glyph(&charmaps, c)).collect();
-    let advance =
-        |(f, g): (usize, skrifa::GlyphId)| metrics.get(f).and_then(|m| m.advance_width(g)).unwrap_or(0.0) as f64;
-    let width: f64 = glyphs.iter().map(|g| advance(*g)).sum();
+    let (glyphs, width) = crate::shaping::shape(fonts, text);
     let (base, frac) = anchor_offsets(anchor);
     let along = DVec2::new(angle.cos(), angle.sin());
     let up = along.perp();
-    let origin = pos - up * (base * size) - along * (frac * width);
+    let origin = pos - up * (base * size) - along * (frac * width * size);
     let mut d = String::new();
-    let mut x = 0.0;
-    for (f, g) in glyphs {
-        if let Some(glyph) = outlines.get(f).and_then(|o| o.get(g)) {
+    for g in glyphs {
+        if let Some(glyph) = outlines.get(g.font).and_then(|o| o.get(g.glyph)) {
             let at = |gx: f32, gy: f32| {
-                let p = origin + along * (x + gx as f64) + up * gy as f64;
+                let p = origin + along * (g.x * size + gx as f64) + up * (g.y * size + gy as f64);
                 DVec2::new(p.x, page_h - p.y)
             };
             let mut pen = GlyphPen { d: &mut d, at: &at };
             // A glyph that fails to draw is left out.
             let _ = glyph.draw(DrawSettings::unhinted(em, location), &mut pen);
         }
-        x += advance((f, g));
     }
     d
-}
-
-/// The font (index in `charmaps`) and glyph of `c`: the first font that
-/// has it, else the first font's missing-glyph box.
-fn pick_glyph(charmaps: &[skrifa::charmap::Charmap], c: char) -> (usize, skrifa::GlyphId) {
-    charmaps.iter().enumerate().find_map(|(i, m)| m.map(c).map(|g| (i, g))).unwrap_or((0, skrifa::GlyphId::NOTDEF))
 }
 
 /// A view's drawing (meters, drawn at 1:`scale`; text sizes in paper
@@ -476,8 +522,8 @@ pub fn view_on_paper(drawing: &Drawing2D, scale: u32, margin: f64) -> (Drawing2D
 
 /// PNG image of `drawing` on a sheet of `paper` millimeters at `dpi` dots
 /// per inch, on white; text is drawn as outlines of Inter (embedded), with
-/// the system's fallback fonts (`fonts::fallbacks`: CJK, Lao) for the
-/// characters Inter lacks.
+/// Sarabun (embedded, Thai) and the system's fallback fonts
+/// (`fonts::fallbacks`: CJK, Lao) for the characters Inter lacks.
 pub fn to_png(drawing: &Drawing2D, paper: DVec2, dpi: f64) -> Result<Vec<u8>, String> {
     use resvg::{tiny_skia, usvg};
     if !(dpi.is_finite() && dpi > 0.0) {
@@ -488,8 +534,10 @@ pub fn to_png(drawing: &Drawing2D, paper: DVec2, dpi: f64) -> Result<Vec<u8>, St
         return Err(format!("the image would be {} x {} pixels: lower the resolution", px.x, px.y));
     }
     let (w, h) = (px.x as u32, px.y as u32);
-    let mut fonts = vec![skrifa::FontRef::new(INTER).map_err(|e| e.to_string())?];
-    fonts.extend(crate::fonts::fallbacks().filter_map(|f| f.font_ref()));
+    let (fonts, _) = crate::pdf_fonts::faces(&crate::pdf_fonts::sources());
+    if fonts.is_empty() {
+        return Err("no font to draw the text with".into());
+    }
     let source = svg(drawing, paper, &fonts);
     let tree = usvg::Tree::from_str(&source, &usvg::Options::default()).map_err(|e| e.to_string())?;
     let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or("the image is too large")?;
@@ -578,17 +626,20 @@ endstream",
 
     #[test]
     fn glyphs_come_from_the_first_font_that_has_them() {
-        use skrifa::MetadataProvider;
+        use crate::shaping::shape;
         let inter = skrifa::FontRef::new(INTER).unwrap();
-        let maps = [inter.charmap()];
-        assert_eq!(pick_glyph(&maps, 'A').0, 0);
+        let first = |fonts: &[skrifa::FontRef], s: &str| {
+            let g = &shape(fonts, s).0[0];
+            (g.font, g.glyph)
+        };
+        assert_eq!(first(std::slice::from_ref(&inter), "A").0, 0);
         // A character no font has: the first font's box.
-        assert_eq!(pick_glyph(&maps, '\u{4E2D}'), (0, skrifa::GlyphId::NOTDEF));
+        assert_eq!(first(std::slice::from_ref(&inter), "\u{4E2D}"), (0, skrifa::GlyphId::NOTDEF));
         // With the system's CJK font (when there is one), ideographs come from it.
         if let Some(cjk) = crate::fonts::cjk().first().and_then(|f| f.font_ref()) {
-            let maps = [inter.charmap(), cjk.charmap()];
-            assert_eq!(pick_glyph(&maps, 'A').0, 0);
-            let (font, glyph) = pick_glyph(&maps, '\u{4E2D}');
+            let fonts = [inter.clone(), cjk];
+            assert_eq!(first(&fonts, "A").0, 0);
+            let (font, glyph) = first(&fonts, "\u{4E2D}");
             assert_eq!(font, 1);
             assert_ne!(glyph, skrifa::GlyphId::NOTDEF);
         }
@@ -612,5 +663,34 @@ endstream",
         v.line(DVec2::ZERO, DVec2::new(10.0, 5.0), crate::LineStyle::Cut, None);
         let (_, paper) = view_on_paper(&v, 100, 5.0);
         assert!((paper - DVec2::new(110.0, 60.0)).length() < 1e-9, "{paper}");
+    }
+
+    /// Thai text is embedded as a font subset, drawn glyph by glyph and
+    /// mapped back to its characters; Latin text keeps Helvetica.
+    #[test]
+    fn pdf_embeds_fonts_for_text_helvetica_lacks() {
+        let mut d = Drawing2D::default();
+        d.text(DVec2::new(4.0, 20.0), "Plan", 5.0);
+        let latin = to_pdf(&d, DVec2::new(80.0, 30.0));
+        assert!(!latin.windows(5).any(|w| w == b"Type0"), "no font embedded for Latin text");
+        d.text(DVec2::new(4.0, 8.0), "ห้องนอนที่ 1", 5.0);
+        let pdf = to_pdf(&d, DVec2::new(80.0, 30.0));
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(text.contains("/Subtype /Type0") && text.contains("/FontFile2") && text.contains("/T0 6 0 R"));
+        assert!(text.contains("+Sarabun-Regular") && text.contains("/Identity-H"));
+        // ToUnicode maps "ห" (U+0E2B) and the tone mark (U+0E49).
+        assert!(text.contains("<0E2B>") && text.contains("<0E49>"), "{text}");
+        assert!(!text.contains("(?"), "no question marks in place of Thai");
+        if let Ok(dir) = std::env::var("CC_EXPORT_PROBE") {
+            let mut sheet = Drawing2D::default();
+            sheet.text(DVec2::new(6.0, 52.0), "TectSkill BIM — แปลนพื้นชั้น 1", 6.0);
+            sheet.text(DVec2::new(6.0, 40.0), "ห้องนอนใหญ่ 24.5 ตร.ม.", 5.0);
+            sheet.text(DVec2::new(6.0, 30.0), "ที่ ผู้ น้ำ ปู่ ญี่ปุ่น ฐาน ฎีกา กำแพง", 5.0);
+            sheet.text(DVec2::new(6.0, 20.0), "ผนังก่ออิฐ 15 ซม. · ประตู 90x210", 5.0);
+            sheet.text(DVec2::new(6.0, 10.0), "Room 1 (Helvetica)", 5.0);
+            let paper = DVec2::new(150.0, 62.0);
+            std::fs::write(format!("{dir}/thai-sheet.pdf"), to_pdf(&sheet, paper)).unwrap();
+            std::fs::write(format!("{dir}/thai-sheet.png"), to_png(&sheet, paper, 200.0).unwrap()).unwrap();
+        }
     }
 }

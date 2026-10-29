@@ -8,7 +8,7 @@ authors.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "constructcad"
+name = "tectskill-bim"
 path = "src/main.rs"
 
 [target.'cfg(windows)'.build-dependencies]

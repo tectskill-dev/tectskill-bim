@@ -280,12 +280,26 @@ fn fonts() -> FontDefinitions {
         "inter-semibold".into(),
         Arc::new(FontData::from_static(include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf"))),
     );
+    // Thai from Sarabun (bundled, SIL OFL), right after Inter.
+    fonts.font_data.insert(
+        "sarabun".into(),
+        Arc::new(FontData::from_static(include_bytes!("../../../assets/fonts/Sarabun-Regular.ttf"))),
+    );
+    fonts.font_data.insert(
+        "sarabun-semibold".into(),
+        Arc::new(FontData::from_static(include_bytes!("../../../assets/fonts/Sarabun-SemiBold.ttf"))),
+    );
     // Inter first; egui's bundled fonts stay as fallbacks for symbols and emoji.
     let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
+    let fallbacks: Vec<String> = proportional.clone();
     proportional.insert(0, "inter".into());
-    let fallbacks: Vec<String> = proportional[1..].to_vec();
-    let mut semibold_family = vec!["inter-semibold".to_string()];
+    proportional.insert(1, "sarabun".into());
+    let mut semibold_family = vec!["inter-semibold".to_string(), "sarabun-semibold".to_string()];
     semibold_family.extend(fallbacks);
+    // Monospace keeps its own Latin face; Thai letters come from Sarabun.
+    if let Some(mono) = fonts.families.get_mut(&FontFamily::Monospace) {
+        mono.insert(1.min(mono.len()), "sarabun".into());
+    }
     fonts.families.insert(semibold(), semibold_family);
     // Chinese, Japanese, Korean and Lao text from the system's fonts, last.
     for (i, fallback) in cc_views::fonts::fallbacks().enumerate() {

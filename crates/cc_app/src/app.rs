@@ -58,7 +58,7 @@ impl ConstructApp {
         }
         // Command line, then saved preference, then the operating system language.
         let saved = cc.storage.and_then(|s| s.get_string(LANGUAGE_KEY)).and_then(|c| Language::from_code(&c));
-        crate::i18n::set_language(language.or(saved).unwrap_or_else(Language::from_system));
+        crate::i18n::set_language(language.or(saved).unwrap_or(Language::Th));
         let mut state = AppState::new(Document::new(actions::new_project()));
         if let Some(recent) = cc.storage.and_then(|s| s.get_string(RECENT_KEY)) {
             state.recent = recent.lines().filter(|l| !l.is_empty()).map(std::path::PathBuf::from).collect();
@@ -418,9 +418,9 @@ impl ConstructApp {
 
         let title = if self.state.project_open {
             let dirty = if self.state.session.doc.is_dirty() { " *" } else { "" };
-            format!("ConstructCAD — {}{dirty}", self.state.project().info.name)
+            format!("TectSkill BIM — {}{dirty}", self.state.project().info.name)
         } else {
-            "ConstructCAD".to_string()
+            "TectSkill BIM".to_string()
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 
