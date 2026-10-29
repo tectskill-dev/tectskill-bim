@@ -36,7 +36,7 @@
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="TectSkill BIM">
         <Directory Id="ExamplesFolder" Name="examples" />
-        <Directory Id="FontsFolder" Name="fonts" />
+        <Directory Id="LicenseFontsFolder" Name="fonts" />
       </Directory>
     </StandardDirectory>
 
@@ -82,7 +82,7 @@
       <Component Id="License">
         <File Id="LICENSE" Name="LICENSE.txt" Source="LICENSE" KeyPath="yes" />
       </Component>
-      <Component Id="FontLicenses" Directory="FontsFolder">
+      <Component Id="FontLicenses" Directory="LicenseFontsFolder">
         <File Id="OFL_Inter.txt" Name="OFL-Inter.txt" Source="assets\fonts\OFL-Inter.txt" KeyPath="yes" />
         <File Id="OFL_Sarabun.txt" Name="OFL-Sarabun.txt" Source="assets\fonts\OFL-Sarabun.txt" />
       </Component>
