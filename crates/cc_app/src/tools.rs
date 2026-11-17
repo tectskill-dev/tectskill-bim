@@ -5,13 +5,11 @@ use crate::paint::{HIGHLIGHT, PREVIEW, PaintOptions, Xf, paint_drawing};
 use crate::state::AppState;
 use crate::t;
 use cc_core::{
-    Category, ColumnSection, DimensionKind, ElementId, ElementKind, ElementTypeId, LevelId, Project, View, ViewId,
-    ViewKind,
+    Category, DimensionKind, ElementId, ElementKind, ElementTypeId, LevelId, Project, View, ViewId, ViewKind,
 };
 use cc_engine::Ref;
 use cc_engine::commands::{create, modify as modify_cmd, views};
 use cc_engine::default_top;
-pub use cc_engine::walls_loop;
 use cc_geom::{ModelGeometry, polygon};
 use cc_views::{Drawing2D, format};
 use egui::{Color32, Key, Painter, Pos2, Response, Stroke, Ui};
@@ -33,6 +31,11 @@ pub enum Tool {
         type_id: ElementTypeId,
     },
     Section,
+    /// Draw a callout's rectangle in a plan, section or elevation.
+    Callout,
+    /// Draw detail lines in the active 2D view (mode and style in
+    /// `AppState::detail`, see [`crate::detail_ui`]).
+    DetailLine,
     Room {
         type_id: ElementTypeId,
     },
@@ -45,17 +48,25 @@ pub enum Tool {
     },
     Column {
         type_id: ElementTypeId,
+        /// Started from the Structure tab: its type list keeps to this material.
+        material: Option<cc_core::StructuralMaterial>,
     },
     Beam {
         type_id: ElementTypeId,
+        material: Option<cc_core::StructuralMaterial>,
     },
-    /// Click to place a pad footing; Space turns it by 90°.
+    /// Click to place a pad footing; Space turns it by 90°. With a strip
+    /// type, draw strip footings as walls are drawn (lines or arcs).
     Footing {
         type_id: ElementTypeId,
     },
-    /// Click the two ends of a truss (options in `AppState::truss`); `type_id` is its chord type.
+    /// Click the two ends of a truss (options in `AppState::truss`) of the Structure tab's material.
     Truss {
-        type_id: ElementTypeId,
+        material: cc_core::StructuralMaterial,
+    },
+    /// Click the two column axes of a braced bay (options in `AppState::bracing`).
+    Bracing {
+        material: cc_core::StructuralMaterial,
     },
     Stair {
         type_id: ElementTypeId,
@@ -64,6 +75,10 @@ pub enum Tool {
         type_id: ElementTypeId,
     },
     Railing {
+        type_id: ElementTypeId,
+    },
+    /// Click the points of a swept profile's path (options in `AppState::sweep`).
+    Sweep {
         type_id: ElementTypeId,
     },
     Component {
@@ -75,6 +90,18 @@ pub enum Tool {
     },
     /// Click the ends of conduit runs, one after the other.
     Conduit {
+        type_id: ElementTypeId,
+    },
+    /// Click the ends of cable tray runs, one after the other.
+    CableTray {
+        type_id: ElementTypeId,
+    },
+    /// Click the ends of lightning protection conductors, one after the other.
+    LightningConductor {
+        type_id: ElementTypeId,
+    },
+    /// Click a pipe to place a valve on it.
+    Valve {
         type_id: ElementTypeId,
     },
     Move,
@@ -90,6 +117,8 @@ pub enum Tool {
     Split,
     Offset,
     Align,
+    /// Push or pull a face of a mass in a 3D view.
+    PushPull,
     /// Click near a wall end to allow or disallow its join.
     ToggleJoin,
     /// Measure between two points; the result stays until the next pick.
@@ -98,12 +127,23 @@ pub enum Tool {
     JoinGeometry {
         unjoin: bool,
     },
+    /// Click the roof, ceiling or floor the selected walls' tops attach to
+    /// (the walls are kept in `interaction.targets`).
+    AttachTop,
     /// Place the clipboard with a click.
     Paste,
     /// Pick an element, then click others to give them its type.
     MatchType,
     /// Place text notes (options in `AppState::text_options`).
     Text {
+        type_id: ElementTypeId,
+    },
+    /// Place level marks in plans, elevations and sections.
+    LevelMark {
+        type_id: ElementTypeId,
+    },
+    /// Place detail components in 2D views (options in `AppState::detail_component`).
+    DetailComponent {
         type_id: ElementTypeId,
     },
     /// Add a leader to the text note `id`.
@@ -118,21 +158,50 @@ pub enum Tool {
     },
     /// Click elements to demolish them in the view's phase.
     Demolish,
+    /// Click curtain walls to edit their grids and panels (options in `AppState::curtain`).
+    CurtainGrid,
+    /// Click faces in a 3D view to paint them with `AppState::paint_material`
+    /// (or to take their paint off).
+    Paint {
+        remove: bool,
+    },
 }
 
 impl Tool {
+    /// Translation key of the tool's name as the options bar shows it: the
+    /// footing tool drawing a strip type is named for strips, the component
+    /// tool for the plumbing fixtures or devices it places.
+    pub fn name_key(&self, project: &Project) -> &'static str {
+        match self {
+            Tool::Footing { type_id } if is_strip(project, *type_id) => "tool-strip-footing",
+            Tool::Component { type_id } => match component_group(project, *type_id) {
+                ComponentGroup::Generic => self.key(),
+                ComponentGroup::Fixture => "tool-fixture",
+                ComponentGroup::Device => "tool-device",
+                ComponentGroup::Own(device) => device.key(),
+            },
+            tool => tool.key(),
+        }
+    }
+
     /// Translation key of the tool name.
     pub fn key(&self) -> &'static str {
         match self {
             Tool::Select => "tool-select",
             Tool::Wall { .. } => "tool-wall",
             Tool::Hosted { category: Category::Door, .. } => "tool-door",
+            Tool::Hosted { category: Category::Niche, .. } => "tool-niche",
             Tool::Hosted { .. } => "tool-window",
             Tool::Sketch { category: Category::Ceiling, .. } => "tool-ceiling",
             Tool::Sketch { category: Category::Roof, .. } => "tool-roof",
             Tool::Sketch { category: Category::Foundation, .. } => "tool-foundation-slab",
+            Tool::Sketch { category: Category::Mass, .. } => "tool-mass",
+            Tool::Sketch { category: Category::Shaft, .. } => "tool-shaft",
+            Tool::Sketch { category: Category::FilledRegion, .. } => "tool-filled-region",
+            Tool::Sketch { category: Category::MaskingRegion, .. } => "tool-masking-region",
             Tool::Sketch { .. } => "tool-floor",
             Tool::Section => "tool-section",
+            Tool::Callout => "tool-callout",
             Tool::Room { .. } => "tool-room",
             Tool::Grid { .. } => "tool-grid",
             Tool::Dimension { mode, .. } => mode.key(),
@@ -140,12 +209,17 @@ impl Tool {
             Tool::Beam { .. } => "tool-beam",
             Tool::Footing { .. } => "tool-footing",
             Tool::Truss { .. } => "tool-truss",
+            Tool::Bracing { .. } => "action-bracing",
             Tool::Stair { .. } => "tool-stair",
             Tool::Ramp { .. } => "tool-ramp",
             Tool::Railing { .. } => "tool-railing",
+            Tool::Sweep { .. } => "tool-sweep",
             Tool::Component { .. } => "tool-component",
             Tool::Pipe { .. } => "tool-pipe",
             Tool::Conduit { .. } => "tool-conduit",
+            Tool::CableTray { .. } => "tool-cable-tray",
+            Tool::LightningConductor { .. } => "tool-lightning-conductor",
+            Tool::Valve { .. } => "tool-valve",
             Tool::Move => "tool-move",
             Tool::Copy => "tool-copy",
             Tool::Rotate => "tool-rotate",
@@ -157,14 +231,22 @@ impl Tool {
             Tool::Split => "tool-split",
             Tool::Offset => "tool-offset",
             Tool::Align => "tool-align",
+            Tool::PushPull => "tool-push-pull",
             Tool::ToggleJoin => "tool-toggle-join",
             Tool::Measure => "tool-measure",
             Tool::JoinGeometry { unjoin: false } => "tool-join-geometry",
             Tool::JoinGeometry { unjoin: true } => "tool-unjoin-geometry",
+            Tool::AttachTop => "tool-attach-top",
             Tool::Paste => "action-paste",
             Tool::MatchType => "tool-match-type",
             Tool::Demolish => "tool-demolish",
+            Tool::CurtainGrid => "tool-curtain-grid",
+            Tool::Paint { remove: false } => "tool-paint",
+            Tool::Paint { remove: true } => "tool-remove-paint",
             Tool::Text { .. } => "tool-text",
+            Tool::DetailLine => "tool-detail-line",
+            Tool::LevelMark { .. } => "tool-level-mark",
+            Tool::DetailComponent { .. } => "tool-detail-component",
             Tool::AddLeader { .. } => "tool-add-leader",
             Tool::Opening { floor: false, .. } => "tool-roof-opening",
             Tool::Opening { floor: true, .. } => "tool-floor-opening",
@@ -179,17 +261,30 @@ impl Tool {
             | Tool::Room { type_id }
             | Tool::Grid { type_id }
             | Tool::Dimension { type_id, .. }
-            | Tool::Column { type_id }
-            | Tool::Beam { type_id }
+            | Tool::Column { type_id, .. }
+            | Tool::Beam { type_id, .. }
             | Tool::Footing { type_id }
-            | Tool::Truss { type_id }
             | Tool::Stair { type_id }
             | Tool::Ramp { type_id }
             | Tool::Railing { type_id }
+            | Tool::Sweep { type_id }
             | Tool::Component { type_id }
             | Tool::Pipe { type_id }
             | Tool::Conduit { type_id }
-            | Tool::Text { type_id } => Some(*type_id),
+            | Tool::CableTray { type_id }
+            | Tool::LightningConductor { type_id }
+            | Tool::Valve { type_id }
+            | Tool::Text { type_id }
+            | Tool::LevelMark { type_id }
+            | Tool::DetailComponent { type_id } => Some(*type_id),
+            _ => None,
+        }
+    }
+
+    /// The structural material a column or beam tool's types keep to.
+    pub fn material(&self) -> Option<cc_core::StructuralMaterial> {
+        match self {
+            Tool::Column { material, .. } | Tool::Beam { material, .. } => *material,
             _ => None,
         }
     }
@@ -204,14 +299,20 @@ impl Tool {
             Tool::Column { .. } => Some(Category::Column),
             Tool::Beam { .. } => Some(Category::Beam),
             Tool::Footing { .. } => Some(Category::Foundation),
-            Tool::Truss { .. } => Some(Category::Beam),
             Tool::Stair { .. } => Some(Category::Stair),
             Tool::Ramp { .. } => Some(Category::Ramp),
             Tool::Railing { .. } => Some(Category::Railing),
+            Tool::Sweep { .. } => Some(Category::Sweep),
             Tool::Component { .. } => Some(Category::Component),
             Tool::Pipe { .. } => Some(Category::Pipe),
             Tool::Conduit { .. } => Some(Category::Conduit),
+            Tool::CableTray { .. } => Some(Category::CableTray),
+            Tool::LightningConductor { .. } => Some(Category::LightningConductor),
+            Tool::Valve { .. } => Some(Category::Valve),
             Tool::Text { .. } => Some(Category::Text),
+            Tool::DetailLine => Some(Category::DetailLine),
+            Tool::LevelMark { .. } => Some(Category::LevelMark),
+            Tool::DetailComponent { .. } => Some(Category::DetailComponent),
             _ => None,
         }
     }
@@ -224,17 +325,24 @@ impl Tool {
             Tool::Room { .. } => Tool::Room { type_id: id },
             Tool::Grid { .. } => Tool::Grid { type_id: id },
             Tool::Dimension { mode, .. } => Tool::Dimension { type_id: id, mode },
-            Tool::Column { .. } => Tool::Column { type_id: id },
-            Tool::Beam { .. } => Tool::Beam { type_id: id },
+            Tool::Column { material, .. } => Tool::Column { type_id: id, material },
+            Tool::Beam { material, .. } => Tool::Beam { type_id: id, material },
             Tool::Footing { .. } => Tool::Footing { type_id: id },
-            Tool::Truss { .. } => Tool::Truss { type_id: id },
+            Tool::Truss { material } => Tool::Truss { material },
+            Tool::Bracing { material } => Tool::Bracing { material },
             Tool::Stair { .. } => Tool::Stair { type_id: id },
             Tool::Ramp { .. } => Tool::Ramp { type_id: id },
             Tool::Railing { .. } => Tool::Railing { type_id: id },
+            Tool::Sweep { .. } => Tool::Sweep { type_id: id },
             Tool::Component { .. } => Tool::Component { type_id: id },
             Tool::Pipe { .. } => Tool::Pipe { type_id: id },
             Tool::Conduit { .. } => Tool::Conduit { type_id: id },
+            Tool::CableTray { .. } => Tool::CableTray { type_id: id },
+            Tool::LightningConductor { .. } => Tool::LightningConductor { type_id: id },
+            Tool::Valve { .. } => Tool::Valve { type_id: id },
             Tool::Text { .. } => Tool::Text { type_id: id },
+            Tool::LevelMark { .. } => Tool::LevelMark { type_id: id },
+            Tool::DetailComponent { .. } => Tool::DetailComponent { type_id: id },
             t => t,
         }
     }
@@ -252,21 +360,47 @@ impl Tool {
         let type_id = project.default_type(category)?;
         Some(match category {
             Category::Wall => Tool::Wall { type_id },
-            Category::Door | Category::Window => Tool::Hosted { category, type_id },
-            Category::Floor | Category::Ceiling | Category::Roof => Tool::Sketch { category, type_id },
+            Category::Door | Category::Window | Category::Niche => Tool::Hosted { category, type_id },
+            Category::Floor
+            | Category::Ceiling
+            | Category::Roof
+            | Category::Mass
+            | Category::Shaft
+            | Category::Topography
+            | Category::Pad
+            | Category::FilledRegion
+            | Category::MaskingRegion => Tool::Sketch { category, type_id },
             Category::Room => Tool::Room { type_id },
             Category::Grid => Tool::Grid { type_id },
             Category::Dimension => Tool::Dimension { type_id, mode: DimensionMode::Aligned },
-            Category::Column => Tool::Column { type_id },
-            Category::Beam => Tool::Beam { type_id },
+            Category::Column => Tool::Column { type_id, material: None },
+            Category::Beam => Tool::Beam { type_id, material: None },
             Category::Foundation | Category::Rebar => Tool::Footing { type_id },
             Category::Stair => Tool::Stair { type_id },
             Category::Ramp => Tool::Ramp { type_id },
             Category::Railing => Tool::Railing { type_id },
+            Category::Sweep => Tool::Sweep { type_id },
             Category::Component => Tool::Component { type_id },
             Category::Pipe => Tool::Pipe { type_id },
             Category::Conduit => Tool::Conduit { type_id },
+            Category::CableTray => Tool::CableTray { type_id },
+            Category::LightningConductor => Tool::LightningConductor { type_id },
+            Category::Valve => Tool::Valve { type_id },
             Category::Text => Tool::Text { type_id },
+            Category::DetailLine => Tool::DetailLine,
+            Category::LevelMark => Tool::LevelMark { type_id },
+            Category::DetailComponent => Tool::DetailComponent { type_id },
+            // Imported, not drawn; bar tags are placed by their command.
+            Category::BarTag
+            | Category::CadImport
+            | Category::TitleBlock
+            | Category::SteelBuilding
+            | Category::Truss
+            | Category::Bracing
+            | Category::Connection
+            | Category::WallFraming => return None,
+            // Made with their caps or by commands.
+            Category::Pile => return None,
         })
     }
 }
@@ -278,15 +412,18 @@ pub enum DimensionMode {
     Aligned,
     /// Horizontal or vertical, chosen by where the line is placed.
     Linear,
+    /// Running dimensions from an origin, horizontal or vertical.
+    Ordinate,
     Angular,
     Radial,
     Diameter,
 }
 
 impl DimensionMode {
-    pub const ALL: [DimensionMode; 5] = [
+    pub const ALL: [DimensionMode; 6] = [
         DimensionMode::Aligned,
         DimensionMode::Linear,
+        DimensionMode::Ordinate,
         DimensionMode::Angular,
         DimensionMode::Radial,
         DimensionMode::Diameter,
@@ -296,6 +433,7 @@ impl DimensionMode {
         match self {
             DimensionMode::Aligned => "tool-dimension",
             DimensionMode::Linear => "tool-dim-linear",
+            DimensionMode::Ordinate => "tool-dim-ordinate",
             DimensionMode::Angular => "tool-dim-angular",
             DimensionMode::Radial => "tool-dim-radial",
             DimensionMode::Diameter => "tool-dim-diameter",
@@ -306,6 +444,7 @@ impl DimensionMode {
         match self {
             DimensionMode::Aligned => "hint-dimension",
             DimensionMode::Linear => "hint-dim-linear",
+            DimensionMode::Ordinate => "hint-dim-ordinate",
             DimensionMode::Angular => "hint-dim-angular",
             DimensionMode::Radial | DimensionMode::Diameter => "hint-dim-radial",
         }
@@ -323,6 +462,11 @@ pub enum Drag {
         at_start: bool,
         fixed: DVec2,
     },
+    /// A grip of a selected detail line (see [`crate::sketch_mode::moved`] for `which`).
+    DetailGrip {
+        id: ElementId,
+        which: u8,
+    },
     /// The curvature handle of an arc wall from `a` to `b`: the arc passes through the cursor.
     Bend {
         id: ElementId,
@@ -334,6 +478,100 @@ pub enum Drag {
         ids: Vec<ElementId>,
         copy: bool,
     },
+    /// The tag of an element, as drawn when the drag started.
+    Tag {
+        tag: cc_views::TagHandle,
+        start: DVec2,
+    },
+    /// A section's mark in a plan: the whole mark, an end or a piece of
+    /// its split line, grabbed at `start`.
+    Section {
+        view: ViewId,
+        part: crate::section_mark::Part,
+        start: DVec2,
+    },
+    /// A callout's mark: the whole mark or a corner, grabbed at `start`.
+    Callout {
+        view: ViewId,
+        part: crate::callout_ui::Part,
+        start: DVec2,
+    },
+    /// A hotspot of a scripted component, at elevation `z` (absolute).
+    Hotspot {
+        id: ElementId,
+        name: String,
+        z: f64,
+        shape: cc_core::HotspotShape,
+        color: Color32,
+    },
+}
+
+/// The hotspots of the selected components: element, name, plan point,
+/// absolute elevation, marker shape and color.
+fn selected_hotspots(state: &AppState) -> Vec<(ElementId, String, DVec2, f64, cc_core::HotspotShape, Color32)> {
+    let p = state.project();
+    state
+        .selection
+        .iter()
+        .take(50)
+        .filter(|id| !p.is_pinned(**id))
+        .filter_map(|id| {
+            let e = p.element(*id)?;
+            let ElementKind::Component(c) = &e.kind else { return None };
+            let cc_core::TypeData::Component { def, .. } = &p.element_type(e.type_id)?.data else { return None };
+            let rot = DVec2::from_angle(c.rotation_deg.to_radians());
+            let base = p.level_elevation(e.level) + c.base_offset;
+            let positions = def.hotspot_positions(&c.hotspots);
+            Some(
+                def.hotspots
+                    .iter()
+                    .filter_map(|h| {
+                        let at = positions.get(&h.name)?;
+                        let [r, g, b, a] = h.color;
+                        let color = Color32::from_rgba_unmultiplied(r, g, b, a);
+                        Some((*id, h.name.clone(), c.position + rot.rotate(at.truncate()), base + at.z, h.shape, color))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect()
+}
+
+/// Draw a hotspot marker of `shape` centered at `c`.
+fn hotspot_marker(painter: &egui::Painter, c: Pos2, shape: cc_core::HotspotShape, color: Color32) {
+    use cc_core::HotspotShape as S;
+    let r = 5.5;
+    let stroke = Stroke::new(1.5, Color32::from_gray(40));
+    let poly = |pts: Vec<Pos2>| painter.add(egui::Shape::convex_polygon(pts, color, stroke));
+    match shape {
+        S::Circle => {
+            painter.circle(c, r, color, stroke);
+        }
+        S::Square => {
+            painter.rect(
+                egui::Rect::from_center_size(c, egui::vec2(2.0 * r, 2.0 * r)),
+                0.0,
+                color,
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+        }
+        S::Diamond => {
+            poly(vec![
+                c + egui::vec2(0.0, -r),
+                c + egui::vec2(r, 0.0),
+                c + egui::vec2(0.0, r),
+                c + egui::vec2(-r, 0.0),
+            ]);
+        }
+        S::Triangle => {
+            poly(vec![c + egui::vec2(0.0, -r), c + egui::vec2(r, r * 0.8), c + egui::vec2(-r, r * 0.8)]);
+        }
+        S::TriangleDown => {
+            poly(vec![c + egui::vec2(-r, -r * 0.8), c + egui::vec2(r, -r * 0.8), c + egui::vec2(0.0, r)]);
+        }
+    }
 }
 
 /// Transient state of the active tool.
@@ -363,6 +601,146 @@ pub struct Interaction {
     pub plane_z: Option<f64>,
     /// The dimension chain being continued (continuous dimensioning).
     pub dim_chain: Option<DimChain>,
+    /// Push/pull: the mass face picked (the mass, the face, a point on it and its outward normal).
+    pub push: Option<(ElementId, cc_core::mass::MassFace, glam::DVec3, glam::DVec3)>,
+    /// The segments a chain tool placed, latest last (see [`chain_back`]).
+    pub chain: Vec<ChainStep>,
+    /// Segments taken back, latest last, for redo.
+    pub chain_redo: Vec<ChainStep>,
+}
+
+/// Where a chain stands: its anchor, the direction angles are measured
+/// from, and the elevation a pipe or conduit run goes on at.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ChainAt {
+    anchor: Option<DVec2>,
+    prev_dir: Option<DVec2>,
+    mep: Option<f64>,
+}
+
+/// A segment a chain tool placed: the chain before and after it, its undo
+/// steps (a pipe's rise and run are two), and the document revision it left
+/// (or, taken back, the revision the undo left), so a step is only taken
+/// back or redone when nothing else changed the model meanwhile.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChainStep {
+    before: ChainAt,
+    after: ChainAt,
+    steps: usize,
+    revision: u64,
+}
+
+/// Most segments of a chain remembered.
+const MAX_CHAIN: usize = 500;
+
+fn chain_at(state: &AppState) -> ChainAt {
+    ChainAt { anchor: state.interaction.anchor, prev_dir: state.interaction.prev_dir, mep: state.mep.chain }
+}
+
+fn set_chain_at(state: &mut AppState, at: ChainAt) {
+    state.interaction.anchor = at.anchor;
+    state.interaction.prev_dir = at.prev_dir;
+    state.mep.chain = at.mep;
+    state.mep.rise = None;
+    state.typed.clear();
+}
+
+/// Remember the segment a chain tool just placed, from where the chain
+/// stood (`before`) and the undo depth then.
+fn chain_placed(state: &mut AppState, before: ChainAt, depth: usize) {
+    let steps = state.session.doc.undo_depth().saturating_sub(depth);
+    if steps == 0 {
+        return;
+    }
+    let step = ChainStep { before, after: chain_at(state), steps, revision: state.session.doc.revision() };
+    let chain = &mut state.interaction.chain;
+    chain.push(step);
+    if chain.len() > MAX_CHAIN {
+        chain.remove(0);
+    }
+    state.interaction.chain_redo.clear();
+}
+
+/// The tools that place chains of segments.
+fn chains(tool: &Tool) -> bool {
+    matches!(
+        tool,
+        Tool::Wall { .. }
+            | Tool::Beam { .. }
+            | Tool::Footing { .. }
+            | Tool::Pipe { .. }
+            | Tool::Conduit { .. }
+            | Tool::CableTray { .. }
+            | Tool::LightningConductor { .. }
+            | Tool::Railing { .. }
+            | Tool::Sweep { .. }
+    )
+}
+
+/// Backspace or Ctrl+Z while a chain tool is drawing: take back the last
+/// segment (undoing it) and go on from where it started, without leaving
+/// the tool; with no segment left, drop the start point. A railing's last
+/// point and an arc wall's picked end go first. Returns whether it did
+/// anything.
+pub fn chain_back(state: &mut AppState) -> bool {
+    if !chains(&state.tool) {
+        return false;
+    }
+    // Points not placed yet: a railing's path, an arc wall's end.
+    if state.interaction.points.pop().is_some() {
+        return true;
+    }
+    if let Some(step) = state.interaction.chain.last().copied() {
+        if state.session.doc.revision() == step.revision {
+            for _ in 0..step.steps {
+                crate::actions::run_command(state, cc_engine::commands::project::Undo {});
+            }
+            state.interaction.chain.pop();
+            state.interaction.chain_redo.push(step);
+            chain_synced(state);
+            set_chain_at(state, step.before);
+            state.selection.clear();
+            return true;
+        }
+        // The model changed some other way: the chain's history no longer applies.
+        state.interaction.chain.clear();
+        state.interaction.chain_redo.clear();
+    }
+    if state.interaction.anchor.is_some() {
+        set_chain_at(state, ChainAt::default());
+        return true;
+    }
+    false
+}
+
+/// After stepping a chain back or forth (which changes the revision), the
+/// next step either way is taken from the model as it now is.
+fn chain_synced(state: &mut AppState) {
+    let revision = state.session.doc.revision();
+    let i = &mut state.interaction;
+    for step in [i.chain.last_mut(), i.chain_redo.last_mut()].into_iter().flatten() {
+        step.revision = revision;
+    }
+}
+
+/// Ctrl+Y after [`chain_back`]: place the segment again and go on from its end.
+pub fn chain_forward(state: &mut AppState) -> bool {
+    if !chains(&state.tool) {
+        return false;
+    }
+    let Some(step) = state.interaction.chain_redo.last().copied() else { return false };
+    if state.session.doc.revision() != step.revision {
+        state.interaction.chain_redo.clear();
+        return false;
+    }
+    for _ in 0..step.steps {
+        crate::actions::run_command(state, cc_engine::commands::project::Redo {});
+    }
+    state.interaction.chain_redo.pop();
+    state.interaction.chain.push(step);
+    chain_synced(state);
+    set_chain_at(state, step.after);
+    true
 }
 
 impl Interaction {
@@ -372,7 +750,8 @@ impl Interaction {
 }
 
 /// A chain of dimensions being placed: the next one measures from `last`
-/// along `dir` and sits on the line through `line`.
+/// (the origin of ordinate dimensions, which stays) along `dir` and sits on
+/// the line through `line`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DimChain {
     pub view: ViewId,
@@ -381,17 +760,25 @@ pub struct DimChain {
     pub line: DVec2,
     /// Linear (horizontal or vertical) rather than aligned dimensions.
     pub linear: bool,
+    /// Running dimensions from the origin `last`.
+    pub ordinate: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SnapKind {
     Endpoint,
     Midpoint,
+    /// The center of an arc or circle (imported drawings), a column, a pile or a pad footing.
+    Center,
     Nearest,
     /// On a guide from an acquired point.
     Alignment,
-    /// Where two guides cross.
+    /// Where two guides cross, or two lines or arcs.
     Intersection,
+    /// The foot of the perpendicular from the point a segment is drawn from.
+    Perpendicular,
+    /// Where a line from the point a segment is drawn from touches an arc or circle.
+    Tangent,
     Free,
 }
 
@@ -407,10 +794,28 @@ impl Snap {
     fn at(point: DVec2, kind: SnapKind) -> Self {
         Self { point, kind, guides: [None, None] }
     }
+
+    /// A snap to `point`, shown as an end point when `on_point`, else free.
+    pub(crate) fn plain(point: DVec2, on_point: bool) -> Self {
+        Self::at(point, if on_point { SnapKind::Endpoint } else { SnapKind::Free })
+    }
+
+    /// A snap to the nearest point of a line.
+    pub(crate) fn nearest(point: DVec2) -> Self {
+        Self::at(point, SnapKind::Nearest)
+    }
+
+    /// Whether nothing was snapped to.
+    pub(crate) fn is_free(&self) -> bool {
+        self.kind == SnapKind::Free
+    }
 }
 
 /// Points acquired for alignment, most recent first.
 const MAX_TRACKED: usize = 6;
+/// A footing outline with more sides than this is a curve in chords: its
+/// corners and sides are not snap points.
+const MAX_OUTLINE_SIDES: usize = 64;
 
 /// Snap through [`snap`] with the interaction's acquired points, and
 /// acquire the point when it is a model point.
@@ -424,9 +829,17 @@ pub(crate) fn snap_at(
     scale: f64,
     ortho: bool,
 ) -> Snap {
-    let (project, geom) = (&state.session.doc.project, state.session.geom());
-    let s = snap(project, geom, level, raw, anchor, extra, &state.interaction.tracked, scale, ortho);
-    if matches!(s.kind, SnapKind::Endpoint | SnapKind::Midpoint) {
+    let on = state.prefs.snaps.effective();
+    let mut cad = cad_snap(state, raw, SNAP_PX / scale * 1.5);
+    // Every element the view draws, by its lines (issue #317).
+    if on.elements
+        && let Some(drawing) = state.active_view.and_then(|v| state.drawing(v))
+    {
+        crate::snaps::drawing_snap(&drawing, raw, SNAP_PX / scale * 1.5, &mut cad);
+    }
+    let model = model_snaps_cached(state, level);
+    let s = snap_with(&model, raw, anchor, extra, &state.interaction.tracked, scale, ortho, &cad, &on);
+    if matches!(s.kind, SnapKind::Endpoint | SnapKind::Midpoint | SnapKind::Center) {
         let tracked = &mut state.interaction.tracked;
         tracked.retain(|p| p.distance(s.point) > 1e-9);
         tracked.insert(0, s.point);
@@ -437,9 +850,106 @@ pub(crate) fn snap_at(
 
 const SNAP_PX: f64 = 10.0;
 
-/// Increment for rounding free coordinates at the current zoom.
-fn round_step(scale: f64) -> f64 {
-    [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0].into_iter().find(|s| s * scale >= 6.0).unwrap_or(10.0)
+/// Snap features of the imported drawings and detail lines shown in the
+/// active view near `raw`, and of the lines of its underlay (the other
+/// levels' plans drawn under it).
+pub(crate) fn cad_snap(state: &mut AppState, raw: DVec2, r: f64) -> cc_core::cad::CadSnap {
+    let mut out = cc_core::cad::CadSnap::default();
+    let Some(view) = state.active_view else { return out };
+    if let Some(drawing) = state.drawing(view) {
+        underlay_snap(&drawing, raw, r, &mut out);
+    }
+    let ids: Vec<ElementId> = state
+        .project()
+        .elements
+        .values()
+        .filter(|e| match &e.kind {
+            ElementKind::CadImport(c) => c.view == view,
+            ElementKind::DetailLine(l) => l.view == view && crate::detail_ui::near(l, raw, r),
+            _ => false,
+        })
+        .map(|e| e.id)
+        .collect();
+    if ids.is_empty() {
+        return out;
+    }
+    // Only drawings the view shows (not hidden by its graphics or temporarily).
+    let Some(drawing) = state.drawing(view) else { return out };
+    for id in ids {
+        if !drawing.prims.iter().any(|p| p.element() == Some(id)) {
+            continue;
+        }
+        if let Some(ElementKind::DetailLine(l)) = state.project().element(id).map(|e| &e.kind) {
+            l.snap_features(&mut out);
+        }
+        // A copy (its drawing is shared), so that the index cache can change.
+        if let Some(ElementKind::CadImport(c)) = state.project().element(id).map(|e| e.kind.clone()) {
+            let index = cad_index(&mut state.cad_snap_index, id, &c.drawing);
+            let f = c.snap_features_in(&index, raw, r);
+            out.ends.extend(f.ends);
+            out.mids.extend(f.mids);
+            out.centers.extend(f.centers);
+            out.lines.extend(f.lines);
+            out.arcs.extend(f.arcs);
+        }
+    }
+    out
+}
+
+/// An imported drawing and the snap index built from it.
+pub type CadIndexEntry = (std::sync::Arc<cc_core::CadDrawing>, std::sync::Arc<cc_core::cad::CadSnapIndex>);
+
+/// The snap index of element `id`'s `drawing`: the one in `cache` while the
+/// drawing is the same (an edit that changes it gives a new `Arc`), else a new one.
+fn cad_index(
+    cache: &mut std::collections::HashMap<ElementId, CadIndexEntry>,
+    id: ElementId,
+    drawing: &std::sync::Arc<cc_core::CadDrawing>,
+) -> std::sync::Arc<cc_core::cad::CadSnapIndex> {
+    if let Some((d, index)) = cache.get(&id)
+        && std::sync::Arc::ptr_eq(d, drawing)
+    {
+        return index.clone();
+    }
+    let index = std::sync::Arc::new(cc_core::cad::CadSnapIndex::new(drawing));
+    cache.insert(id, (drawing.clone(), index.clone()));
+    index
+}
+
+/// Lines of `drawing`'s underlay passing within `r` of `raw`, with their
+/// ends and midpoints (the underlay has no arcs: plans draw them as chords).
+pub(crate) fn underlay_snap(drawing: &Drawing2D, raw: DVec2, r: f64, out: &mut cc_core::cad::CadSnap) {
+    let Some(under) = drawing.prims.get(..drawing.underlay) else { return };
+    for prim in under {
+        let cc_views::Prim::Line { a, b, .. } = prim else { continue };
+        if a.distance(*b) < 1e-9 || polygon::closest_on_segment(*a, *b, raw).0.distance(raw) > r {
+            continue;
+        }
+        out.ends.extend([*a, *b]);
+        out.mids.push((*a + *b) * 0.5);
+        out.lines.push((*a, *b));
+    }
+}
+
+/// Increment for rounding free coordinates at the current zoom: 1 cm to
+/// 10 m in metric projects, 1/2" to 20'-0" in imperial ones, so drawn
+/// lengths land on round values of the project's system.
+pub(crate) fn round_step(scale: f64) -> f64 {
+    use cc_core::units::{FOOT, INCH};
+    let (steps, last): (&[f64], f64) = if format::imperial() {
+        (&[INCH / 2.0, INCH, 3.0 * INCH, 6.0 * INCH, FOOT, 2.0 * FOOT, 5.0 * FOOT, 10.0 * FOOT], 20.0 * FOOT)
+    } else {
+        (&[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0], 10.0)
+    };
+    steps.iter().copied().find(|s| s * scale >= 6.0).unwrap_or(last)
+}
+
+/// `meters` rounded to a millimeter, or to 1/16" in imperial projects
+/// (component reference planes and sketches), to 1e-7 m so it writes short.
+pub(crate) fn round_fine(meters: f64) -> f64 {
+    let step = if format::imperial() { cc_core::units::INCH / 16.0 } else { 0.001 };
+    let v = (meters / step).round() * step;
+    (v * 1e7).round() / 1e7
 }
 
 /// Snap `raw` to model points, wall lines, alignments and angle/length
@@ -447,6 +957,22 @@ fn round_step(scale: f64) -> f64 {
 /// with the anchor and `extra` they cast horizontal, vertical and wall-line
 /// guides; a crossing of two guides, or of a guide with the current
 /// direction from the anchor, is a snap point.
+/// The selection rectangle from `start` to `cur`: a window (solid outline)
+/// dragged to the right, a crossing (dashed, green) dragged to the left.
+pub(crate) fn select_box(painter: &egui::Painter, start: egui::Pos2, cur: egui::Pos2) {
+    let rect = egui::Rect::from_two_pos(start, cur);
+    let crossing = cur.x < start.x;
+    let color = if crossing { Color32::from_rgb(30, 160, 60) } else { HIGHLIGHT };
+    painter.rect_filled(rect, 0.0, color.gamma_multiply(0.08));
+    if crossing {
+        let c = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom(), rect.left_top()];
+        painter.extend(egui::Shape::dashed_line(&c, Stroke::new(1.0, color), 5.0, 3.0));
+    } else {
+        painter.rect_stroke(rect, 0.0, Stroke::new(1.0, color), egui::StrokeKind::Middle);
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn snap(
     project: &Project,
@@ -459,9 +985,44 @@ fn snap(
     scale: f64,
     ortho: bool,
 ) -> Snap {
-    let r = SNAP_PX / scale;
-    let mut ends: Vec<DVec2> = extra.to_vec();
+    let cad = cc_core::cad::CadSnap::default();
+    let on = crate::snaps::SnapSettings::default();
+    snap_with(&model_snaps(project, geom, level), raw, anchor, extra, tracked, scale, ortho, &cad, &on)
+}
+
+/// The model's snap candidates on a level: element ends, midpoints, lines and arcs, outlines,
+/// grid lines and crossings, risers. They depend only on the model, so they are gathered once
+/// per revision and level (see [`model_snaps_cached`]), not on every pointer move.
+#[derive(Debug, Default)]
+pub(crate) struct ModelSnaps {
+    ends: Vec<DVec2>,
+    mids: Vec<DVec2>,
+    /// Centers: columns, piles and pad footings.
+    centers: Vec<DVec2>,
+    lines: Vec<(DVec2, DVec2)>,
+    arcs: Vec<cc_core::arc::Arc>,
+}
+
+/// The cached [`ModelSnaps`] of `level`, gathered again when the document or the level changes.
+fn model_snaps_cached(state: &mut AppState, level: Option<LevelId>) -> std::sync::Arc<ModelSnaps> {
+    let revision = state.session.doc.revision();
+    if let Some((r, l, snaps)) = &state.snap_cache
+        && *r == revision
+        && *l == level
+    {
+        return snaps.clone();
+    }
+    let (project, geom) = state.session.project_and_geometry();
+    let snaps = std::sync::Arc::new(model_snaps(project, geom, level));
+    state.snap_cache = Some((revision, level, snaps.clone()));
+    snaps
+}
+
+/// Gather the model's snap candidates on `level`.
+fn model_snaps(project: &Project, geom: &ModelGeometry, level: Option<LevelId>) -> ModelSnaps {
+    let mut ends: Vec<DVec2> = Vec::new();
     let mut mids = Vec::new();
+    let mut centers = Vec::new();
     let mut lines = Vec::new();
     let mut arcs: Vec<cc_core::arc::Arc> = Vec::new();
     for e in project.elements.values().filter(|e| Some(e.level) == level) {
@@ -472,6 +1033,40 @@ fn snap(
                 Some(a) => arcs.push(a),
                 None => lines.push((w.start, w.end)),
             }
+        } else if let ElementKind::Beam(b) = &e.kind
+            && let Some(a) = b.arc()
+        {
+            // An arc beam's location line: its ends, its middle and the arc itself.
+            ends.extend([b.start, b.end]);
+            mids.push(a.point(a.length() * 0.5));
+            arcs.push(a);
+        } else if let ElementKind::Beam(b) = &e.kind {
+            // A straight beam's location line (issue #317); its faces come with the outlines.
+            ends.extend([b.start, b.end]);
+            mids.push((b.start + b.end) * 0.5);
+            lines.push((b.start, b.end));
+        } else if let ElementKind::Foundation(f) = &e.kind {
+            match &f.shape {
+                cc_core::FoundationShape::Pad { position, .. } => centers.push(*position),
+                cc_core::FoundationShape::Strip { start, end, .. } => {
+                    ends.extend([*start, *end]);
+                    match f.shape.arc() {
+                        Some(a) => {
+                            mids.push(a.point(a.length() * 0.5));
+                            arcs.push(a);
+                        }
+                        None => {
+                            mids.push((*start + *end) * 0.5);
+                            lines.push((*start, *end));
+                        }
+                    }
+                }
+                cc_core::FoundationShape::Slab { .. } => {}
+            }
+        } else if let ElementKind::Column(c) = &e.kind {
+            centers.push(c.position);
+        } else if let ElementKind::Pile(pile) = &e.kind {
+            centers.push(pile.position);
         } else if let Some(s) = e.as_segment() {
             // Pipe and conduit ends, and runs to branch from.
             ends.extend([s.start, s.end]);
@@ -490,27 +1085,49 @@ fn snap(
         } else if let ElementKind::Railing(r) = &e.kind {
             ends.extend_from_slice(&r.path);
             lines.extend(r.path.windows(2).map(|w| (w[0], w[1])));
+        } else if let ElementKind::Sweep(sw) = &e.kind {
+            ends.extend_from_slice(&sw.path);
+            lines.extend(sw.path.windows(2).map(|w| (w[0], w[1])));
+            if sw.closed
+                && let (Some(a), Some(b)) = (sw.path.last(), sw.path.first())
+            {
+                lines.push((*a, *b));
+            }
         }
         // Outlines as the plan draws them: corners are endpoints, edges lines.
         let outlines: Vec<Vec<DVec2>> = match (&e.kind, project.element_type(e.type_id).map(|t| &t.data)) {
             (ElementKind::Wall(_), _) => geom.walls.get(&e.id).filter(|w| w.arc.is_none()).map(|w| vec![w.footprint()]),
-            (
-                ElementKind::Column(c),
-                Some(cc_core::TypeData::Column {
-                    section: section @ (ColumnSection::Rectangular { .. } | ColumnSection::Profile { .. }),
-                    ..
-                }),
-            ) => Some(cc_geom::section::column_loops(*section, c.position, c.rotation_deg)),
+            // Corners of the section without its radii (round sections have none).
+            (ElementKind::Column(c), Some(data @ cc_core::TypeData::Column { .. })) => {
+                project.type_section_without_radii(data).filter(|s| !s.curved).map(|s| {
+                    let (outer, holes) = cc_geom::section::column_body(&s.outline, c.position, c.rotation_deg);
+                    std::iter::once(outer).chain(holes).collect()
+                })
+            }
             (ElementKind::Stair(st), _) => cc_geom::stair_geom(project, e, st).map(|g| g.parts),
             (ElementKind::Ramp(r), _) => {
                 cc_geom::ramp_geom(project, e, r).map(|g| g.pieces.into_iter().map(|p| p.outline).collect())
             }
+            // The faces of a straight beam, and of a footing that is not curved,
+            // with the middles of their sides.
+            (ElementKind::Beam(_), _) => {
+                geom.beams.get(&e.id).filter(|b| b.arc.is_none()).map(|b| vec![b.footprint().to_vec()])
+            }
+            (ElementKind::Foundation(_), _) => geom
+                .foundations
+                .get(&e.id)
+                .filter(|f| f.arc.is_none() && f.drawn_area.is_none() && f.footprint.len() <= MAX_OUTLINE_SIDES)
+                .map(|f| std::iter::once(f.footprint.clone()).chain(f.holes.iter().cloned()).collect()),
             _ => None,
         }
         .unwrap_or_default();
+        let sides = matches!(e.kind, ElementKind::Beam(_) | ElementKind::Foundation(_));
         for o in outlines {
             ends.extend_from_slice(&o);
             lines.extend(closed_edges(&o));
+            if sides {
+                mids.extend(closed_edges(&o).map(|(a, b)| (a + b) * 0.5));
+            }
         }
     }
     // Grid lines show on every level; their crossings are endpoints.
@@ -525,14 +1142,65 @@ fn snap(
         let risers = project.segments_at(level).filter(|(e, _)| e.level != level);
         ends.extend(risers.map(|(_, s)| s.start));
     }
+    ModelSnaps { ends, mids, centers, lines, arcs }
+}
+
+/// [`snap`] over the model's candidates `model` with the snap features of imported drawings too
+/// (their endpoints, midpoints, arc centers, lines and arcs).
+#[allow(clippy::too_many_arguments)]
+fn snap_with(
+    model: &ModelSnaps,
+    raw: DVec2,
+    anchor: Option<DVec2>,
+    extra: &[DVec2],
+    tracked: &[DVec2],
+    scale: f64,
+    ortho: bool,
+    cad: &cc_core::cad::CadSnap,
+    on: &crate::snaps::SnapSettings,
+) -> Snap {
+    let r = SNAP_PX / scale;
+    // In the order they always had: the extra points (the tool's own, always
+    // on), the drawings', then the model's.
+    let found = cad.ends.iter().chain(&model.ends).filter(|_| on.endpoint);
+    let ends: Vec<DVec2> = extra.iter().chain(found).copied().collect();
+    let mids: Vec<DVec2> = cad.mids.iter().chain(&model.mids).copied().collect();
+    let centers: Vec<DVec2> = cad.centers.iter().chain(&model.centers).copied().collect();
+    let lines: Vec<(DVec2, DVec2)> = cad.lines.iter().chain(&model.lines).copied().collect();
+    let arcs: Vec<cc_core::arc::Arc> = cad.arcs.iter().chain(&model.arcs).cloned().collect();
     let nearest = |pts: &[DVec2]| {
         pts.iter().map(|p| (*p, p.distance(raw))).filter(|(_, d)| *d <= r).min_by(|a, b| a.1.total_cmp(&b.1))
     };
     if let Some((p, _)) = nearest(&ends) {
         return Snap::at(p, SnapKind::Endpoint);
     }
-    if let Some((p, _)) = nearest(&mids) {
+    if on.center
+        && let Some((p, _)) = nearest(&centers)
+    {
+        return Snap::at(p, SnapKind::Center);
+    }
+    if on.midpoint
+        && let Some((p, _)) = nearest(&mids)
+    {
         return Snap::at(p, SnapKind::Midpoint);
+    }
+    // Where two lines or arcs cross; the perpendicular and tangent from the anchor (issue #159).
+    if on.intersection
+        && let Some(p) = crate::snap_geom::crossing(&lines, &arcs, raw, r)
+    {
+        return Snap::at(p, SnapKind::Intersection);
+    }
+    if let Some(a) = anchor {
+        if on.perpendicular
+            && let Some(p) = crate::snap_geom::perpendicular(a, &lines, &arcs, raw, r)
+        {
+            return Snap { point: p, kind: SnapKind::Perpendicular, guides: [Some((a, p)), None] };
+        }
+        if on.tangent
+            && let Some(p) = crate::snap_geom::tangent(a, &arcs, raw, r)
+        {
+            return Snap { point: p, kind: SnapKind::Tangent, guides: [Some((a, p)), None] };
+        }
     }
 
     // Guides (origin, unit direction) passing near the pointer.
@@ -552,7 +1220,9 @@ fn snap(
         }
     }
     let off = |g: &(DVec2, DVec2), q: DVec2| (q - g.0).perp_dot(g.1).abs();
-    guides.retain(|g| off(g, raw) <= r && g.0.distance(raw) > r);
+    guides.retain(|g| on.alignment && off(g, raw) <= r && g.0.distance(raw) > r);
+    // The nearest point of a line or an arc.
+    let (lines, arcs) = if on.nearest { (lines, arcs) } else { Default::default() };
     // Two guides crossing near the pointer.
     let mut best: Option<(Snap, f64)> = None;
     for (i, g) in guides.iter().enumerate() {
@@ -656,6 +1326,18 @@ pub(crate) fn draw_snap(painter: &Painter, xf: &Xf, s: Snap) {
         SnapKind::Alignment => {
             painter.circle_stroke(c, 4.0, stroke);
         }
+        SnapKind::Perpendicular => {
+            // A right angle on its base.
+            let (l, r, top) = (c + egui::vec2(-6.0, 6.0), c + egui::vec2(6.0, 6.0), c + egui::vec2(-6.0, -6.0));
+            painter.line_segment([l, r], stroke);
+            painter.line_segment([l, top], stroke);
+            painter.add(egui::Shape::line(vec![c + egui::vec2(-6.0, 0.0), c, c + egui::vec2(0.0, 6.0)], stroke));
+        }
+        SnapKind::Tangent => {
+            // A circle under a line that touches it.
+            painter.circle_stroke(c + egui::vec2(0.0, 2.0), 4.5, stroke);
+            painter.line_segment([c + egui::vec2(-7.0, -2.5), c + egui::vec2(7.0, -2.5)], stroke);
+        }
         SnapKind::Endpoint => {
             painter.rect_stroke(
                 egui::Rect::from_center_size(c, egui::vec2(10.0, 10.0)),
@@ -667,6 +1349,11 @@ pub(crate) fn draw_snap(painter: &Painter, xf: &Xf, s: Snap) {
         SnapKind::Midpoint => {
             let pts = vec![c + egui::vec2(0.0, -6.0), c + egui::vec2(6.0, 5.0), c + egui::vec2(-6.0, 5.0)];
             painter.add(egui::Shape::closed_line(pts, stroke));
+        }
+        SnapKind::Center => {
+            painter.circle_stroke(c, 6.0, stroke);
+            painter.line_segment([c + egui::vec2(-3.0, 0.0), c + egui::vec2(3.0, 0.0)], stroke);
+            painter.line_segment([c + egui::vec2(0.0, -3.0), c + egui::vec2(0.0, 3.0)], stroke);
         }
         SnapKind::Nearest => {
             painter.line_segment([c + egui::vec2(-5.0, -5.0), c + egui::vec2(5.0, 5.0)], stroke);
@@ -686,11 +1373,11 @@ pub(crate) fn label(painter: &Painter, pos: Pos2, text: String) {
 }
 
 /// Color of temporary dimensions.
-const TEMP_DIM: Color32 = Color32::from_rgb(40, 110, 200);
+pub(crate) const TEMP_DIM: Color32 = Color32::from_rgb(40, 110, 200);
 
 /// Text on a light background, centered at `pos` and rotated by `angle`
 /// (radians, screen orientation), kept upright.
-fn dim_text(painter: &Painter, pos: Pos2, text: String, angle: f32, strong: bool) {
+pub(crate) fn dim_text(painter: &Painter, pos: Pos2, text: String, angle: f32, strong: bool) {
     let angle =
         if angle.abs() > std::f32::consts::FRAC_PI_2 { angle - angle.signum() * std::f32::consts::PI } else { angle };
     let font =
@@ -750,26 +1437,7 @@ pub(crate) fn temp_dimension(
     let len = a.distance(p);
     let Some(dir) = (p - a).try_normalize() else { return };
     let thin = Stroke::new(1.0, TEMP_DIM);
-    // Dimension line, offset to the left of the segment.
-    let n = dir.perp();
-    let offset = (side + 26.0 / xf.scale) * n;
-    let gap = n * (4.0 / xf.scale);
-    let over = n * (5.0 / xf.scale);
-    let (da, dp) = (a + offset, p + offset);
-    for q in [a, p] {
-        painter.line_segment([xf.to_screen(q + n * side + gap), xf.to_screen(q + offset + over)], thin);
-    }
-    painter.line_segment([xf.to_screen(da), xf.to_screen(dp)], thin);
-    // Architectural ticks.
-    let tick = (dir + n).normalize_or_zero() * (5.0 / xf.scale);
-    for q in [da, dp] {
-        painter.line_segment([xf.to_screen(q - tick), xf.to_screen(q + tick)], Stroke::new(1.5, TEMP_DIM));
-    }
-    let unit = format::current().0.length.unit.symbol();
-    let text = if typed.length.is_empty() { format::length(len) } else { format!("{} {unit} \u{23ce}", typed.length) };
-    let screen_dir = xf.to_screen(dp) - xf.to_screen(da);
-    let mid = xf.to_screen((da + dp) * 0.5) + (xf.to_screen(da + n) - xf.to_screen(da)).normalized() * 9.0;
-    dim_text(painter, mid, text, screen_dir.y.atan2(screen_dir.x), !typed.angle_active);
+    dimension_line(painter, xf, a, p, &typed.length, !typed.angle_active, side);
 
     // Angle to the reference direction.
     let reference = reference.and_then(|r| r.try_normalize()).unwrap_or(DVec2::X);
@@ -795,6 +1463,40 @@ pub(crate) fn temp_dimension(
     let text =
         if typed.angle.is_empty() { format::angle(degrees.abs()) } else { format!("{}\u{b0} \u{23ce}", typed.angle) };
     dim_text(painter, label_at, text, 0.0, typed.angle_active);
+}
+
+/// A temporary dimension line beside the segment from `a` to `p` (to its
+/// left, `side` further out) with its length, or the `typed` value;
+/// `active` marks the field typing goes to.
+pub(crate) fn dimension_line(painter: &Painter, xf: &Xf, a: DVec2, p: DVec2, typed: &str, active: bool, side: f64) {
+    let len = a.distance(p);
+    let Some(dir) = (p - a).try_normalize() else { return };
+    let thin = Stroke::new(1.0, TEMP_DIM);
+    // Dimension line, offset to the left of the segment.
+    let n = dir.perp();
+    let offset = (side + 26.0 / xf.scale) * n;
+    let gap = n * (4.0 / xf.scale);
+    let over = n * (5.0 / xf.scale);
+    let (da, dp) = (a + offset, p + offset);
+    for q in [a, p] {
+        painter.line_segment([xf.to_screen(q + n * side + gap), xf.to_screen(q + offset + over)], thin);
+    }
+    painter.line_segment([xf.to_screen(da), xf.to_screen(dp)], thin);
+    // Architectural ticks.
+    let tick = (dir + n).normalize_or_zero() * (5.0 / xf.scale);
+    for q in [da, dp] {
+        painter.line_segment([xf.to_screen(q - tick), xf.to_screen(q + tick)], Stroke::new(1.5, TEMP_DIM));
+    }
+    let unit = format::current().0.length.unit;
+    let text = match (typed.is_empty(), unit.is_fractional()) {
+        (true, _) => format::length(len),
+        // Feet and inches carry their own marks.
+        (false, true) => format!("{typed} \u{23ce}"),
+        (false, false) => format!("{typed} {} \u{23ce}", unit.symbol()),
+    };
+    let screen_dir = xf.to_screen(dp) - xf.to_screen(da);
+    let mid = xf.to_screen((da + dp) * 0.5) + (xf.to_screen(da + n) - xf.to_screen(da)).normalized() * 9.0;
+    dim_text(painter, mid, text, screen_dir.y.atan2(screen_dir.x), active);
 }
 
 /// Values typed while drawing a segment: digits go to the active field
@@ -832,6 +1534,30 @@ impl TypedInput {
         format::parse_number(&self.angle).filter(|v| v.is_finite())
     }
 
+    /// The second field read as a length, for tools that take two (a
+    /// rectangle's width and depth).
+    pub fn second_length(&self) -> Option<f64> {
+        format::parse_length(&self.angle).filter(|v| v.is_finite() && *v > 0.0)
+    }
+
+    /// Takes a character typed into the active field, if it belongs in a
+    /// value: digits and decimal marks, and in feet and inches the marks,
+    /// fractions (`12'6 1/2"`) and, inside a length already started, a space
+    /// or a dash. `second_is_length` when the second field is a length too.
+    pub fn type_char(&mut self, ch: char, second_is_length: bool) -> bool {
+        if ch.is_ascii_digit() || ch == ',' || ch == '.' {
+            self.push(ch);
+            return true;
+        }
+        let in_length = !self.angle_active || second_is_length;
+        let started = !if self.angle_active { &self.angle } else { &self.length }.is_empty();
+        if in_length && format::imperial() && (matches!(ch, '\'' | '"' | '/') || (started && matches!(ch, ' ' | '-'))) {
+            self.push(ch);
+            return true;
+        }
+        false
+    }
+
     /// The end of a segment from `a` toward the cursor `p`, with the typed
     /// length and the typed angle from `reference` (the X axis by default;
     /// the angle turns to the cursor's side of it).
@@ -864,6 +1590,8 @@ pub fn handle(
         (Tool::MatchType, _) => crate::clipboard::match_type_tool(resp, painter, state, xf, drawing),
         // Demolishing works in plans, elevations and sections.
         (Tool::Demolish, _) => crate::phases_dialog::demolish_tool(resp, painter, state, view, xf, drawing),
+        // Curtain grids are edited in plans, elevations and sections.
+        (Tool::CurtainGrid, _) => crate::curtain_ui::grid_tool(resp, painter, state, view, xf),
         // Dimensions work in any 2D view.
         (Tool::Dimension { type_id, mode }, _) => {
             dimension_tool(ui, resp, painter, state, view, (*type_id, *mode), xf, drawing)
@@ -872,14 +1600,68 @@ pub fn handle(
         (Tool::Measure, _) => measure_tool(ui, resp, painter, state, xf, drawing),
         // Joining geometry too (sections show it best).
         (Tool::JoinGeometry { unjoin }, _) => crate::modify::join_tool(resp, painter, state, xf, drawing, *unjoin),
+        (Tool::AttachTop, _) => crate::modify::attach_tool(resp, painter, state, xf, drawing),
         // Text notes too.
         (Tool::Text { type_id }, _) => {
             let px_per_mm = xf.scale * view.scale.max(1) as f64 / 1000.0;
             crate::text_tool::text_tool(ui, resp, painter, state, view, *type_id, xf, px_per_mm)
         }
+        // Level marks go in plans, elevations and sections.
+        (Tool::LevelMark { type_id }, _) => {
+            crate::level_mark_ui::tool(ui, resp, painter, state, view, *type_id, xf, drawing)
+        }
         (Tool::AddLeader { id }, _) => {
             let px_per_mm = xf.scale * view.scale.max(1) as f64 / 1000.0;
             crate::text_tool::add_leader_tool(ui, resp, painter, state, view, *id, xf, px_per_mm)
+        }
+        // Callouts go in plans, ceiling plans, sections and elevations.
+        (Tool::Callout, _) if view.kind.croppable() => crate::callout_ui::tool(ui, resp, painter, state, view, xf),
+        // Regions are sketched in any view that holds drawings, in its coordinates.
+        (Tool::Sketch { category: Category::FilledRegion | Category::MaskingRegion, .. }, level)
+            if cc_views::hosts_cad(&view.kind) =>
+        {
+            crate::sketch_mode::canvas(ui, resp, painter, state, level, xf);
+        }
+        // Detail lines go in any view that holds drawings.
+        (Tool::DetailLine, _) if cc_views::hosts_cad(&view.kind) => {
+            crate::detail_ui::tool(ui, resp, painter, state, view, xf);
+        }
+        // Detail components too.
+        (Tool::DetailComponent { type_id }, _) if cc_views::hosts_cad(&view.kind) => {
+            crate::detail_component_ui::tool(ui, resp, painter, state, view, *type_id, xf);
+        }
+        // Outside plans the modify tools edit what the view owns (detail
+        // lines, texts, dimensions), in its drawing coordinates.
+        (
+            Tool::Move
+            | Tool::Copy
+            | Tool::Rotate
+            | Tool::Mirror { .. }
+            | Tool::Array
+            | Tool::TrimCorner
+            | Tool::TrimExtend
+            | Tool::Split
+            | Tool::Offset,
+            _,
+        ) if !is_plan && cc_views::hosts_cad(&view.kind) => {
+            if crate::detail_ui::view_owned(state, &tool) {
+                let level = view.level().or_else(|| state.project().levels.first().map(|l| l.id));
+                if let Some(level) = level {
+                    crate::modify::handle(ui, resp, painter, state, level, xf, drawing, &tool);
+                }
+            } else {
+                if resp.clicked() {
+                    state.message = t!("msg-plan-only");
+                }
+                select(ui, resp, painter, state, false, xf, drawing);
+            }
+        }
+        // Faces are painted in 3D views.
+        (Tool::Paint { .. }, _) => {
+            if resp.clicked() {
+                state.message = t!("hint-paint-3d");
+            }
+            select(ui, resp, painter, state, is_plan, xf, drawing);
         }
         (_, None) | (_, Some(_)) if !is_plan => {
             if resp.clicked() {
@@ -891,9 +1673,7 @@ pub fn handle(
         (Tool::Hosted { category, type_id }, Some(level)) => {
             hosted_tool(ui, resp, painter, state, level, *category, *type_id, xf)
         }
-        (Tool::Sketch { category, type_id }, Some(level)) => {
-            sketch_tool(ui, resp, painter, state, level, *category, *type_id, xf)
-        }
+        (Tool::Sketch { .. }, Some(level)) => crate::sketch_mode::canvas(ui, resp, painter, state, Some(level), xf),
         (Tool::Section, level) => section_tool(ui, resp, painter, state, level, xf),
         (Tool::Opening { host, .. }, Some(level)) => {
             if let Some(pts) = sketch_input(ui, resp, painter, state, level, xf) {
@@ -902,13 +1682,23 @@ pub fn handle(
         }
         (Tool::Room { type_id }, Some(level)) => room_tool(resp, painter, state, level, *type_id, xf),
         (Tool::Grid { type_id }, Some(level)) => grid_tool(ui, resp, painter, state, level, *type_id, xf),
-        (Tool::Column { type_id }, Some(level)) => column_tool(ui, resp, painter, state, level, *type_id, xf),
-        (Tool::Beam { type_id }, Some(level)) => beam_tool(ui, resp, painter, state, level, *type_id, xf),
+        (Tool::Column { type_id, .. }, Some(level)) => column_tool(ui, resp, painter, state, level, *type_id, xf),
+        (Tool::Beam { type_id, .. }, Some(level)) => beam_tool(ui, resp, painter, state, level, *type_id, xf),
         (Tool::Footing { type_id }, Some(level)) => footing_tool(ui, resp, painter, state, level, *type_id, xf),
-        (Tool::Truss { type_id }, Some(level)) => truss_tool(ui, resp, painter, state, level, *type_id, xf),
+        (Tool::Truss { material }, Some(level)) => truss_tool(ui, resp, painter, state, level, *material, xf),
+        (Tool::Bracing { material }, Some(level)) => bracing_tool(ui, resp, painter, state, level, *material, xf),
         (Tool::Stair { type_id }, Some(level)) => stair_tool(ui, resp, painter, state, level, *type_id, xf),
         (Tool::Ramp { type_id }, Some(level)) => ramp_tool(ui, resp, painter, state, level, *type_id, xf),
-        (Tool::Railing { type_id }, Some(level)) => railing_tool(ui, resp, painter, state, level, *type_id, xf),
+        (Tool::Railing { type_id }, _) if state.railing_host.on => {
+            host_railing_tool(resp, painter, state, *type_id, xf, drawing);
+        }
+        (Tool::Railing { type_id }, Some(level)) => {
+            path_tool(ui, resp, painter, state, level, *type_id, xf, false, finish_railing);
+        }
+        (Tool::Sweep { type_id }, Some(level)) => {
+            let closed = state.sweep.closed;
+            path_tool(ui, resp, painter, state, level, *type_id, xf, closed, finish_sweep);
+        }
         (
             Tool::Move
             | Tool::Copy
@@ -925,14 +1715,28 @@ pub fn handle(
         ) => crate::modify::handle(ui, resp, painter, state, level, xf, drawing, &tool),
         (Tool::Paste, Some(level)) => crate::clipboard::paste_tool(ui, resp, painter, state, view.id, level, xf),
         (Tool::Component { type_id }, Some(level)) => component_tool(ui, resp, painter, state, level, *type_id, xf),
-        (Tool::Pipe { type_id }, Some(level)) => segment_tool(ui, resp, painter, state, level, *type_id, true, xf),
-        (Tool::Conduit { type_id }, Some(level)) => segment_tool(ui, resp, painter, state, level, *type_id, false, xf),
+        (Tool::Pipe { type_id }, Some(level)) => {
+            segment_tool(ui, resp, painter, state, level, *type_id, Run::Pipe, xf);
+        }
+        (Tool::Conduit { type_id }, Some(level)) => {
+            segment_tool(ui, resp, painter, state, level, *type_id, Run::Conduit, xf);
+        }
+        (Tool::CableTray { type_id }, Some(level)) => {
+            segment_tool(ui, resp, painter, state, level, *type_id, Run::Tray, xf);
+        }
+        (Tool::LightningConductor { type_id }, Some(level)) => {
+            segment_tool(ui, resp, painter, state, level, *type_id, Run::Conductor, xf);
+        }
+        (Tool::Valve { type_id }, Some(_)) => valve_tool(resp, painter, state, *type_id, xf, drawing),
         _ => {}
     }
 }
 
 /// Run a creating command: the new element is selected; a refusal goes to the status bar.
-fn run_create<C: cc_engine::Command + serde::Serialize>(state: &mut AppState, command: C) -> Option<ElementId> {
+pub(crate) fn run_create<C: cc_engine::Command + serde::Serialize>(
+    state: &mut AppState,
+    command: C,
+) -> Option<ElementId> {
     let id = crate::actions::run_command(state, command)?["id"].as_u64().map(ElementId)?;
     state.selection = std::collections::BTreeSet::from([id]);
     Some(id)
@@ -955,8 +1759,8 @@ fn column_tool(
     let shift = ui.input(|i| i.modifiers.shift);
     let s = snap_at(state, Some(level), raw, None, &grid_crossings(state.project()), xf.scale, shift);
     draw_snap(painter, xf, s);
-    if let Some(cc_core::TypeData::Column { section, .. }) = state.project().element_type(type_id).map(|t| &t.data) {
-        let outline: Vec<Pos2> = cc_geom::column_outline(*section, s.point, state.interaction.rotation)
+    if let Some(data @ cc_core::TypeData::Column { .. }) = state.project().element_type(type_id).map(|t| &t.data) {
+        let outline: Vec<Pos2> = cc_geom::column_outline(state.project(), data, s.point, state.interaction.rotation)
             .iter()
             .map(|p| xf.to_screen(*p))
             .collect();
@@ -981,6 +1785,10 @@ pub struct MepOptions {
     pub system: Option<cc_core::SystemId>,
     /// Circuit of new conduits and devices.
     pub circuit: Option<cc_core::SystemId>,
+    /// Cabling (a rack's data system) of new data outlets.
+    pub data: Option<cc_core::SystemId>,
+    /// Lightning protection system of new conductors and devices (`None`: the engine's default).
+    pub lightning: Option<cc_core::SystemId>,
     /// Elevation of new pipes and conduits above the level (`None`: the engine's default).
     pub offset: Option<f64>,
     /// Fall of new pipes, percent (`None`: the default for the system and diameter).
@@ -1000,13 +1808,59 @@ pub fn device_type(project: &Project, type_id: ElementTypeId) -> Option<cc_core:
     }
 }
 
+/// The ribbon tool that places a component type: the generic component tool,
+/// plumbing fixtures, electrical devices, or a device with a tool of its own
+/// (`commands::DEVICE_TOOLS`). The options bar lists the types of one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentGroup {
+    Generic,
+    Fixture,
+    Device,
+    Own(cc_core::DeviceKind),
+}
+
+/// Which tool places `type_id` (`Generic` for any type that is no fixture or device).
+pub fn component_group(project: &Project, type_id: ElementTypeId) -> ComponentGroup {
+    let Some(cc_core::TypeData::Component { def, .. }) = project.element_type(type_id).map(|t| &t.data) else {
+        return ComponentGroup::Generic;
+    };
+    match def.mep {
+        Some(cc_core::MepData::Fixture { .. }) => ComponentGroup::Fixture,
+        Some(cc_core::MepData::Device { device, .. }) if crate::commands::DEVICE_TOOLS.contains(&device) => {
+            ComponentGroup::Own(device)
+        }
+        Some(cc_core::MepData::Device { .. }) => ComponentGroup::Device,
+        None => ComponentGroup::Generic,
+    }
+}
+
+/// The types the options bar offers to a tool of `category` placing `type_id`:
+/// all of the category, but for components only those placed by the same
+/// tool (fixtures, electrical devices, a device with its own tool, the rest).
+pub fn tool_types(
+    project: &Project,
+    category: Category,
+    type_id: ElementTypeId,
+    material: Option<cc_core::StructuralMaterial>,
+) -> Vec<(ElementTypeId, String)> {
+    let group = (category == Category::Component).then(|| component_group(project, type_id));
+    project
+        .types_of(category)
+        .filter(|t| group.is_none_or(|g| component_group(project, t.id) == g))
+        .filter(|t| material.is_none_or(|m| project.structural_material(&t.data) == Some(m)))
+        .map(|t| (t.id, t.name.clone()))
+        .collect()
+}
+
 /// The first component type that is an electrical device (`device`) or a plumbing fixture.
 pub fn mep_component_type(project: &Project, device: bool) -> Option<ElementTypeId> {
     project
         .types_of(Category::Component)
         .find(|t| match &t.data {
             cc_core::TypeData::Component { def, .. } => match def.mep {
-                Some(cc_core::MepData::Device { .. }) => device,
+                Some(cc_core::MepData::Device { device: d, .. }) => {
+                    device && d.class() == cc_core::SystemClass::Circuit
+                }
                 Some(cc_core::MepData::Fixture { .. }) => !device,
                 None => false,
             },
@@ -1015,10 +1869,19 @@ pub fn mep_component_type(project: &Project, device: bool) -> Option<ElementType
         .map(|t| t.id)
 }
 
-/// Clicks chain pipe or conduit runs: each ends where the next one starts,
-/// at the elevation the last one reached (a sloped drain keeps falling). A
-/// new elevation set while drawing makes a vertical run at the last point
-/// first; clicking that point again makes only the vertical run.
+/// What a run tool draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Run {
+    Pipe,
+    Conduit,
+    Tray,
+    Conductor,
+}
+
+/// Clicks chain pipe, conduit, cable tray or lightning conductor runs: each ends where the next
+/// one starts, at the elevation the last one reached (a sloped drain keeps
+/// falling). A new elevation set while drawing makes a vertical run at the
+/// last point first; clicking that point again makes only the vertical run.
 #[allow(clippy::too_many_arguments)]
 fn segment_tool(
     ui: &Ui,
@@ -1027,7 +1890,7 @@ fn segment_tool(
     state: &mut AppState,
     level: LevelId,
     type_id: ElementTypeId,
-    pipe: bool,
+    run: Run,
     xf: &Xf,
 ) {
     let Some(raw) = resp.hover_pos().map(|p| xf.to_world(p)) else { return };
@@ -1036,8 +1899,14 @@ fn segment_tool(
     let s = snap_at(state, Some(level), raw, anchor, &[], xf.scale, shift);
     draw_snap(painter, xf, s);
     let project = state.project();
-    let diameter = project.element_type(type_id).and_then(|t| t.diameter()).unwrap_or(0.025);
-    let system = if pipe { state.mep.system } else { state.mep.circuit };
+    let ty = project.element_type(type_id);
+    // A tray shows as wide as it is.
+    let diameter = ty.and_then(|t| t.diameter().or(t.tray_section().map(|s| s.0))).unwrap_or(0.025);
+    let system = match run {
+        Run::Pipe => state.mep.system,
+        Run::Conduit | Run::Tray => state.mep.circuit,
+        Run::Conductor => state.mep.lightning,
+    };
     let color = system.and_then(|id| project.system(id)).map_or(PREVIEW, |sys| {
         let [r, g, b] = sys.color();
         Color32::from_rgb(r, g, b)
@@ -1065,31 +1934,61 @@ fn segment_tool(
     };
     let level_ref = Some(Ref::Id(level.0));
     let create = |state: &mut AppState, end: Option<DVec2>, offset: Option<f64>, end_offset: Option<f64>| {
-        if pipe {
-            let command = cc_engine::commands::mep::PipeCreate {
-                start: a.to_array(),
-                end: end.map(|p| p.to_array()),
-                level: level_ref.clone(),
-                type_ref: Some(Ref::Id(type_id.0)),
-                system: state.mep.system.map(|id| Ref::Id(id.0)),
-                offset,
-                end_offset,
-                slope: state.mep.slope,
-            };
-            crate::actions::run_command(state, command)
-        } else {
-            let command = cc_engine::commands::mep::ConduitCreate {
-                start: a.to_array(),
-                end: end.map(|p| p.to_array()),
-                level: level_ref.clone(),
-                type_ref: Some(Ref::Id(type_id.0)),
-                circuits: state.mep.circuit.map(|id| Ref::Id(id.0)).into_iter().collect(),
-                offset,
-                end_offset,
-            };
-            crate::actions::run_command(state, command)
+        let circuits = state.mep.circuit.map(|id| Ref::Id(id.0)).into_iter().collect();
+        match run {
+            Run::Pipe => {
+                let command = cc_engine::commands::mep::PipeCreate {
+                    start: a.to_array(),
+                    end: end.map(|p| p.to_array()),
+                    level: level_ref.clone(),
+                    type_ref: Some(Ref::Id(type_id.0)),
+                    system: state.mep.system.map(|id| Ref::Id(id.0)),
+                    offset,
+                    end_offset,
+                    slope: state.mep.slope,
+                };
+                crate::actions::run_command(state, command)
+            }
+            Run::Conduit => {
+                let command = cc_engine::commands::mep::ConduitCreate {
+                    start: a.to_array(),
+                    end: end.map(|p| p.to_array()),
+                    level: level_ref.clone(),
+                    type_ref: Some(Ref::Id(type_id.0)),
+                    circuits,
+                    offset,
+                    end_offset,
+                };
+                crate::actions::run_command(state, command)
+            }
+            Run::Tray => {
+                let command = cc_engine::commands::cable_tray::CableTrayCreate {
+                    start: a.to_array(),
+                    end: end.map(|p| p.to_array()),
+                    level: level_ref.clone(),
+                    type_ref: Some(Ref::Id(type_id.0)),
+                    circuits,
+                    offset,
+                    end_offset,
+                };
+                crate::actions::run_command(state, command)
+            }
+            Run::Conductor => {
+                let command = cc_engine::commands::lightning::LpsConductorCreate {
+                    start: a.to_array(),
+                    end: end.map(|p| p.to_array()),
+                    level: level_ref.clone(),
+                    type_ref: Some(Ref::Id(type_id.0)),
+                    role: None,
+                    offset,
+                    end_offset,
+                    system: state.mep.lightning.map(|id| Ref::Id(id.0)),
+                };
+                crate::actions::run_command(state, command)
+            }
         }
     };
+    let (before, depth) = (chain_at(state), state.session.doc.undo_depth());
     let select = |state: &mut AppState, out: &serde_json::Value| {
         if let Some(id) = out["id"].as_u64() {
             state.selection = BTreeSet::from([ElementId(id)]);
@@ -1111,37 +2010,76 @@ fn segment_tool(
         state.mep.chain = out["params"]["end_offset"].as_f64();
         state.interaction.anchor = Some(s.point);
     }
+    chain_placed(state, before, depth);
 }
 
 /// Truss tool options, kept between uses.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrussOptions {
-    /// Distance between the chord axes, meters.
+    pub shape: cc_core::truss::TrussShape,
+    pub pattern: cc_core::truss::TrussPattern,
+    /// Chord to chord (flat), or the rise (mono, gable), meters.
     pub height: f64,
     /// Number of panels; 0 picks about one per 1.5 m.
     pub panels: u32,
-    /// `pratt`, `howe` or `warren`.
-    pub pattern: &'static str,
+    pub copies: u32,
+    /// Copy to copy, meters.
+    pub spacing: f64,
 }
 
 impl Default for TrussOptions {
     fn default() -> Self {
-        Self { height: 1.0, panels: 0, pattern: "pratt" }
+        Self {
+            shape: Default::default(),
+            pattern: Default::default(),
+            height: cc_core::truss::DEFAULT_HEIGHT,
+            panels: 0,
+            copies: 1,
+            spacing: cc_core::truss::DEFAULT_SPACING,
+        }
     }
 }
 
-/// The truss patterns, with their translation keys.
-pub const TRUSS_PATTERNS: [(&str, &str); 3] =
-    [("pratt", "truss-pratt"), ("howe", "truss-howe"), ("warren", "truss-warren")];
+/// The command the tool runs for a truss from `a` to `b`.
+pub fn truss_command(
+    o: &TrussOptions,
+    material: cc_core::StructuralMaterial,
+    level: LevelId,
+    a: DVec2,
+    b: DVec2,
+) -> cc_engine::commands::framing::TrussCreate {
+    // Auto panels on a gable: the engine's default is even already.
+    let panels = (o.panels > 0).then(|| {
+        if o.shape == cc_core::truss::TrussShape::Gable && !o.panels.is_multiple_of(2) {
+            o.panels + 1
+        } else {
+            o.panels
+        }
+    });
+    cc_engine::commands::framing::TrussCreate {
+        start: a.to_array(),
+        end: b.to_array(),
+        height: o.height,
+        panels,
+        pattern: Some(o.pattern.code().into()),
+        shape: Some(o.shape.code().into()),
+        copies: Some(o.copies),
+        spacing: Some(o.spacing),
+        material: Some(material.code().into()),
+        level: Some(Ref::Id(level.0)),
+        ..Default::default()
+    }
+}
 
-/// Two clicks: the ends of a truss, laid out with the options bar's height, panels and pattern.
+/// Two clicks: the ends of a truss, laid out with the options bar's values
+/// and the Structure tab's material; the new truss is selected.
 fn truss_tool(
     ui: &Ui,
     resp: &Response,
     painter: &Painter,
     state: &mut AppState,
     level: LevelId,
-    type_id: ElementTypeId,
+    material: cc_core::StructuralMaterial,
     xf: &Xf,
 ) {
     let Some(raw) = resp.hover_pos().map(|p| xf.to_world(p)) else { return };
@@ -1157,21 +2095,97 @@ fn truss_tool(
     if resp.clicked() {
         match anchor {
             None => state.interaction.anchor = Some(s.point),
-            Some(a) if a.distance(s.point) > 0.1 => {
-                let options = state.truss.clone();
-                let command = cc_engine::commands::framing::TrussCreate {
-                    start: a.to_array(),
-                    end: s.point.to_array(),
-                    height: options.height,
-                    panels: (options.panels > 0).then_some(options.panels),
-                    pattern: Some(options.pattern.to_string()),
-                    level: Some(Ref::Id(level.0)),
-                    chord_type: Some(Ref::Id(type_id.0)),
-                    ..Default::default()
-                };
-                if let Some(out) = crate::actions::run_command(state, command) {
-                    let ids = out["created"].as_array().into_iter().flatten().filter_map(|v| v.as_u64());
-                    state.selection = ids.map(ElementId).collect();
+            Some(a) if a.distance(s.point) >= *cc_core::truss::LENGTH.start() => {
+                let command = truss_command(&state.truss, material, level, a, s.point);
+                if let Some(out) = crate::actions::run_command(state, command)
+                    && let Some(id) = out["id"].as_u64()
+                {
+                    state.selection = [ElementId(id)].into_iter().collect();
+                }
+                state.interaction.anchor = None;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Bracing tool options, kept between uses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BracingOptions {
+    pub pattern: cc_core::bracing::BracingPattern,
+    /// One storey, meters.
+    pub height: f64,
+    pub stories: u32,
+    /// A diagonal rises toward the first click instead of the second.
+    pub flip: bool,
+    /// Diagonals change direction storey by storey.
+    pub alternate: bool,
+}
+
+impl Default for BracingOptions {
+    fn default() -> Self {
+        Self {
+            pattern: Default::default(),
+            height: cc_core::bracing::DEFAULT_HEIGHT,
+            stories: 1,
+            flip: false,
+            alternate: false,
+        }
+    }
+}
+
+/// The command the tool runs for a braced bay from `a` to `b`.
+pub fn bracing_command(
+    o: &BracingOptions,
+    material: cc_core::StructuralMaterial,
+    level: LevelId,
+    a: DVec2,
+    b: DVec2,
+) -> cc_engine::commands::bracing::BracingCreate {
+    cc_engine::commands::bracing::BracingCreate {
+        start: Some(a.to_array()),
+        end: Some(b.to_array()),
+        pattern: Some(o.pattern.code().into()),
+        height: Some(o.height),
+        stories: Some(o.stories),
+        flip: o.flip,
+        alternate: o.alternate,
+        material: Some(material.code().into()),
+        level: Some(Ref::Id(level.0)),
+        ..Default::default()
+    }
+}
+
+/// Two clicks: the column axes of a bay, braced with the options bar's
+/// values and the Structure tab's material; the new bracing is selected.
+fn bracing_tool(
+    ui: &Ui,
+    resp: &Response,
+    painter: &Painter,
+    state: &mut AppState,
+    level: LevelId,
+    material: cc_core::StructuralMaterial,
+    xf: &Xf,
+) {
+    let Some(raw) = resp.hover_pos().map(|p| xf.to_world(p)) else { return };
+    let shift = ui.input(|i| i.modifiers.shift);
+    let crossings = grid_crossings(state.project());
+    let anchor = state.interaction.anchor;
+    let s = snap_at(state, Some(level), raw, anchor, &crossings, xf.scale, shift);
+    draw_snap(painter, xf, s);
+    if let Some(a) = anchor {
+        painter.line_segment([xf.to_screen(a), xf.to_screen(s.point)], Stroke::new(1.5, PREVIEW));
+        temp_dimension(painter, xf, a, s.point, None, None, 0.1);
+    }
+    if resp.clicked() {
+        match anchor {
+            None => state.interaction.anchor = Some(s.point),
+            Some(a) if a.distance(s.point) >= *cc_core::bracing::LENGTH.start() => {
+                let command = bracing_command(&state.bracing, material, level, a, s.point);
+                if let Some(out) = crate::actions::run_command(state, command)
+                    && let Some(id) = out["id"].as_u64()
+                {
+                    state.selection = [ElementId(id)].into_iter().collect();
                 }
                 state.interaction.anchor = None;
             }
@@ -1198,6 +2212,11 @@ fn footing_tool(
     type_id: ElementTypeId,
     xf: &Xf,
 ) {
+    // A strip type draws strips, as the wall tool draws walls.
+    if is_strip(state.project(), type_id) {
+        strip_tool(ui, resp, painter, state, level, type_id, xf);
+        return;
+    }
     if resp.hovered() && ui.input(|i| i.key_pressed(Key::Space)) {
         state.interaction.rotation = (state.interaction.rotation + 90.0).rem_euclid(360.0);
     }
@@ -1208,8 +2227,7 @@ fn footing_tool(
     if let Some(cc_core::TypeData::Foundation { width, length, .. }) =
         state.project().element_type(type_id).map(|t| &t.data)
     {
-        let section = cc_core::ColumnSection::Rectangular { width: *width, depth: *length };
-        let outline: Vec<Pos2> = cc_geom::column_outline(section, s.point, state.interaction.rotation)
+        let outline: Vec<Pos2> = cc_geom::rect_outline(*width, *length, s.point, state.interaction.rotation)
             .iter()
             .map(|p| xf.to_screen(*p))
             .collect();
@@ -1225,6 +2243,155 @@ fn footing_tool(
         };
         run_create(state, command);
     }
+}
+
+/// Whether `type_id` is a strip footing type.
+/// The ends and the arc of an arc wall, arc beam or arc strip footing: what
+/// the curvature handle of a selected element bends.
+fn bendable(e: &cc_core::Element) -> Option<(DVec2, DVec2, cc_core::arc::Arc)> {
+    match &e.kind {
+        ElementKind::Wall(w) => Some((w.start, w.end, w.arc()?)),
+        ElementKind::Beam(b) => Some((b.start, b.end, b.arc()?)),
+        ElementKind::Foundation(f) => match &f.shape {
+            cc_core::FoundationShape::Strip { start, end, .. } => Some((*start, *end, f.shape.arc()?)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Give a wall, beam or strip footing a new bulge (the curvature handle's edit).
+fn set_bulge(e: &mut cc_core::Element, to: f64) {
+    match &mut e.kind {
+        ElementKind::Wall(w) => w.bulge = to,
+        ElementKind::Beam(b) => b.bulge = to,
+        ElementKind::Foundation(f) => {
+            if let cc_core::FoundationShape::Strip { bulge, .. } = &mut f.shape {
+                *bulge = to;
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn is_strip(project: &Project, type_id: ElementTypeId) -> bool {
+    matches!(
+        project.element_type(type_id).map(|t| &t.data),
+        Some(cc_core::TypeData::Foundation { kind: cc_core::FoundationKind::Strip, .. })
+    )
+}
+
+/// Strip footings, drawn as walls are: a chain of straight strips, or in
+/// arc mode the start, the end and then a point on the arc (or a typed radius).
+fn strip_tool(
+    ui: &Ui,
+    resp: &Response,
+    painter: &Painter,
+    state: &mut AppState,
+    level: LevelId,
+    type_id: ElementTypeId,
+    xf: &Xf,
+) {
+    let Some(raw) = resp.hover_pos().map(|p| xf.to_world(p)) else { return };
+    let shift = ui.input(|i| i.modifiers.shift);
+    let anchor = state.interaction.anchor;
+    let crossings = grid_crossings(state.project());
+    let s = snap_at(state, Some(level), raw, anchor, &crossings, xf.scale, shift);
+    let mut p = s.point;
+    draw_snap(painter, xf, s);
+    let half = match state.project().element_type(type_id).map(|t| &t.data) {
+        Some(cc_core::TypeData::Foundation { width, .. }) => width / 2.0,
+        _ => 0.1,
+    };
+    let arc_end = state.interaction.points.first().copied().filter(|_| state.strip_arc);
+    if let (Some(a), Some(b)) = (anchor, arc_end) {
+        let radius = state.typed.length_value();
+        let bulge = match radius {
+            Some(r) => bulge_with_radius(a, b, p, r),
+            None => cc_core::arc::Arc::bulge_through(a, p, b),
+        };
+        match bulge {
+            Some(bulge) => arc_preview(painter, xf, a, b, bulge, 0.0, half),
+            None => paint_wall_preview(painter, xf, a, b, 0.0, half),
+        }
+        let unit = format::current().0.length.unit.symbol();
+        let arc = bulge.and_then(|bulge| cc_core::arc::Arc::from_bulge(a, b, bulge));
+        let text = match (radius, arc) {
+            (Some(_), Some(arc)) => {
+                format!("R {} {unit} \u{23ce}  {}", state.typed.length, format::length(arc.length()))
+            }
+            (Some(_), None) => format!("R {} {unit}  {}", state.typed.length, t!("msg-arc-radius-short")),
+            (None, Some(arc)) => format!("R {}  {}", format::length(arc.radius), format::length(arc.length())),
+            (None, None) => String::new(),
+        };
+        if !text.is_empty() {
+            label(painter, xf.to_screen(p), text);
+        }
+        let enter = ui.input(|i| i.key_pressed(Key::Enter)) && radius.is_some();
+        if resp.clicked() || enter {
+            match bulge {
+                Some(bulge) => {
+                    let (before, depth) = (chain_at(state), state.session.doc.undo_depth());
+                    create_strip(state, level, type_id, a, b, bulge);
+                    state.interaction.anchor = Some(b);
+                    state.interaction.points.clear();
+                    state.typed.clear();
+                    if let Some(arc) = cc_core::arc::Arc::from_bulge(a, b, bulge) {
+                        state.interaction.prev_dir = Some(-arc.tangent(arc.length()));
+                    }
+                    chain_placed(state, before, depth);
+                }
+                None if radius.is_some() => state.message = t!("msg-arc-radius-short"),
+                None => state.message = t!("msg-arc-collinear"),
+            }
+        }
+        return;
+    }
+    if let Some(a) = anchor {
+        if !state.typed.is_empty() {
+            p = state.typed.apply(a, p, state.interaction.prev_dir);
+        }
+        if state.strip_arc {
+            painter.line_segment([xf.to_screen(a), xf.to_screen(p)], Stroke::new(1.0, PREVIEW));
+        } else {
+            paint_wall_preview(painter, xf, a, p, 0.0, half);
+        }
+        temp_dimension(painter, xf, a, p, state.interaction.prev_dir, Some(&state.typed), half);
+    }
+    let enter = ui.input(|i| i.key_pressed(Key::Enter)) && !state.typed.is_empty();
+    if resp.clicked() || enter {
+        match anchor {
+            None => state.interaction.anchor = Some(p),
+            Some(a) if a.distance(p) > 0.01 && state.strip_arc => {
+                // The end of the arc; the next click places a point on it.
+                state.interaction.points = vec![p];
+                state.message = t!("hint-wall-arc-point");
+                state.typed.clear();
+            }
+            Some(a) if a.distance(p) > 0.01 => {
+                let (before, depth) = (chain_at(state), state.session.doc.undo_depth());
+                create_strip(state, level, type_id, a, p, 0.0);
+                state.interaction.anchor = Some(p);
+                state.interaction.prev_dir = Some(a - p);
+                state.typed.clear();
+                chain_placed(state, before, depth);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Create a strip footing from `a` to `b` (an arc when `bulge` is not 0).
+fn create_strip(state: &mut AppState, level: LevelId, type_id: ElementTypeId, a: DVec2, b: DVec2, bulge: f64) {
+    let command = cc_engine::commands::foundation::StripFootingCreate {
+        start: a.to_array(),
+        end: b.to_array(),
+        bulge: (bulge != 0.0).then_some(bulge),
+        level: Some(Ref::Id(level.0)),
+        type_ref: Some(Ref::Id(type_id.0)),
+        ..Default::default()
+    };
+    run_create(state, command);
 }
 
 /// Click to place a component; Space turns it by 90°.
@@ -1247,20 +2414,39 @@ fn component_tool(
     let rotation = state.interaction.rotation;
     if let Some(cc_core::TypeData::Component { def, .. }) = state.project().element_type(type_id).map(|t| &t.data) {
         let rot = DVec2::from_angle(rotation.to_radians());
-        let (parts, _) = def.resolve(&Default::default());
+        let (parts, _) = cc_geom::resolve_pieces(def, &Default::default(), &[]);
         for part in parts.iter().filter(|p| p.in_plan && !p.void) {
             let outline: Vec<Pos2> = part.footprint.iter().map(|p| xf.to_screen(s.point + rot.rotate(*p))).collect();
             painter.add(egui::Shape::closed_line(outline, Stroke::new(1.5, PREVIEW)));
         }
     }
     if resp.clicked() {
+        let device = device_type(state.project(), type_id);
+        if device == Some(cc_core::DeviceKind::Rack) {
+            // A rack comes with the cabling its outlets are cabled to.
+            let command = cc_engine::commands::cabling::RackPlace {
+                position: s.point.to_array(),
+                level: Some(Ref::Id(level.0)),
+                rotation: Some(rotation),
+                type_ref: Some(Ref::Id(type_id.0)),
+                ..Default::default()
+            };
+            run_create(state, command);
+            return;
+        }
+        let system = match device.map(|d| d.class()) {
+            Some(cc_core::SystemClass::Circuit) => state.mep.circuit,
+            Some(cc_core::SystemClass::Data) => state.mep.data,
+            Some(cc_core::SystemClass::Lightning) => state.mep.lightning,
+            _ => None,
+        };
         let command = create::ComponentPlace {
             position: s.point.to_array(),
             type_ref: Ref::Id(type_id.0),
             rotation: Some(rotation),
             level: Some(Ref::Id(level.0)),
             base_offset: None,
-            system: device_type(state.project(), type_id).and(state.mep.circuit).map(|s| Ref::Id(s.0)),
+            system: system.filter(|id| state.project().system(*id).is_some()).map(|s| Ref::Id(s.0)),
         };
         run_create(state, command);
     }
@@ -1321,6 +2507,18 @@ fn align_grid_end(
 }
 
 /// Two clicks: start and end of a beam. Its top is at the level above by default.
+/// The command the beam tool runs for a beam from `a` to `b` (an arc with a `bulge`).
+pub fn beam_command(level: LevelId, type_id: ElementTypeId, a: DVec2, b: DVec2, bulge: f64) -> create::BeamCreate {
+    create::BeamCreate {
+        start: a.to_array(),
+        end: b.to_array(),
+        level: Some(Ref::Id(level.0)),
+        type_ref: Some(Ref::Id(type_id.0)),
+        bulge: (bulge != 0.0).then_some(bulge),
+        ..Default::default()
+    }
+}
+
 fn beam_tool(
     ui: &Ui,
     resp: &Response,
@@ -1336,29 +2534,75 @@ fn beam_tool(
     let anchor = state.interaction.anchor;
     let s = snap_at(state, Some(level), raw, anchor, &crossings, xf.scale, shift);
     draw_snap(painter, xf, s);
-    if let Some(a) = state.interaction.anchor {
-        let width = match state.project().element_type(type_id).map(|t| &t.data) {
-            Some(cc_core::TypeData::Beam { width, .. }) => *width,
-            _ => 0.15,
+    // As wide as the type's section (its profile turned in the type).
+    let project = state.project();
+    let section = project.element_type(type_id).and_then(|t| project.type_section(&t.data));
+    let width = section.map(|s| s.outline.bbox()).map_or(0.15, |(lo, hi)| hi.x - lo.x);
+    let width = if width.is_finite() && width > 0.0 { width } else { 0.15 };
+    // Arc mode: the start, the end, then a point on the arc (or a typed radius).
+    let arc_end = state.interaction.points.first().copied().filter(|_| state.beam_arc);
+    if let (Some(a), Some(b)) = (anchor, arc_end) {
+        let p = s.point;
+        let radius = state.typed.length_value();
+        let bulge = match radius {
+            Some(r) => bulge_with_radius(a, b, p, r),
+            None => cc_core::arc::Arc::bulge_through(a, p, b),
         };
-        let n = (s.point - a).normalize_or_zero().perp() * (width / 2.0);
-        let pts = vec![xf.to_screen(a - n), xf.to_screen(s.point - n), xf.to_screen(s.point + n), xf.to_screen(a + n)];
-        painter.add(egui::Shape::closed_line(pts, Stroke::new(1.5, PREVIEW)));
+        match bulge {
+            Some(bulge) => arc_preview(painter, xf, a, b, bulge, 0.0, width / 2.0),
+            None => paint_wall_preview(painter, xf, a, b, 0.0, width / 2.0),
+        }
+        if let Some(arc) = bulge.and_then(|bulge| cc_core::arc::Arc::from_bulge(a, b, bulge)) {
+            label(
+                painter,
+                xf.to_screen(p),
+                format!("R {}  {}", format::length(arc.radius), format::length(arc.length())),
+            );
+        }
+        let enter = ui.input(|i| i.key_pressed(Key::Enter)) && radius.is_some();
+        if resp.clicked() || enter {
+            match bulge {
+                Some(bulge) => {
+                    let command = beam_command(level, type_id, a, b, bulge);
+                    let (before, depth) = (chain_at(state), state.session.doc.undo_depth());
+                    run_create(state, command);
+                    state.interaction.anchor = Some(b);
+                    state.interaction.points.clear();
+                    state.typed.clear();
+                    chain_placed(state, before, depth);
+                }
+                None if radius.is_some() => state.message = t!("msg-arc-radius-short"),
+                None => state.message = t!("msg-arc-collinear"),
+            }
+        }
+        return;
+    }
+    if let Some(a) = state.interaction.anchor {
+        if state.beam_arc {
+            painter.line_segment([xf.to_screen(a), xf.to_screen(s.point)], Stroke::new(1.0, PREVIEW));
+        } else {
+            let n = (s.point - a).normalize_or_zero().perp() * (width / 2.0);
+            let pts =
+                vec![xf.to_screen(a - n), xf.to_screen(s.point - n), xf.to_screen(s.point + n), xf.to_screen(a + n)];
+            painter.add(egui::Shape::closed_line(pts, Stroke::new(1.5, PREVIEW)));
+        }
         temp_dimension(painter, xf, a, s.point, None, None, width / 2.0);
     }
     if resp.clicked() {
         match state.interaction.anchor {
             None => state.interaction.anchor = Some(s.point),
+            Some(a) if a.distance(s.point) > 0.05 && state.beam_arc => {
+                // The end of the arc; the next click places a point on it.
+                state.interaction.points = vec![s.point];
+                state.message = t!("hint-wall-arc-point");
+                state.typed.clear();
+            }
             Some(a) if a.distance(s.point) > 0.05 => {
-                let command = create::BeamCreate {
-                    start: a.to_array(),
-                    end: s.point.to_array(),
-                    level: Some(Ref::Id(level.0)),
-                    type_ref: Some(Ref::Id(type_id.0)),
-                    ..Default::default()
-                };
+                let command = beam_command(level, type_id, a, s.point, 0.0);
+                let (before, depth) = (chain_at(state), state.session.doc.undo_depth());
                 run_create(state, command);
                 state.interaction.anchor = Some(s.point);
+                chain_placed(state, before, depth);
             }
             _ => {}
         }
@@ -1399,7 +2643,11 @@ fn stair_tool(
             painter.add(egui::Shape::closed_line(pts, Stroke::new(1.0, PREVIEW)));
         }
         let end = g.walkline.last().map_or(a, |p| p.truncate());
-        let text = t!("label-stair", "risers" => g.risers, "run" => format::meters(g.run()));
+        let text = if format::imperial() {
+            t!("label-imp-stair", "risers" => g.risers, "run" => format::meters(g.run()))
+        } else {
+            t!("label-stair", "risers" => g.risers, "run" => format::meters(g.run()))
+        };
         label(painter, xf.to_screen(end), text);
     }
     if resp.clicked() {
@@ -1450,7 +2698,11 @@ fn ramp_tool(
             painter.add(egui::Shape::closed_line(pts, Stroke::new(1.0, PREVIEW)));
         }
         let end = g.walkline.last().map_or(a, |p| p.truncate());
-        let text = t!("label-ramp", "flights" => g.check.flights, "run" => format::meters(g.run()));
+        let text = if format::imperial() {
+            t!("label-imp-ramp", "flights" => g.check.flights, "run" => format::meters(g.run()))
+        } else {
+            t!("label-ramp", "flights" => g.check.flights, "run" => format::meters(g.run()))
+        };
         label(painter, xf.to_screen(end), text);
     }
     if resp.clicked() {
@@ -1468,8 +2720,11 @@ fn ramp_tool(
     }
 }
 
-/// Click the points of the railing path; Enter, a double click or Finish ends it.
-fn railing_tool(
+/// Click the points of a railing's or swept profile's path; Enter, a double
+/// click or Finish ends it (`finish` makes the element). A `closed` path
+/// previews its way back to the first point.
+#[allow(clippy::too_many_arguments)]
+fn path_tool(
     ui: &Ui,
     resp: &Response,
     painter: &Painter,
@@ -1477,6 +2732,8 @@ fn railing_tool(
     level: LevelId,
     type_id: ElementTypeId,
     xf: &Xf,
+    closed: bool,
+    finish: fn(&mut AppState, LevelId, ElementTypeId),
 ) {
     let Some(raw) = resp.hover_pos().map(|p| xf.to_world(p)) else { return };
     let shift = ui.input(|i| i.modifiers.shift);
@@ -1485,15 +2742,121 @@ fn railing_tool(
     draw_snap(painter, xf, s);
     let pts: Vec<Pos2> =
         state.interaction.points.iter().map(|p| xf.to_screen(*p)).chain([xf.to_screen(s.point)]).collect();
-    if pts.len() >= 2 {
+    if pts.len() >= 3 && closed {
+        painter.add(egui::Shape::closed_line(pts, Stroke::new(1.5, PREVIEW)));
+    } else if pts.len() >= 2 {
         painter.add(egui::Shape::line(pts, Stroke::new(1.5, PREVIEW)));
     }
-    let finish = resp.double_clicked() || ui.input(|i| i.key_pressed(Key::Enter));
+    let done = resp.double_clicked() || ui.input(|i| i.key_pressed(Key::Enter));
     if resp.clicked() && !resp.double_clicked() {
         state.interaction.points.push(s.point);
     }
-    if finish {
-        finish_railing(state, level, type_id);
+    if done {
+        finish(state, level, type_id);
+    }
+}
+
+/// Options of the railing tool: put railings on a stair or ramp picked in
+/// the view instead of drawing a path.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RailingHostOptions {
+    pub on: bool,
+    /// Both sides of the host, not only the side nearest the click.
+    pub both: bool,
+}
+
+/// Whether `id` is a stair or a ramp (an element railings can follow).
+pub fn railing_host(state: &AppState, id: ElementId) -> bool {
+    state.project().element(id).is_some_and(|e| matches!(e.kind, ElementKind::Stair(_) | ElementKind::Ramp(_)))
+}
+
+/// The railing tool picking a host: the stair or ramp under the pointer is
+/// highlighted, and a click puts a railing on its side nearest the click
+/// (or on both sides).
+fn host_railing_tool(
+    resp: &Response,
+    painter: &Painter,
+    state: &mut AppState,
+    type_id: ElementTypeId,
+    xf: &Xf,
+    drawing: &cc_views::Drawing2D,
+) {
+    let Some(raw) = resp.hover_pos().map(|p| xf.to_world(p)) else { return };
+    let Some(host) = drawing.hit_test(raw, 6.0 / xf.scale).filter(|id| railing_host(state, *id)) else { return };
+    let lit: std::collections::BTreeSet<ElementId> = [host].into_iter().collect();
+    crate::modify::paint_ghost(painter, xf, drawing, &lit, &cc_core::PlanTransform::IDENTITY);
+    if resp.clicked() {
+        let command = cc_engine::commands::stair::StairRailingsAdd {
+            id: host.0,
+            side: state.railing_host.both.then(|| "both".to_string()),
+            type_ref: Some(Ref::Id(type_id.0)),
+            inset: None,
+            near: Some(raw.to_array()),
+        };
+        crate::actions::run_command(state, command);
+    }
+}
+
+/// The pipe under the pointer, or the pipe of a valve under it.
+fn pipe_at(project: &Project, drawing: &cc_views::Drawing2D, p: DVec2, reach: f64) -> Option<ElementId> {
+    let id = drawing.hit_test(p, reach)?;
+    match &project.element(id)?.kind {
+        ElementKind::Pipe(_) => Some(id),
+        ElementKind::Valve(v) => project.valve_host(v).map(|(pipe, _)| pipe.id),
+        _ => None,
+    }
+}
+
+/// Click a pipe to place a valve of `type_id` there; the pipe lights up under the pointer.
+fn valve_tool(
+    resp: &Response,
+    painter: &Painter,
+    state: &mut AppState,
+    type_id: ElementTypeId,
+    xf: &Xf,
+    drawing: &cc_views::Drawing2D,
+) {
+    let Some(raw) = resp.hover_pos().map(|p| xf.to_world(p)) else { return };
+    let Some(pipe) = pipe_at(state.project(), drawing, raw, 6.0 / xf.scale) else { return };
+    let lit: BTreeSet<ElementId> = [pipe].into_iter().collect();
+    crate::modify::paint_ghost(painter, xf, drawing, &lit, &cc_core::PlanTransform::IDENTITY);
+    if resp.clicked() {
+        let command = cc_engine::commands::valve::ValvePlace {
+            pipe: pipe.0,
+            point: Some(raw.to_array()),
+            type_ref: Some(Ref::Id(type_id.0)),
+            ..Default::default()
+        };
+        run_create(state, command);
+    }
+}
+
+/// Options of the swept profile tool.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SweepOptions {
+    /// Height of the path above the level.
+    pub base_offset: f64,
+    /// The path runs back to its first point.
+    pub closed: bool,
+    /// The profile on the right of the path.
+    pub flip: bool,
+}
+
+/// Create the swept profile from the points clicked so far.
+pub fn finish_sweep(state: &mut AppState, level: LevelId, type_id: ElementTypeId) {
+    let mut path = std::mem::take(&mut state.interaction.points);
+    path.dedup_by(|a, b| a.distance(*b) < 1e-3);
+    let o = state.sweep;
+    if path.len() >= if o.closed { 3 } else { 2 } {
+        let command = cc_engine::commands::sweep::SweepCreate {
+            path: path.iter().map(|p| p.to_array()).collect(),
+            closed: o.closed,
+            level: Some(Ref::Id(level.0)),
+            type_ref: Some(Ref::Id(type_id.0)),
+            base_offset: Some(o.base_offset),
+            flip: o.flip,
+        };
+        run_create(state, command);
     }
 }
 
@@ -1556,37 +2919,47 @@ fn grid_tool(
     // The ends line up with the bubbles of the other grids.
     let s = align_grid_end(state.project(), None, anchor, raw, s, xf.scale);
     draw_snap(painter, xf, s);
+    // A typed length (and angle) places the end along the cursor's direction (issue #158).
+    let p = anchor.map_or(s.point, |a| typed_end(state, a, s.point));
     if let Some(a) = anchor {
         painter.add(egui::Shape::dashed_line(
-            &[xf.to_screen(a), xf.to_screen(s.point)],
+            &[xf.to_screen(a), xf.to_screen(p)],
             Stroke::new(1.5, PREVIEW),
             10.0,
             4.0,
         ));
-        temp_dimension(painter, xf, a, s.point, None, None, 0.0);
+        temp_dimension(painter, xf, a, p, None, Some(&state.typed), 0.0);
         // The name the grid will get (the engine's default for `grid_create`).
-        if a.distance(s.point) > 0.1 {
-            let name = cc_core::grid::next_name(create::grids(state.project()), a, s.point);
-            label(painter, xf.to_screen(s.point), format!("{} {name}", t!("tool-grid")));
+        if a.distance(p) > 0.1 {
+            let name = cc_core::grid::next_name(create::grids(state.project()), a, p);
+            label(painter, xf.to_screen(p), format!("{} {name}", t!("tool-grid")));
         }
     }
-    if resp.clicked() {
+    let enter = ui.input(|i| i.key_pressed(Key::Enter)) && !state.typed.is_empty();
+    if resp.clicked() || enter {
         match state.interaction.anchor {
-            None => state.interaction.anchor = Some(s.point),
-            Some(a) if a.distance(s.point) > 0.1 => {
+            None => state.interaction.anchor = Some(p),
+            Some(a) if a.distance(p) > 0.1 => {
                 let _ = type_id;
                 let command = create::GridCreate {
                     start: a.to_array(),
-                    end: s.point.to_array(),
+                    end: p.to_array(),
                     level: Some(Ref::Id(level.0)),
                     ..Default::default()
                 };
                 run_create(state, command);
                 state.interaction.anchor = None;
+                state.typed.clear();
             }
             _ => {}
         }
     }
+}
+
+/// The end of a segment from `a` towards the cursor point `p`: at the
+/// typed length and angle (from the X axis), if any were typed.
+fn typed_end(state: &AppState, a: DVec2, p: DVec2) -> DVec2 {
+    if state.typed.is_empty() { p } else { state.typed.apply(a, p, None) }
 }
 
 /// Measure between two references: two clicks snapped to the view's
@@ -1594,15 +2967,8 @@ fn grid_tool(
 fn measure_tool(ui: &Ui, resp: &Response, painter: &Painter, state: &mut AppState, xf: &Xf, drawing: &Drawing2D) {
     let Some(raw) = resp.hover_pos().map(|p| xf.to_world(p)) else { return };
     let shift = ui.input(|i| i.modifiers.shift);
-    let ends: Vec<DVec2> = drawing
-        .prims
-        .iter()
-        .filter_map(|p| match p {
-            cc_views::Prim::Line { a, b, .. } => Some([*a, *b]),
-            _ => None,
-        })
-        .flatten()
-        .collect();
+    // The view's own linework (not its underlay or its hatches).
+    let ends: Vec<DVec2> = drawing.snap_lines().into_iter().flat_map(|(a, b)| [a, b]).collect();
     let points = state.interaction.points.clone();
     let anchor = match points.as_slice() {
         [a] => Some(*a),
@@ -1674,6 +3040,7 @@ fn dimension_tool(
 ) {
     let Some(raw) = resp.hover_pos().map(|p| xf.to_world(p)) else { return };
     let scale = view.scale.max(1);
+    let style = cc_views::dimension_type(state.project(), type_id).1;
     let tol = 6.0 / xf.scale;
     let points = state.interaction.points.clone();
     let place = |state: &mut AppState, dim: cc_core::Dimension| {
@@ -1682,6 +3049,9 @@ fn dimension_tool(
             DimensionKind::Aligned => ("aligned", None, None),
             DimensionKind::Linear { dir } => {
                 ("linear", Some(if dir.x.abs() >= dir.y.abs() { "horizontal" } else { "vertical" }), None)
+            }
+            DimensionKind::Ordinate { dir } => {
+                ("ordinate", Some(if dir.x.abs() >= dir.y.abs() { "horizontal" } else { "vertical" }), None)
             }
             DimensionKind::Angular { vertex, .. } => ("angular", None, Some(vertex.to_array())),
             DimensionKind::Radial => ("radial", None, None),
@@ -1716,22 +3086,20 @@ fn dimension_tool(
         refs: Default::default(),
     };
     match mode {
-        DimensionMode::Aligned | DimensionMode::Linear => {
+        DimensionMode::Aligned | DimensionMode::Linear | DimensionMode::Ordinate => {
             let shift = ui.input(|i| i.modifiers.shift);
-            // Snap to the visible linework of the view.
-            let ends: Vec<DVec2> = drawing
-                .prims
-                .iter()
-                .filter_map(|p| match p {
-                    cc_views::Prim::Line { a, b, .. } => Some([*a, *b]),
-                    _ => None,
-                })
-                .flatten()
-                .collect();
-            let linear = mode == DimensionMode::Linear;
+            // Snap to the visible linework of the view (not its underlay or its hatches).
+            let ends: Vec<DVec2> = drawing.snap_lines().into_iter().flat_map(|(a, b)| [a, b]).collect();
+            let linear = mode != DimensionMode::Aligned;
+            // Ordinate dimensions always continue from their origin.
+            let ordinate = mode == DimensionMode::Ordinate;
+            let continuous = state.dim_continuous || ordinate;
             // A chain of another view or mode, or with Single chosen, ends.
-            if state.interaction.dim_chain.is_some_and(|c| c.view != view.id || c.linear != linear)
-                || !state.dim_continuous
+            if state
+                .interaction
+                .dim_chain
+                .is_some_and(|c| c.view != view.id || c.linear != linear || c.ordinate != ordinate)
+                || !continuous
             {
                 state.interaction.dim_chain = None;
             }
@@ -1744,12 +3112,15 @@ fn dimension_tool(
                 let s = snap_at(state, None, raw, Some(chain.last), &ends, xf.scale, shift);
                 draw_snap(painter, xf, s);
                 let offset = (chain.line - chain.last).dot(chain.dir.perp());
-                let next = cc_core::dim_line::chain(view.id, &[chain.last, s.point], chain.dir, offset, !linear)
-                    .and_then(|dims| dims.into_iter().next());
-                match next {
+                let next = if ordinate {
+                    cc_core::dim_line::ordinate(view.id, &[chain.last, s.point], chain.dir, offset)
+                } else {
+                    cc_core::dim_line::chain(view.id, &[chain.last, s.point], chain.dir, offset, !linear)
+                };
+                match next.and_then(|dims| dims.into_iter().next()) {
                     Some(d) => {
-                        paint_dimension(painter, xf, &d, scale);
-                        if resp.clicked() && place_chain(state, type_id, &chain, s.point, offset) {
+                        paint_dimension(painter, xf, &d, scale, &style);
+                        if resp.clicked() && place_chain(state, type_id, &chain, s.point, offset) && !ordinate {
                             state.interaction.dim_chain = Some(DimChain { last: s.point, ..chain });
                         }
                     }
@@ -1776,10 +3147,10 @@ fn dimension_tool(
                     }
                 }
                 [a, b, ..] => {
-                    let kind = if mode == DimensionMode::Linear {
-                        DimensionKind::Linear { dir: linear_direction(*a, *b, raw) }
-                    } else {
-                        DimensionKind::Aligned
+                    let kind = match mode {
+                        DimensionMode::Linear => DimensionKind::Linear { dir: linear_direction(*a, *b, raw) },
+                        DimensionMode::Ordinate => DimensionKind::Ordinate { dir: linear_direction(*a, *b, raw) },
+                        _ => DimensionKind::Aligned,
                     };
                     let d = dim(*a, *b, 0.0, kind);
                     let dir = d.direction().unwrap_or(DVec2::X);
@@ -1801,14 +3172,15 @@ fn dimension_tool(
                         }
                         None => d,
                     };
-                    paint_dimension(painter, xf, &d, scale);
+                    paint_dimension(painter, xf, &d, scale, &style);
                     if resp.clicked() {
-                        if d.value() > 1e-6 && state.dim_continuous {
+                        if d.value() > 1e-6 && continuous {
                             // The first dimension of a chain.
                             let line = *a + dir.perp() * d.offset;
-                            let chain = DimChain { view: view.id, last: *a, dir, line, linear };
+                            let chain = DimChain { view: view.id, last: *a, dir, line, linear, ordinate };
                             if place_chain(state, type_id, &chain, *b, d.offset) {
-                                state.interaction.dim_chain = Some(DimChain { last: *b, ..chain });
+                                let last = if ordinate { *a } else { *b };
+                                state.interaction.dim_chain = Some(DimChain { last, ..chain });
                             }
                             state.interaction.points.clear();
                         } else if d.value() > 1e-6 {
@@ -1847,7 +3219,7 @@ fn dimension_tool(
                         (raw - vertex).length(),
                         DimensionKind::Angular { vertex, rays: Default::default() },
                     );
-                    paint_dimension(painter, xf, &d, scale);
+                    paint_dimension(painter, xf, &d, scale, &style);
                     if resp.clicked() && d.value() > 1e-6 {
                         place(state, d);
                     }
@@ -1886,7 +3258,7 @@ fn dimension_tool(
             if points.is_empty() {
                 painter.circle_stroke(xf.to_screen(center), (r * xf.scale) as f32, Stroke::new(2.5, PREVIEW));
             }
-            paint_dimension(painter, xf, &d, scale);
+            paint_dimension(painter, xf, &d, scale, &style);
             if resp.clicked() {
                 if points.is_empty() {
                     // Keep the arc while the leader is placed.
@@ -1911,21 +3283,37 @@ pub(crate) fn linear_direction(a: DVec2, b: DVec2, cursor: DVec2) -> DVec2 {
     if horizontal { DVec2::X } else { DVec2::Y }
 }
 
-/// Place the next dimension of `chain`, from its last point to `to`, with
-/// its line at `offset` from the last point (`dimension_chain_create`);
-/// selects it. False (with the error shown) when it was refused.
+/// Place the next dimension of `chain`, from its last point (or origin) to
+/// `to`, with its line at `offset` from that point (`dimension_chain_create`
+/// or `dimension_ordinate_create`); selects it. False (with the error
+/// shown) when it was refused.
 fn place_chain(state: &mut AppState, type_id: ElementTypeId, chain: &DimChain, to: DVec2, offset: f64) -> bool {
     let dir = chain.dir;
-    let command = cc_engine::commands::annotate::DimensionChainCreate {
-        view: Ref::Id(chain.view.0),
-        points: vec![chain.last.to_array(), to.to_array()],
-        kind: Some(if chain.linear { "linear" } else { "aligned" }.to_string()),
-        offset: Some(offset),
-        direction: chain.linear.then(|| if dir.x.abs() >= dir.y.abs() { "horizontal" } else { "vertical" }.to_string()),
-        angle: (!chain.linear).then(|| dir.y.atan2(dir.x).to_degrees()),
-        type_ref: Some(Ref::Id(type_id.0)),
+    let axis = if dir.x.abs() >= dir.y.abs() { "horizontal" } else { "vertical" };
+    let points = vec![chain.last.to_array(), to.to_array()];
+    let view = Ref::Id(chain.view.0);
+    let type_ref = Some(Ref::Id(type_id.0));
+    let result = if chain.ordinate {
+        state.session.run(cc_engine::commands::annotate::DimensionOrdinateCreate {
+            view,
+            points,
+            offset: Some(offset),
+            direction: Some(axis.to_string()),
+            angle: None,
+            type_ref,
+        })
+    } else {
+        state.session.run(cc_engine::commands::annotate::DimensionChainCreate {
+            view,
+            points,
+            kind: Some(if chain.linear { "linear" } else { "aligned" }.to_string()),
+            offset: Some(offset),
+            direction: chain.linear.then(|| axis.to_string()),
+            angle: (!chain.linear).then(|| dir.y.atan2(dir.x).to_degrees()),
+            type_ref,
+        })
     };
-    match state.session.run(command) {
+    match result {
         Ok(out) => {
             let ids = out["ids"].as_array().map(|ids| ids.iter().filter_map(|id| id.as_u64()).map(ElementId));
             state.selection = ids.into_iter().flatten().collect();
@@ -1950,11 +3338,32 @@ fn draw_line_guide(painter: &Painter, xf: &Xf, reference: DVec2, point: DVec2) {
 }
 
 /// Paint a dimension being placed, as it will be drawn.
-fn paint_dimension(painter: &Painter, xf: &Xf, d: &cc_core::Dimension, scale: u32) {
-    let Some(layout) = cc_views::dimension_layout(d, scale) else { return };
+fn paint_dimension(
+    painter: &Painter,
+    xf: &Xf,
+    d: &cc_core::Dimension,
+    scale: u32,
+    style: &cc_core::dim_style::DimensionStyle,
+) {
+    let Some(layout) = cc_views::dimension_layout(d, scale, style) else { return };
     let stroke = Stroke::new(1.25, PREVIEW);
     for (a, b, _) in &layout.lines {
         painter.line_segment([xf.to_screen(*a), xf.to_screen(*b)], stroke);
+    }
+    // The type's marks, in the preview color.
+    let mut marks = Drawing2D::default();
+    cc_views::draw_marks(&mut marks, &layout, style, scale, None);
+    for prim in &marks.prims {
+        match prim {
+            cc_views::Prim::Line { a, b, .. } => {
+                painter.line_segment([xf.to_screen(*a), xf.to_screen(*b)], stroke);
+            }
+            cc_views::Prim::Fill { pts, .. } => {
+                let pts = pts.iter().map(|p| xf.to_screen(*p)).collect();
+                painter.add(egui::Shape::convex_polygon(pts, PREVIEW, Stroke::NONE));
+            }
+            _ => {}
+        }
     }
     let up = DVec2::from_angle(layout.text_angle).perp();
     let at = xf.to_screen(layout.text_pos + up * (2.0 * scale as f64 / 1000.0));
@@ -2090,7 +3499,10 @@ fn wall_tool(
     let mut p = s.point;
     draw_snap(painter, xf, s);
 
-    let half = state.project().element_type(type_id).map_or(0.075, |t| t.thickness() * 0.5);
+    let ty = state.project().element_type(type_id);
+    let half = ty.map_or(0.075, |t| t.thickness() * 0.5);
+    // The body's centerline, across from the drawn location line (to its left).
+    let center = -ty.map_or(0.0, |t| t.location_offset(state.wall_location_line));
     // Arc mode: after the start and the end, the third point is on the arc,
     // or a typed radius gives the arc on the cursor's side.
     let arc_end = state.interaction.points.first().copied().filter(|_| state.wall_arc);
@@ -2101,8 +3513,8 @@ fn wall_tool(
             None => cc_core::arc::Arc::bulge_through(a, p, b),
         };
         match bulge {
-            Some(bulge) => arc_preview(painter, xf, a, b, bulge, half),
-            None => paint_wall_preview(painter, xf, a, b, half),
+            Some(bulge) => arc_preview(painter, xf, a, b, bulge, center, half),
+            None => paint_wall_preview(painter, xf, a, b, center, half),
         }
         let unit = format::current().0.length.unit.symbol();
         let arc = bulge.and_then(|bulge| cc_core::arc::Arc::from_bulge(a, b, bulge));
@@ -2121,6 +3533,7 @@ fn wall_tool(
         if resp.clicked() || enter {
             match bulge {
                 Some(bulge) => {
+                    let (before, depth) = (chain_at(state), state.session.doc.undo_depth());
                     create_wall(state, level, type_id, a, b, bulge);
                     state.interaction.anchor = Some(b);
                     state.interaction.points.clear();
@@ -2129,6 +3542,7 @@ fn wall_tool(
                     if let Some(arc) = cc_core::arc::Arc::from_bulge(a, b, bulge) {
                         state.interaction.prev_dir = Some(-arc.tangent(arc.length()));
                     }
+                    chain_placed(state, before, depth);
                 }
                 None if radius.is_some() => state.message = t!("msg-arc-radius-short"),
                 None => state.message = t!("msg-arc-collinear"),
@@ -2143,9 +3557,10 @@ fn wall_tool(
         if state.wall_arc {
             painter.line_segment([xf.to_screen(a), xf.to_screen(p)], Stroke::new(1.0, PREVIEW));
         } else {
-            paint_wall_preview(painter, xf, a, p, half);
+            paint_wall_preview(painter, xf, a, p, center, half);
         }
-        temp_dimension(painter, xf, a, p, state.interaction.prev_dir, Some(&state.typed), half);
+        let side = (center + half).max(0.0);
+        temp_dimension(painter, xf, a, p, state.interaction.prev_dir, Some(&state.typed), side);
     }
 
     let enter = ui.input(|i| i.key_pressed(Key::Enter)) && !state.typed.is_empty();
@@ -2159,11 +3574,13 @@ fn wall_tool(
                 state.typed.clear();
             }
             Some(a) if a.distance(p) > 0.01 => {
+                let (before, depth) = (chain_at(state), state.session.doc.undo_depth());
                 create_wall(state, level, type_id, a, p, 0.0);
                 state.interaction.anchor = Some(p);
                 // The next wall's angle is measured from this one (as an interior angle).
                 state.interaction.prev_dir = Some(a - p);
                 state.typed.clear();
+                chain_placed(state, before, depth);
             }
             _ => {}
         }
@@ -2203,22 +3620,26 @@ fn create_wall(state: &mut AppState, level: LevelId, type_id: ElementTypeId, a: 
     run_create(state, command);
 }
 
-/// Preview of a straight wall from `a` to `b`: its line and faces.
-fn paint_wall_preview(painter: &Painter, xf: &Xf, a: DVec2, b: DVec2, half: f64) {
-    let n = (b - a).normalize_or_zero().perp() * half;
+/// Preview of a straight wall drawn from `a` to `b`: its location line and
+/// faces, `half` either side of its centerline `center` to the left of the line.
+fn paint_wall_preview(painter: &Painter, xf: &Xf, a: DVec2, b: DVec2, center: f64, half: f64) {
+    let left = (b - a).normalize_or_zero().perp();
     let stroke = Stroke::new(1.5, PREVIEW);
     painter.line_segment([xf.to_screen(a), xf.to_screen(b)], Stroke::new(1.0, PREVIEW));
-    painter.line_segment([xf.to_screen(a + n), xf.to_screen(b + n)], stroke);
-    painter.line_segment([xf.to_screen(a - n), xf.to_screen(b - n)], stroke);
+    for v in [center + half, center - half] {
+        let n = left * v;
+        painter.line_segment([xf.to_screen(a + n), xf.to_screen(b + n)], stroke);
+    }
 }
 
-/// Preview of an arc wall from `a` to `b` with `bulge`: its line and faces.
-pub(crate) fn arc_preview(painter: &Painter, xf: &Xf, a: DVec2, b: DVec2, bulge: f64, half: f64) {
+/// Preview of an arc wall drawn from `a` to `b` with `bulge`: its location
+/// line and faces, as in [`paint_wall_preview`].
+pub(crate) fn arc_preview(painter: &Painter, xf: &Xf, a: DVec2, b: DVec2, bulge: f64, center: f64, half: f64) {
     let Some(arc) = cc_core::arc::Arc::from_bulge(a, b, bulge) else {
-        paint_wall_preview(painter, xf, a, b, half);
+        paint_wall_preview(painter, xf, a, b, center, half);
         return;
     };
-    for (v, width) in [(0.0, 1.0), (half, 1.5), (-half, 1.5)] {
+    for (v, width) in [(0.0, 1.0), (center + half, 1.5), (center - half, 1.5)] {
         if arc.radius_at(v) <= 0.0 {
             continue;
         }
@@ -2266,22 +3687,37 @@ fn hosted_tool(
     let Some(ty) = project.element_type(type_id) else { return };
     let Some((width, _)) = ty.opening_size() else { return };
     let sill = ty.default_sill();
-    let Some((host, u, v)) = wall_under(project, state.session.geom(), level, raw, 12.0 / xf.scale) else {
+    // Some reach off the wall, to aim at marks of a drawing beside it (issue #251).
+    let Some((host, u, v)) = wall_under(project, state.session.geom(), level, raw, 30.0 / xf.scale) else {
         painter.circle_stroke(xf.to_screen(raw), 4.0, Stroke::new(1.0, Color32::GRAY));
         return;
     };
-    let g = &state.session.geom().walls[&host];
-    let Some(offset) = opening_offset(g, width, u) else {
+    let r = SNAP_PX / xf.scale;
+    let features = cad_snap(state, raw, width * 0.5 + 2.0 * r);
+    let Some(g) = state.session.geom().walls.get(&host) else { return };
+    let Some(placed) = crate::opening_place::place(g, width, (u, v), &features, r, &state.typed) else {
         label(painter, xf.to_screen(raw), t!("msg-wall-too-short"));
         return;
     };
+    let offset = placed.offset;
     let flip_facing = v < 0.0;
+    let side = if flip_facing { -1.0 } else { 1.0 };
+    crate::opening_place::paint_dimensions(painter, xf, g, offset, side, &state.typed);
+    if let Some(s) = placed.snapped {
+        let at = match s.part {
+            crate::opening_place::Part::Center => offset,
+            crate::opening_place::Part::StartEdge => offset - width * 0.5,
+            crate::opening_place::Part::EndEdge => offset + width * 0.5,
+        };
+        let line = [xf.to_screen(s.point), xf.to_screen(g.world(at, 0.0))];
+        painter.extend(egui::Shape::dashed_line(&line, Stroke::new(1.0, TEMP_DIM), 4.0, 3.0));
+        draw_snap(painter, xf, Snap::plain(s.point, true));
+    }
     let (u0, u1) = (offset - width * 0.5, offset + width * 0.5);
     let rect = g.outline((u0, u1), (u0, u1));
     let pts: Vec<Pos2> = rect.iter().map(|p| xf.to_screen(*p)).collect();
     painter.add(egui::Shape::closed_line(pts, Stroke::new(2.0, PREVIEW)));
     if category == Category::Door {
-        let side = if flip_facing { -1.0 } else { 1.0 };
         let hinge_u = if state.interaction.flip_hand { u1 } else { u0 };
         let hinge = g.world(hinge_u, side * g.half);
         let normal = g.normal_at(offset);
@@ -2290,10 +3726,19 @@ fn hosted_tool(
             Stroke::new(1.5, PREVIEW),
         );
     }
-    label(painter, xf.to_screen(raw), format!("{} {}", t!("label-offset"), format::meters(offset)));
+    if placed.outside {
+        label(painter, xf.to_screen(raw), t!("msg-opening-past-wall-end"));
+    }
 
-    if resp.clicked() {
+    // A click, or Enter after a typed distance (issue #250).
+    let enter = ui.input(|i| i.key_pressed(Key::Enter)) && !state.typed.is_empty();
+    if resp.clicked() || enter {
+        if placed.outside {
+            state.message = t!("msg-opening-past-wall-end");
+            return;
+        }
         let flip_hand = state.interaction.flip_hand;
+        state.typed.clear();
         create_opening(state, category, type_id, host, offset, sill, flip_facing, flip_hand);
     }
 }
@@ -2301,8 +3746,7 @@ fn hosted_tool(
 /// Center of an opening `width` wide near `u` along wall `g`, kept inside
 /// the wall (`None` when the wall is too short).
 fn opening_offset(g: &cc_geom::WallGeom, width: f64, u: f64) -> Option<f64> {
-    let margin = 0.01;
-    (g.length >= width + 2.0 * margin).then(|| u.clamp(width * 0.5 + margin, g.length - width * 0.5 - margin))
+    crate::opening_place::center_range(g, width).map(|(lo, hi)| u.clamp(lo, hi))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2325,11 +3769,22 @@ fn create_opening(
         flip_hand: Some(flip_hand),
         point: None,
     };
-    if category == Category::Door {
-        run_create(state, create::DoorCreate { args });
-    } else {
-        run_create(state, create::WindowCreate { args });
-    }
+    match category {
+        Category::Door => run_create(state, create::DoorCreate { args }),
+        // A niche has no hand; it is in the face clicked.
+        Category::Niche => run_create(
+            state,
+            cc_engine::commands::niche::NicheCreate {
+                wall: args.wall,
+                offset: args.offset,
+                point: None,
+                sill: args.sill,
+                type_ref: args.type_ref,
+                flip_facing: args.flip_facing,
+            },
+        ),
+        _ => run_create(state, create::WindowCreate { args }),
+    };
 }
 
 /// A door or window tool clicked on `point` of wall `host` in a 3D view: the
@@ -2350,22 +3805,6 @@ pub(crate) fn place_opening_3d(state: &mut AppState, tool: &Tool, host: ElementI
     };
     let flip_hand = state.interaction.flip_hand;
     create_opening(state, category, type_id, host, offset, sill, v < 0.0, flip_hand);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn sketch_tool(
-    ui: &Ui,
-    resp: &Response,
-    painter: &Painter,
-    state: &mut AppState,
-    level: LevelId,
-    category: Category,
-    type_id: ElementTypeId,
-    xf: &Xf,
-) {
-    if let Some(pts) = sketch_input(ui, resp, painter, state, level, xf) {
-        finish_sketch(state, level, category, type_id, pts);
-    }
 }
 
 /// Add the sketched outline `pts` as an opening of `roof` (refused, with a
@@ -2448,32 +3887,6 @@ fn sketch_input(
     None
 }
 
-pub fn finish_sketch(
-    state: &mut AppState,
-    level: LevelId,
-    category: Category,
-    type_id: ElementTypeId,
-    pts: Vec<DVec2>,
-) {
-    if pts.len() < 3 || polygon::area(&pts) < 1e-4 {
-        state.message = t!("msg-sketch-invalid");
-        return;
-    }
-    let sketch = create::SketchArgs {
-        boundary: Some(pts.iter().map(|p| p.to_array()).collect()),
-        level: Some(Ref::Id(level.0)),
-        type_ref: Some(Ref::Id(type_id.0)),
-        ..Default::default()
-    };
-    match category {
-        Category::Floor => run_create(state, create::FloorCreate { sketch, openings: Vec::new() }),
-        Category::Ceiling => run_create(state, create::CeilingCreate { sketch }),
-        Category::Foundation => run_create(state, cc_engine::commands::foundation::FoundationSlabCreate { sketch }),
-        _ => run_create(state, create::RoofCreate { sketch, overhang: None, holes: Vec::new() }),
-    };
-    state.interaction.points.clear();
-}
-
 fn section_tool(ui: &Ui, resp: &Response, painter: &Painter, state: &mut AppState, level: Option<LevelId>, xf: &Xf) {
     let Some(raw) = resp.hover_pos().map(|p| xf.to_world(p)) else { return };
     let shift = ui.input(|i| i.modifiers.shift);
@@ -2530,6 +3943,17 @@ fn select(
     xf: &Xf,
     drawing: &Drawing2D,
 ) {
+    // Callout and section marks first: they lie over the model.
+    if crate::callout_ui::select(ui, resp, painter, state, xf, drawing) {
+        return;
+    }
+    if movable && crate::section_mark::select(ui, resp, painter, state, xf, drawing) {
+        return;
+    }
+    // The grips of selected detail lines, in any view that holds them.
+    if crate::detail_ui::grips(ui, resp, painter, state, xf) {
+        return;
+    }
     let raw = resp.hover_pos().map(|p| xf.to_world(p));
     let tol = 5.0 / xf.scale;
     let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
@@ -2562,7 +3986,7 @@ fn select(
     } else {
         Vec::new()
     };
-    // Curvature handles of selected arc walls, at the middle of the arc.
+    // Curvature handles of selected arc walls and strip footings, at the middle of the arc.
     let bends: Vec<(ElementId, DVec2, DVec2, cc_core::arc::Arc)> = if movable && state.interaction.drag.is_none() {
         state
             .selection
@@ -2570,14 +3994,20 @@ fn select(
             .take(50)
             .filter(|id| !state.project().is_pinned(**id))
             .filter_map(|id| {
-                let w = state.project().element(*id)?.as_wall()?;
-                Some((*id, w.start, w.end, w.arc()?))
+                let (a, b, arc) = bendable(state.project().element(*id)?)?;
+                Some((*id, a, b, arc))
             })
             .collect()
     } else {
         Vec::new()
     };
     let grip_at = |p: Pos2| grips.iter().find(|g| xf.to_screen(g.2).distance(p) <= 7.0).copied();
+    // Hotspots of selected scripted components.
+    let spots = if movable && state.interaction.drag.is_none() { selected_hotspots(state) } else { Vec::new() };
+    let spot_at = |p: Pos2| spots.iter().find(|s| xf.to_screen(s.2).distance(p) <= 7.0).cloned();
+    for (.., at, _, shape, color) in &spots {
+        hotspot_marker(painter, xf.to_screen(*at), *shape, *color);
+    }
     let bend_at = |p: Pos2| {
         bends.iter().find(|(.., arc)| xf.to_screen(arc.point(arc.length() * 0.5)).distance(p) <= 7.0).copied()
     };
@@ -2596,11 +4026,23 @@ fn select(
         // The handle moves the arc's middle toward or away from its center.
         let mid = arc.point(arc.length() * 0.5);
         ui.ctx().set_cursor_icon(resize_cursor(xf.to_screen(mid) - xf.to_screen(arc.center)));
+    } else if movable && raw.is_some_and(|p| drawing.tag_at(p).is_some()) {
+        // Tags are dragged to a new spot.
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
     }
 
     if resp.drag_started_by(egui::PointerButton::Primary) {
         let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or_default();
         let w = xf.to_world(origin);
+        // A tag is dragged on its own, away from its element.
+        if movable && let Some(tag) = drawing.tag_at(w) {
+            state.interaction.drag = Some(Drag::Tag { tag, start: w });
+            return;
+        }
+        if let Some((id, name, _, z, shape, color)) = spot_at(origin) {
+            state.interaction.drag = Some(Drag::Hotspot { id, name, z, shape, color });
+            return;
+        }
         if let Some((id, at_start, _, fixed)) = grip_at(origin) {
             state.interaction.drag = Some(Drag::Grip { id, at_start, fixed });
             return;
@@ -2609,7 +4051,13 @@ fn select(
             state.interaction.drag = Some(Drag::Bend { id, a, b });
             return;
         }
-        match drawing.hit_test(w, tol) {
+        // A drag moves what it starts on: an element's line, or an element
+        // already selected. Elsewhere (empty paper, inside a floor or a
+        // hatch) it draws a selection box.
+        let grabbed = drawing
+            .hit_test_line(w, tol)
+            .or_else(|| drawing.hit_test(w, tol).filter(|id| state.selection.contains(id)));
+        match grabbed {
             Some(hit) if movable => {
                 if !state.selection.contains(&hit) {
                     state.selection = BTreeSet::from([hit]);
@@ -2643,7 +4091,7 @@ fn select(
         let bulge = state.project().element(id).and_then(|e| e.as_wall()).map_or(0.0, |w| w.bulge);
         if bulge != 0.0 {
             let (a, b) = if at_start { (s.point, fixed) } else { (fixed, s.point) };
-            arc_preview(painter, xf, a, b, bulge, 0.0);
+            arc_preview(painter, xf, a, b, bulge, 0.0, 0.0);
         } else {
             painter.line_segment([xf.to_screen(fixed), xf.to_screen(s.point)], Stroke::new(2.0, PREVIEW));
         }
@@ -2657,6 +4105,25 @@ fn select(
         return;
     }
 
+    // Dragging a hotspot: it snaps like a drawing point and keeps its elevation.
+    if let (Some(Drag::Hotspot { id, name, z, shape, color }), Some(raw)) = (state.interaction.drag.clone(), raw) {
+        let level = state.project().element(id).map(|e| e.level);
+        let s = snap_at(state, level, raw, None, &[], xf.scale, shift);
+        draw_snap(painter, xf, s);
+        hotspot_marker(painter, xf.to_screen(s.point), shape, color);
+        if resp.drag_stopped() {
+            state.interaction.drag = None;
+            let command = cc_engine::commands::component_script::ComponentHotspotMove {
+                element: id.0,
+                name,
+                point: [s.point.x, s.point.y, z],
+                world: true,
+            };
+            crate::actions::run_command(state, command);
+        }
+        return;
+    }
+
     // Dragging an arc wall's curvature handle: the arc passes through the cursor
     // and its ends stay.
     if let (Some(Drag::Bend { id, a, b }), Some(raw)) = (state.interaction.drag.clone(), raw) {
@@ -2664,7 +4131,7 @@ fn select(
         if let Some((bulge, arc)) = bulge.and_then(|bulge| Some((bulge, cc_core::arc::Arc::from_bulge(a, b, bulge)?))) {
             let mid = arc.point(arc.length() * 0.5);
             ui.ctx().set_cursor_icon(resize_cursor(xf.to_screen(mid) - xf.to_screen(arc.center)));
-            arc_preview(painter, xf, a, b, bulge, 0.0);
+            arc_preview(painter, xf, a, b, bulge, 0.0, 0.0);
             label(
                 painter,
                 xf.to_screen(raw),
@@ -2675,11 +4142,7 @@ fn select(
             state.interaction.drag = None;
             match bulge {
                 Some(bulge) => {
-                    crate::engine_edit::element(state, id, None, |e| {
-                        if let ElementKind::Wall(w) = &mut e.kind {
-                            w.bulge = bulge;
-                        }
-                    });
+                    crate::engine_edit::element(state, id, None, |e| set_bulge(e, bulge));
                 }
                 None => state.message = t!("msg-arc-collinear"),
             }
@@ -2697,19 +4160,15 @@ fn select(
             let verb = if *copy { t!("label-copy") } else { t!("label-move") };
             label(painter, xf.to_screen(raw), format!("{verb} {}", format::length(delta.length())));
         }
+        (Some(Drag::Tag { tag, start }), Some(raw)) => {
+            // The tag's box where it would go.
+            let center = tag.center + (raw - *start);
+            let rect = egui::Rect::from_two_pos(xf.to_screen(center - tag.half), xf.to_screen(center + tag.half));
+            painter.rect_stroke(rect.expand(2.0), 2.0, Stroke::new(1.5, PREVIEW), egui::StrokeKind::Middle);
+        }
         (Some(Drag::Box { start }), _) => {
             if let Some(cur) = resp.interact_pointer_pos().or(resp.hover_pos()) {
-                let rect = egui::Rect::from_two_pos(*start, cur);
-                let crossing = cur.x < start.x;
-                let color = if crossing { Color32::from_rgb(30, 160, 60) } else { HIGHLIGHT };
-                painter.rect_filled(rect, 0.0, color.gamma_multiply(0.08));
-                if crossing {
-                    let c =
-                        [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom(), rect.left_top()];
-                    painter.extend(egui::Shape::dashed_line(&c, Stroke::new(1.0, color), 5.0, 3.0));
-                } else {
-                    painter.rect_stroke(rect, 0.0, Stroke::new(1.0, color), egui::StrokeKind::Middle);
-                }
+                select_box(painter, *start, cur);
             }
         }
         _ => {}
@@ -2730,7 +4189,28 @@ fn select(
                 }
             }
             // Handled above while the pointer is over the view.
-            Some(Drag::Grip { .. } | Drag::Bend { .. }) => {}
+            Some(
+                Drag::Grip { .. }
+                | Drag::DetailGrip { .. }
+                | Drag::Bend { .. }
+                | Drag::Hotspot { .. }
+                | Drag::Section { .. }
+                | Drag::Callout { .. },
+            ) => {}
+            Some(Drag::Tag { tag, start }) => {
+                if let (Some(raw), Some(view)) = (raw.or(state.cursor), state.active_view)
+                    && raw.distance(start) > 1e-6
+                {
+                    let command = cc_engine::commands::annotate::TagMove {
+                        view: Ref::Id(view.0),
+                        id: tag.element.0,
+                        delta: Some((raw - start).to_array()),
+                        offset: None,
+                        reset: false,
+                    };
+                    crate::actions::run_command(state, command);
+                }
+            }
             Some(Drag::Box { start }) => {
                 let end = resp.interact_pointer_pos().or(resp.hover_pos()).unwrap_or(start);
                 let (a, b) = (xf.to_world(start), xf.to_world(end));
@@ -2860,6 +4340,101 @@ mod tests {
     /// 100 px per meter: the snap radius is 0.1 m.
     const SCALE: f64 = 100.0;
 
+    /// The plumbing fixture and electrical device tools offer only their own
+    /// types in the options bar, not furniture or each other's (issue #255);
+    /// the generic component tool offers no fixtures or devices.
+    #[test]
+    fn mep_component_tools_list_only_their_types() {
+        let project = crate::actions::new_project();
+        let group = |id| component_group(&project, id);
+        for (device, wanted) in [(false, ComponentGroup::Fixture), (true, ComponentGroup::Device)] {
+            let first = mep_component_type(&project, device).expect("the template has one");
+            let listed = tool_types(&project, Category::Component, first, None);
+            assert!(listed.iter().any(|(id, _)| *id == first));
+            assert!(listed.iter().all(|(id, _)| group(*id) == wanted), "{wanted:?}: {listed:?}");
+            let key = Tool::Component { type_id: first }.name_key(&project);
+            assert_eq!(key, if device { "tool-device" } else { "tool-fixture" });
+        }
+        let furniture = project
+            .types_of(Category::Component)
+            .find(|t| group(t.id) == ComponentGroup::Generic)
+            .map(|t| t.id)
+            .expect("the template has furniture");
+        let listed = tool_types(&project, Category::Component, furniture, None);
+        assert!(!listed.is_empty() && listed.iter().all(|(id, _)| group(*id) == ComponentGroup::Generic));
+        assert!(listed.len() < project.types_of(Category::Component).count());
+        assert_eq!(Tool::Component { type_id: furniture }.name_key(&project), "tool-component");
+        // Other categories keep every type.
+        let wall = project.types_of(Category::Wall).next().map(|t| t.id).unwrap();
+        assert_eq!(tool_types(&project, Category::Wall, wall, None).len(), project.types_of(Category::Wall).count());
+    }
+
+    /// The curvature handle bends arc strip footings as it bends arc walls
+    /// (a straight strip has none, like a straight wall), through the engine
+    /// in one undo step; a bulge the engine refuses leaves the strip as it was.
+    #[test]
+    fn the_curvature_handle_bends_arc_strip_footings() {
+        fn strip(state: &mut AppState, args: serde_json::Value) -> ElementId {
+            let out = state.session.execute("strip_footing_create", args).unwrap();
+            ElementId(out["id"].as_u64().unwrap())
+        }
+        let mut state = AppState::new(cc_core::Document::new(crate::actions::new_project()));
+        let level = state.project().levels.first().map(|l| l.id.0).unwrap();
+        let arc = strip(&mut state, serde_json::json!({"level": level, "start": [0, 0], "end": [6, 0], "mid": [3, 1]}));
+        let straight = strip(&mut state, serde_json::json!({"level": level, "start": [0, 5], "end": [6, 5]}));
+        let element = |state: &AppState, id| state.project().element(id).cloned().unwrap();
+        assert!(bendable(&element(&state, straight)).is_none());
+        let (a, b, before) = bendable(&element(&state, arc)).expect("an arc strip has a handle");
+        assert_eq!((a, b), (DVec2::ZERO, DVec2::new(6.0, 0.0)));
+        // Drag the middle up to (3, 2): the ends stay, the arc passes there.
+        let bulge = cc_core::arc::Arc::bulge_through(a, DVec2::new(3.0, 2.0), b).unwrap();
+        let depth = state.session.doc.undo_depth();
+        assert!(crate::engine_edit::element(&mut state, arc, None, |e| set_bulge(e, bulge)));
+        assert_eq!(state.session.doc.undo_depth(), depth + 1);
+        let (a2, b2, after) = bendable(&element(&state, arc)).unwrap();
+        assert_eq!((a2, b2), (a, b));
+        assert!(after.radius < before.radius, "{} {}", after.radius, before.radius);
+        assert!(after.point(after.length() * 0.5).distance(DVec2::new(3.0, 2.0)) < 1e-9);
+        // A bulge out of range is refused: unchanged, with a message.
+        let kept = element(&state, arc);
+        assert!(!crate::engine_edit::element(&mut state, arc, None, |e| set_bulge(e, 1e3)));
+        assert_eq!(element(&state, arc), kept);
+        assert!(!state.message.is_empty());
+    }
+
+    /// The beam tool's command makes a straight beam or, with a bulge, an
+    /// arc beam, which then has the curvature handle and snaps by its arc.
+    #[test]
+    fn the_beam_tool_draws_arc_beams() {
+        let mut state = AppState::new(cc_core::Document::new(crate::actions::new_project()));
+        let level = state.project().levels.first().map(|l| l.id).unwrap();
+        let type_id = state.project().default_type(Category::Beam).unwrap();
+        let (a, b) = (DVec2::new(2.5, 0.0), DVec2::new(0.0, 2.5));
+        let made = |state: &mut AppState, command: create::BeamCreate| {
+            ElementId(state.session.run(command).unwrap()["id"].as_u64().unwrap())
+        };
+        let straight = made(&mut state, beam_command(level, type_id, a + DVec2::X * 10.0, b + DVec2::X * 10.0, 0.0));
+        let bulge = cc_core::arc::Arc::bulge_through(a, DVec2::from_angle(0.7) * 2.5, b).unwrap();
+        let arc = made(&mut state, beam_command(level, type_id, a, b, bulge));
+        let element = |state: &AppState, id| state.project().element(id).cloned().unwrap();
+        assert!(bendable(&element(&state, straight)).is_none());
+        let (a2, b2, curve) = bendable(&element(&state, arc)).expect("an arc beam has a handle");
+        assert_eq!((a2, b2), (a, b));
+        assert!((curve.radius - 2.5).abs() < 1e-9 && curve.center.length() < 1e-9);
+        // The handle bends it through the engine, in one undo step.
+        let tighter = cc_core::arc::Arc::bulge_through(a, DVec2::new(2.5, 2.5), b).unwrap();
+        let depth = state.session.doc.undo_depth();
+        assert!(crate::engine_edit::element(&mut state, arc, None, |e| set_bulge(e, tighter)));
+        assert_eq!(state.session.doc.undo_depth(), depth + 1);
+        let (.., bent) = bendable(&element(&state, arc)).unwrap();
+        assert!(bent.point(bent.length() * 0.5).distance(DVec2::new(2.5, 2.5)) < 1e-9);
+        // Its ends, middle and arc are snap targets.
+        state.sync();
+        let snaps = model_snaps_cached(&mut state, Some(level));
+        assert!(snaps.arcs.iter().any(|c| (c.radius - bent.radius).abs() < 1e-9));
+        assert!(snaps.ends.contains(&a) && snaps.ends.contains(&b));
+    }
+
     #[test]
     fn typed_radius_takes_the_cursor_side() {
         use cc_core::arc::Arc;
@@ -2879,6 +4454,22 @@ mod tests {
         assert!(m.y > 7.0 && (sweep - 300.0).abs() < 1e-9, "{m} {sweep}");
         // Too short a radius.
         assert_eq!(bulge_with_radius(a, b, DVec2::new(2.0, 1.0), 1.0), None);
+    }
+
+    /// Issue #158: a grid's length can be typed after its first point.
+    #[test]
+    fn grids_take_a_typed_length() {
+        let mut state = AppState::new(cc_core::Document::new(crate::home::sample_project("casa_simples").unwrap()));
+        let tool = Tool::for_category(state.project(), cc_core::Category::Grid).unwrap();
+        state.set_tool(tool);
+        assert!(!state.typing_segment(), "no first point yet");
+        let a = DVec2::new(1.0, 2.0);
+        state.interaction.anchor = Some(a);
+        assert!(state.typing_segment());
+        let cursor = DVec2::new(1.0, 5.0);
+        assert_eq!(typed_end(&state, a, cursor), cursor, "nothing typed: the cursor");
+        "12,5".chars().for_each(|c| state.typed.push(c));
+        assert!(typed_end(&state, a, cursor).distance(DVec2::new(1.0, 14.5)) < 1e-9);
     }
 
     #[test]
@@ -2919,6 +4510,25 @@ mod tests {
     }
 
     #[test]
+    fn ordinate_points_measure_from_the_origin_on_one_line() {
+        let mut state = AppState::new(cc_core::Document::new(crate::home::sample_project("casa_simples").unwrap()));
+        let plan = *state.project().views.iter().find(|(_, v)| v.is_plan()).unwrap().0;
+        let type_id = state.project().default_type(Category::Dimension).unwrap();
+        let origin = DVec2::new(100.0, 100.0);
+        let line = origin - DVec2::Y;
+        let chain = DimChain { view: plan, last: origin, dir: DVec2::X, line, linear: true, ordinate: true };
+        for (x, total) in [(100.6, 0.6), (101.2, 1.2), (102.4, 2.4)] {
+            assert!(place_chain(&mut state, type_id, &chain, DVec2::new(x, 100.2), -1.0));
+            let [id] = state.selection.iter().copied().collect::<Vec<_>>()[..] else { panic!("one selected") };
+            let Some(ElementKind::Dimension(d)) = state.project().element(id).map(|e| &e.kind) else { panic!() };
+            assert!(matches!(d.kind, DimensionKind::Ordinate { .. }), "{d:?}");
+            assert_eq!(d.a, origin);
+            assert!((d.value() - total).abs() < 1e-9, "{d:?}");
+            assert!((d.a.y + d.offset - line.y).abs() < 1e-9);
+        }
+    }
+
+    #[test]
     fn a_continued_chain_stays_on_its_line_and_selects_the_new_dimension() {
         let mut state = AppState::new(cc_core::Document::new(crate::home::sample_project("casa_simples").unwrap()));
         let plan = *state.project().views.iter().find(|(_, v)| v.is_plan()).unwrap().0;
@@ -2937,7 +4547,7 @@ mod tests {
         let dir = DVec2::new(3.0, 4.0).normalize();
         let first = DVec2::new(100.0, 100.0);
         let line = first + dir.perp() * 1.5;
-        let mut chain = DimChain { view: plan, last: first, dir, line, linear: false };
+        let mut chain = DimChain { view: plan, last: first, dir, line, linear: false, ordinate: false };
         for (to, aligned) in [(first + dir * 5.0, true), (first + DVec2::new(7.0, 6.0), false)] {
             let offset = (chain.line - chain.last).dot(dir.perp());
             assert!(place_chain(&mut state, type_id, &chain, to, offset));
@@ -2978,6 +4588,36 @@ mod tests {
         (p, level)
     }
 
+    /// The tools snap to an imported drawing's ends and circle centers in its view only.
+    #[test]
+    fn snaps_to_imported_drawings() {
+        let dir = std::env::temp_dir().join(format!("ccad-app-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snap.dxf");
+        let dxf = "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n3\n21\n0\n\
+                   0\nCIRCLE\n8\n0\n10\n6\n20\n2\n40\n1\n0\nENDSEC\n0\nEOF\n";
+        std::fs::write(&path, dxf).unwrap();
+        let mut state = AppState::new(cc_core::Document::new(crate::actions::new_project()));
+        let level = state.project().levels[0].id;
+        let plan = state.project().views.values().find(|v| v.level() == Some(level)).map(|v| v.id).unwrap();
+        state.active_view = Some(plan);
+        crate::cad_ui::import_cad_path(&mut state, path);
+        crate::jobs::wait(&mut state);
+        assert_eq!(state.selection.len(), 1, "{}", state.message);
+        state.sync();
+        let s = snap_at(&mut state, Some(level), DVec2::new(3.04, 0.03), None, &[], SCALE, false);
+        assert_eq!(s.kind, SnapKind::Endpoint);
+        assert!(s.point.distance(DVec2::new(3.0, 0.0)) < 1e-12);
+        let s = snap_at(&mut state, Some(level), DVec2::new(6.03, 2.02), None, &[], SCALE, false);
+        assert_eq!(s.kind, SnapKind::Center);
+        assert!(s.point.distance(DVec2::new(6.0, 2.0)) < 1e-12);
+        // Not in another view.
+        let other = state.project().views.values().find(|v| v.level().is_some() && v.id != plan).map(|v| v.id);
+        state.active_view = other;
+        let s = snap_at(&mut state, Some(level), DVec2::new(6.03, 2.02), None, &[], SCALE, false);
+        assert_ne!(s.kind, SnapKind::Center);
+    }
+
     #[test]
     fn two_guides_cross_at_an_alignment() {
         let (p, level) = empty();
@@ -3011,6 +4651,77 @@ mod tests {
         );
         assert_eq!(s.kind, SnapKind::Alignment);
         assert!(s.point.distance(target) < 1e-9, "{} vs {target}", s.point);
+    }
+
+    /// Issue #125: Backspace or Ctrl+Z takes back the last wall of a chain
+    /// and the tool goes on from where it started; Ctrl+Y puts it back.
+    #[test]
+    fn chains_step_back_one_segment_without_leaving_the_tool() {
+        use crate::commands::{UiCommand, run};
+        let mut state = AppState::new(cc_core::Document::new(crate::home::sample_project("casa_simples").unwrap()));
+        let level = state.project().levels[0].id;
+        let type_id = Tool::for_category(state.project(), cc_core::Category::Wall).and_then(|t| match t {
+            Tool::Wall { type_id } => Some(type_id),
+            _ => None,
+        });
+        let type_id = type_id.unwrap();
+        state.set_tool(Tool::Wall { type_id });
+        let walls = |state: &AppState| {
+            state.project().elements.values().filter(|e| e.category() == cc_core::Category::Wall).count()
+        };
+        let before = walls(&state);
+        // Three walls, placed the way the tool places them.
+        let pts = [DVec2::new(30.0, 30.0), DVec2::new(34.0, 30.0), DVec2::new(34.0, 33.0), DVec2::new(30.0, 33.0)];
+        state.interaction.anchor = Some(pts[0]);
+        for w in pts.windows(2) {
+            let (at, depth) = (chain_at(&state), state.session.doc.undo_depth());
+            create_wall(&mut state, level, type_id, w[0], w[1], 0.0);
+            state.interaction.anchor = Some(w[1]);
+            state.interaction.prev_dir = Some(w[0] - w[1]);
+            chain_placed(&mut state, at, depth);
+        }
+        assert_eq!(walls(&state), before + 3);
+        let ctx = egui::Context::default();
+        // The keys themselves, through the app's shortcuts (issue #161).
+        let press = |state: &mut AppState, key: egui::Key| {
+            let modifiers = egui::Modifiers::COMMAND;
+            let event = egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+            let input = egui::RawInput { events: vec![event], ..Default::default() };
+            ctx.begin_pass(input);
+            crate::app::shortcuts(&ctx, state);
+            ctx.end_pass().textures_delta.clear();
+        };
+        // Ctrl+Z: the last wall goes, the chain goes on from its start, the tool stays.
+        press(&mut state, egui::Key::Z);
+        assert_eq!(walls(&state), before + 2);
+        assert_eq!(state.interaction.anchor, Some(pts[2]));
+        assert_eq!(state.interaction.prev_dir, Some(pts[1] - pts[2]));
+        assert!(matches!(state.tool, Tool::Wall { .. }));
+        // Ctrl+Y puts it back and the chain goes on from its end.
+        press(&mut state, egui::Key::Y);
+        assert_eq!((walls(&state), state.interaction.anchor), (before + 3, Some(pts[3])));
+        // The quick access buttons do the same.
+        run(&mut state, &ctx, UiCommand::Undo);
+        assert_eq!((walls(&state), state.interaction.anchor), (before + 2, Some(pts[2])));
+        run(&mut state, &ctx, UiCommand::Redo);
+        assert_eq!((walls(&state), state.interaction.anchor), (before + 3, Some(pts[3])));
+        // Backspace walks back the whole chain, then drops the start point.
+        for (left, anchor) in [(2, pts[2]), (1, pts[1]), (0, pts[0])] {
+            assert!(chain_back(&mut state));
+            assert_eq!((walls(&state), state.interaction.anchor), (before + left, Some(anchor)));
+        }
+        assert!(chain_back(&mut state));
+        assert_eq!(state.interaction.anchor, None);
+        assert!(!chain_back(&mut state), "nothing left to take back");
+        // A change made some other way is not undone by stepping back.
+        state.interaction.anchor = Some(pts[0]);
+        let (at, depth) = (chain_at(&state), state.session.doc.undo_depth());
+        create_wall(&mut state, level, type_id, pts[0], pts[1], 0.0);
+        state.interaction.anchor = Some(pts[1]);
+        chain_placed(&mut state, at, depth);
+        create_wall(&mut state, level, type_id, pts[2], pts[3], 0.0);
+        assert!(chain_back(&mut state), "the anchor is dropped");
+        assert_eq!(walls(&state), before + 2, "both walls stay");
     }
 
     #[test]
@@ -3100,6 +4811,164 @@ mod tests {
         let s = snap(&p, &geom, Some(level), face - w.normal * 0.01, None, &[], &[], SCALE, false);
         assert_eq!(s.kind, SnapKind::Nearest);
         assert!(s.point.distance(face) < 1e-6, "{} vs {face}", s.point);
+    }
+
+    /// Issue #317: beams and footings have snap points like columns do:
+    /// the ends and middle of a beam's line, the corners and the middles of
+    /// the sides of both, a pad's center.
+    #[test]
+    fn beams_and_footings_snap() {
+        let mut state = AppState::new(cc_core::Document::new(crate::actions::new_project()));
+        let level = state.project().levels.first().map(|l| l.id).unwrap();
+        let mut make = |name: &str, args: serde_json::Value| {
+            ElementId(state.session.execute(name, args).unwrap()["id"].as_u64().unwrap())
+        };
+        let beam = make("beam_create", serde_json::json!({"level": level.0, "start": [0, 0], "end": [4, 0]}));
+        let pad = make("footing_create", serde_json::json!({"level": level.0, "position": [10, 10], "rotation": 30}));
+        let strip =
+            make("strip_footing_create", serde_json::json!({"level": level.0, "start": [0, 20], "end": [6, 20]}));
+        let (project, geom) = state.session.project_and_geometry();
+        let near = DVec2::new(0.004, 0.003);
+        let at = |p: DVec2| snap(project, geom, Some(level), p + near, None, &[], &[], SCALE, false);
+        let hits = |p: DVec2, kind: SnapKind| {
+            let s = at(p);
+            assert_eq!(s.kind, kind, "at {p}");
+            assert!(s.point.distance(p) < 1e-9, "{} vs {p}", s.point);
+        };
+
+        // The beam's location line, and the faces of its body.
+        hits(DVec2::new(4.0, 0.0), SnapKind::Endpoint);
+        hits(DVec2::new(2.0, 0.0), SnapKind::Midpoint);
+        let body = geom.beams[&beam].footprint();
+        assert!(body[0].distance(body[1]) > 0.05, "a beam with some width");
+        hits(body[0], SnapKind::Endpoint);
+        hits((body[0] + body[1]) * 0.5, SnapKind::Midpoint);
+        let on_face = body[0].lerp(body[1], 0.3);
+        assert_eq!(at(on_face).kind, SnapKind::Nearest);
+
+        // The pad: its center, its corners and the middles of its sides.
+        hits(DVec2::new(10.0, 10.0), SnapKind::Center);
+        let outline = geom.foundations[&pad].footprint.clone();
+        assert_eq!(outline.len(), 4);
+        hits(outline[2], SnapKind::Endpoint);
+        hits((outline[0] + outline[1]) * 0.5, SnapKind::Midpoint);
+
+        // The strip: the ends and middle of its line, and its corners.
+        hits(DVec2::new(6.0, 20.0), SnapKind::Endpoint);
+        hits(DVec2::new(3.0, 20.0), SnapKind::Midpoint);
+        hits(geom.foundations[&strip].footprint[0], SnapKind::Endpoint);
+
+        // On another level they are not there.
+        let s = snap(project, geom, None, DVec2::new(2.0, 0.0) + near, None, &[], &[], SCALE, false);
+        assert_eq!(s.kind, SnapKind::Free);
+    }
+
+    /// The snap settings turn each kind off; the tool's own points stay.
+    #[test]
+    fn snap_settings_choose_the_kinds() {
+        use crate::snaps::{SnapOption, SnapSettings};
+        let model = ModelSnaps {
+            ends: vec![DVec2::ZERO, DVec2::new(4.0, 0.0)],
+            mids: vec![DVec2::new(2.0, 0.0)],
+            centers: vec![DVec2::new(8.0, 8.0)],
+            lines: vec![(DVec2::ZERO, DVec2::new(4.0, 0.0)), (DVec2::new(1.0, -1.0), DVec2::new(1.0, 1.0))],
+            arcs: Vec::new(),
+        };
+        let cad = cc_core::cad::CadSnap::default();
+        let kind = |on: &SnapSettings, p: DVec2, extra: &[DVec2]| {
+            snap_with(&model, p + DVec2::new(0.003, 0.004), None, extra, &[], SCALE, false, &cad, on).kind
+        };
+        let all = SnapSettings::default();
+        let without = |o: SnapOption| {
+            let mut s = all;
+            *s.get_mut(o) = false;
+            s.effective()
+        };
+        let cases = [
+            (DVec2::new(4.0, 0.0), SnapOption::Endpoint, SnapKind::Endpoint),
+            (DVec2::new(2.0, 0.0), SnapOption::Midpoint, SnapKind::Midpoint),
+            (DVec2::new(8.0, 8.0), SnapOption::Center, SnapKind::Center),
+            (DVec2::new(1.0, 0.0), SnapOption::Intersection, SnapKind::Intersection),
+            (DVec2::new(3.0, 0.0), SnapOption::Nearest, SnapKind::Nearest),
+        ];
+        for (p, option, expected) in cases {
+            assert_eq!(kind(&all, p, &[]), expected, "{option:?} on");
+            assert_ne!(kind(&without(option), p, &[]), expected, "{option:?} off");
+            assert_eq!(kind(&without(SnapOption::Enabled), p, &[]), SnapKind::Free, "all off at {p}");
+        }
+        // Guides from an acquired point.
+        let guided = |on: &SnapSettings| {
+            snap_with(&model, DVec2::new(20.0, 30.004), None, &[], &[DVec2::new(15.0, 30.0)], SCALE, false, &cad, on)
+                .kind
+        };
+        assert_eq!(guided(&all), SnapKind::Alignment);
+        assert_eq!(guided(&without(SnapOption::Alignment)), SnapKind::Free);
+        // The points a tool passes itself (the start of a chain) always snap.
+        let own = [DVec2::new(30.0, 30.0)];
+        assert_eq!(kind(&without(SnapOption::Enabled), own[0], &own), SnapKind::Endpoint);
+    }
+
+    /// With *every element* on, the tools snap to what the view draws.
+    #[test]
+    fn the_view_s_elements_are_snapped_to() {
+        let mut state = AppState::new(cc_core::Document::new(crate::actions::new_project()));
+        let level = state.project().levels.first().map(|l| l.id).unwrap();
+        let plan = state.project().views.values().find(|v| v.level() == Some(level)).map(|v| v.id).unwrap();
+        state.active_view = Some(plan);
+        let pile = state.session.execute("pile_create", serde_json::json!({"level": level.0, "position": [3, 3]}));
+        let pile = ElementId(pile.unwrap()["id"].as_u64().unwrap());
+        let drawing = state.drawing(plan).unwrap();
+        // Any line the plan draws for the pile, away from its center.
+        let (a, b) = drawing
+            .prims
+            .iter()
+            .find_map(|p| match p {
+                cc_views::Prim::Line { a, b, element: Some(e), style, .. }
+                    if *e == pile && *style != cc_views::LineStyle::Annotation && a.distance(*b) > 0.01 =>
+                {
+                    Some((*a, *b))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let p = a.lerp(b, 0.3);
+        let s = snap_at(&mut state, Some(level), p, None, &[], 2000.0, false);
+        assert!(!s.is_free(), "{:?} on the pile's line {a} {b}", s.kind);
+        state.prefs.snaps.elements = false;
+        state.interaction.tracked.clear();
+        let s = snap_at(&mut state, Some(level), p, None, &[], 2000.0, false);
+        assert!(s.is_free(), "{:?} without the view's elements", s.kind);
+    }
+
+    /// Issue #304: the Niche tool makes the project's first niche type and
+    /// places niches in the face of the wall clicked.
+    #[test]
+    fn the_niche_tool_places_niches_in_the_face_clicked() {
+        let mut state = AppState::new(cc_core::Document::new(crate::home::sample_project("casa_simples").unwrap()));
+        state.session.geometry();
+        assert!(state.project().default_type(Category::Niche).is_none());
+        crate::actions::activate_category_tool(&mut state, Category::Niche);
+        let niche = state.project().default_type(Category::Niche).expect("a niche type was made");
+        let tool = state.tool.clone();
+        assert!(matches!(tool, Tool::Hosted { category: Category::Niche, type_id } if type_id == niche));
+        assert_eq!(tool.key(), "tool-niche");
+        // The longest wall with no door or window (a niche over one cuts nothing).
+        let walls = state.session.geom().walls.iter().filter(|(_, g)| g.openings.is_empty() && g.curtain.is_none());
+        let (wall, g) = walls.max_by(|a, b| a.1.length.total_cmp(&b.1.length)).unwrap();
+        let (wall, g) = (*wall, g.clone());
+        assert!(g.length > 2.0, "room for two niches");
+        for (u, side) in [(0.3, 1.0), (0.7, -1.0)] {
+            let before = state.project().elements.len();
+            place_opening_3d(&mut state, &tool, wall, g.world(g.length * u, side * g.half));
+            assert_eq!(state.project().elements.len(), before + 1);
+            let new = state.selection.iter().next().copied().unwrap();
+            let e = state.project().element(new).unwrap();
+            assert!(matches!(&e.kind, ElementKind::Niche(h) if h.host == wall && h.flip_facing == (side < 0.0)));
+        }
+        // The wall is recessed, not opened, by them.
+        let after = &state.session.geometry().walls[&wall];
+        assert!(after.openings.is_empty());
+        assert_eq!(after.recesses.len(), 2);
     }
 
     /// A window tool clicked on a wall in a 3D view places the window there.

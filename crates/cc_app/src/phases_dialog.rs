@@ -299,6 +299,7 @@ fn filters_tab(ui: &mut Ui, state: &mut AppState, drafts: &mut BTreeMap<Draft, S
 fn graphics_tab(ui: &mut Ui, state: &mut AppState) {
     ui.label(RichText::new(t!("ph-graphics-hint")).size(11.0).color(PALETTE.text_faint));
     let graphics = state.project().phase_graphics;
+    let choices = crate::fill_patterns_dialog::choices(state.project());
     egui::Grid::new("phase-graphics").num_columns(8).striped(true).spacing([8.0, 4.0]).show(ui, |ui| {
         header(ui, t!("ph-status"));
         override_headers(ui);
@@ -307,7 +308,7 @@ fn graphics_tab(ui: &mut Ui, state: &mut AppState) {
         for st in PhaseStatus::ALL {
             let mut g = *graphics.get(st);
             ui.label(tr(st.key()));
-            let mut changed = override_cells(ui, &mut g, true);
+            let mut changed = override_cells(ui, &mut g, true, &choices);
             if ui.add_enabled(!g.is_empty(), egui::Button::new(t!("vg-reset")).small()).clicked() {
                 g = cc_core::GraphicOverride::default();
                 changed = true;

@@ -28,7 +28,22 @@ pub struct ComponentFile {
     pub types: Vec<ComponentFileType>,
     #[serde(default)]
     pub materials: Vec<Material>,
+    /// The detail components a detail component nests (directly or deeper),
+    /// so the file stands alone; loading adds those the project lacks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested: Vec<NestedComponent>,
 }
+
+/// A detail component another one in the file nests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NestedComponent {
+    pub component: String,
+    /// The definition, with its first type's parameter values.
+    pub def: ComponentDef,
+}
+
+/// Most nested components a file carries.
+const MAX_NESTED: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComponentFileType {
@@ -73,7 +88,7 @@ pub fn extract(project: &Project, component: &str) -> Result<ComponentFile, Comp
         .collect();
     Ok(ComponentFile {
         format_version: COMPONENT_FORMAT_VERSION,
-        generator: format!("ConstructCAD {}", env!("CARGO_PKG_VERSION")),
+        generator: format!("ConstructCraft {}", env!("CARGO_PKG_VERSION")),
         component: component.to_string(),
         def: (*first).clone(),
         types: types
@@ -85,7 +100,29 @@ pub fn extract(project: &Project, component: &str) -> Result<ComponentFile, Comp
             })
             .collect(),
         materials: project.materials.iter().filter(|m| used.contains(&m.name.as_str())).cloned().collect(),
+        nested: nested_of(project, component, first),
     })
+}
+
+/// The detail components `def` (of `component`) nests, directly or deeper,
+/// each once, bounded by [`MAX_NESTED`] and the nesting depth.
+fn nested_of(project: &Project, component: &str, def: &ComponentDef) -> Vec<NestedComponent> {
+    let mut out: Vec<NestedComponent> = Vec::new();
+    let mut pending: Vec<(String, usize)> =
+        crate::detail_component::nested_names(def).map(|n| (n.to_string(), 1)).collect();
+    while let Some((name, depth)) = pending.pop() {
+        if name == component
+            || depth > crate::detail_component::MAX_DEPTH
+            || out.len() >= MAX_NESTED
+            || out.iter().any(|n| n.component == name)
+        {
+            continue;
+        }
+        let Some(inner) = project.detail_def(&name) else { continue };
+        pending.extend(crate::detail_component::nested_names(inner).map(|n| (n.to_string(), depth + 1)));
+        out.push(NestedComponent { component: name, def: inner.clone() });
+    }
+    out
 }
 
 pub fn to_ron(file: &ComponentFile) -> Result<String, ComponentFileError> {
@@ -112,8 +149,32 @@ fn validate(file: &ComponentFile) -> Result<(), ComponentFileError> {
     if def.params.len() > MAX_PARAMS || def.items.len() > MAX_ITEMS || file.types.len() > MAX_TYPES {
         return bad("too many parameters, pieces or types");
     }
-    if def.items.is_empty() || file.types.is_empty() {
+    // A title block or a detail component holds only 2D pieces (a title
+    // block possibly none), within their limits.
+    let two_d = def.kind.is_2d();
+    let empty = if def.kind == crate::ComponentKind::Detail { def.sheet.is_empty() } else { def.items.is_empty() };
+    if (empty && def.kind != crate::ComponentKind::TitleBlock) || file.types.is_empty() {
         return bad("no pieces or no types");
+    }
+    if two_d && crate::title_block::repair_def(&mut def.clone()) > 0 {
+        return bad("invalid or too many 2D pieces");
+    }
+    if !two_d && !def.sheet.is_empty() {
+        return bad("2D pieces in a component that is not a title block or a detail component");
+    }
+    if file.nested.len() > MAX_NESTED {
+        return bad("too many nested components");
+    }
+    for n in &file.nested {
+        let mut copy = n.def.clone();
+        if n.component.trim().is_empty()
+            || n.def.kind != crate::ComponentKind::Detail
+            || n.def.params.len() > MAX_PARAMS
+            || crate::title_block::repair_def(&mut copy) > 0
+            || n.def.params.iter().any(|p| !p.value.is_finite() || !expr::is_valid_name(&p.name))
+        {
+            return bad(&format!("invalid nested component '{}'", n.component));
+        }
     }
     for (i, p) in def.params.iter().enumerate() {
         if !expr::is_valid_name(&p.name) || def.params[..i].iter().any(|q| q.name == p.name) {
@@ -138,6 +199,22 @@ fn validate(file: &ComponentFile) -> Result<(), ComponentFileError> {
             return bad("invalid type");
         }
     }
+    if def.ref_planes.len() + def.ref_lines.len() + def.dimensions.len() + def.equals.len()
+        > crate::component_ref::MAX_REFS
+    {
+        return bad("too many reference planes, lines and dimensions");
+    }
+    let names = def.ref_planes.iter().map(|p| &p.name).chain(def.ref_lines.iter().map(|l| &l.name));
+    let mut seen: Vec<&str> = def.params.iter().map(|p| p.name.as_str()).collect();
+    for name in names {
+        if !expr::is_valid_name(name)
+            || crate::component_ref::is_reserved_for(def.kind, name)
+            || seen.contains(&name.as_str())
+        {
+            return bad(&format!("invalid or repeated reference name '{name}'"));
+        }
+        seen.push(name);
+    }
     Ok(())
 }
 
@@ -149,8 +226,11 @@ pub fn save(file: &ComponentFile, path: &Path) -> Result<(), ComponentFileError>
     Ok(())
 }
 
+/// Largest `.ccomp` file read: imported meshes make the largest ones.
+pub const MAX_COMPONENT_BYTES: u64 = 512 << 20;
+
 pub fn load(path: &Path) -> Result<ComponentFile, ComponentFileError> {
-    from_ron(&std::fs::read_to_string(path)?)
+    from_ron(&crate::read_to_string_limited(path, MAX_COMPONENT_BYTES)?)
 }
 
 /// Most component files a library scan reads.
@@ -240,6 +320,24 @@ pub fn types_for(
             uid: Default::default(),
         });
     }
+    // Nested detail components the project lacks (by name), one type each;
+    // those it has are used as they are.
+    let mut added: Vec<&str> = Vec::new();
+    for n in &file.nested {
+        if components.contains(&n.component.as_str()) || added.contains(&n.component.as_str()) {
+            continue;
+        }
+        added.push(&n.component);
+        let name = unique(&n.component, &|x| names.iter().any(|y| y == x));
+        names.push(name.clone());
+        types.push(ElementType {
+            id: ElementTypeId(alloc()),
+            name,
+            data: TypeData::Component { component: n.component.clone(), def: n.def.clone() },
+            info: TypeInfo::default(),
+            uid: Default::default(),
+        });
+    }
     let materials =
         file.materials.iter().filter(|m| !project.materials.iter().any(|x| x.name == m.name)).cloned().collect();
     (types, materials)
@@ -318,5 +416,25 @@ mod tests {
         big.def.items = vec![big.def.items[0].clone(); MAX_ITEMS + 1];
         assert!(matches!(from_ron(&to_ron(&big).unwrap()), Err(ComponentFileError::Invalid(_))));
         assert!(from_ron("not ron").is_err());
+    }
+
+    #[test]
+    fn title_blocks_hold_only_sheet_pieces() {
+        let p = Project::from_template();
+        let tb = p.title_blocks()[0];
+        let name = p.types[&tb].name.clone();
+        let file = extract(&p, &name).unwrap();
+        // No 3D pieces, and an empty title block, are fine.
+        assert!(from_ron(&to_ron(&file).unwrap()).is_ok());
+        let mut empty = file.clone();
+        empty.def.sheet.clear();
+        assert!(from_ron(&to_ron(&empty).unwrap()).is_ok());
+        // Sheet pieces in another kind, or too many of them, are not.
+        let mut table = extract(&p, &table_component(&p)).unwrap();
+        table.def.sheet = file.def.sheet.clone();
+        assert!(matches!(from_ron(&to_ron(&table).unwrap()), Err(ComponentFileError::Invalid(_))));
+        let mut big = file.clone();
+        big.def.sheet = vec![file.def.sheet[0].clone(); crate::title_block::MAX_SHEET_PIECES + 1];
+        assert!(matches!(from_ron(&to_ron(&big).unwrap()), Err(ComponentFileError::Invalid(_))));
     }
 }

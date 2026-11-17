@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     doc.edit("Casa simples", |e| -> Result<(), String> {
         e.info_mut().name = "Casa simples".into();
         e.info_mut().client = "Exemplo".into();
-        e.info_mut().author = "ConstructCAD".into();
+        e.info_mut().author = "ConstructCraft".into();
         let p = e.project().clone();
         let (level, upper) = match p.levels.as_slice() {
             [ground, first, ..] => (ground.id, first.id),
@@ -36,6 +36,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 uid: Default::default(),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             })
         };
 
@@ -135,6 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 overrides: Default::default(),
                 properties: Vec::new(),
                 system: None,
+                ..Default::default()
             };
             add(e, type_id, "", ElementKind::Component(c));
         };
@@ -192,7 +195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             section,
             "Corte 1",
             50,
-            ViewKind::Section { start: DVec2::new(3.0, -1.5), end: DVec2::new(3.0, 7.5), depth: 10.0 },
+            ViewKind::Section { start: DVec2::new(3.0, -1.5), end: DVec2::new(3.0, 7.5), depth: 10.0, segments: None },
         ));
         // Put the south elevation and section on a second sheet.
         let south =
@@ -205,6 +208,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ViewKind::Sheet {
                 number: "A102".into(),
                 size: cc_core::SheetSize::A3,
+                portrait: false,
+                title_block: p.title_blocks().first().copied(),
+                fields: Default::default(),
+                issue_date: String::new(),
                 viewports: vec![
                     Viewport { view: south, center: DVec2::new(130.0, 170.0) },
                     Viewport { view: section, center: DVec2::new(310.0, 170.0) },

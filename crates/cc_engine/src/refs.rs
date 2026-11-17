@@ -22,6 +22,33 @@ impl Default for Ref {
     }
 }
 
+/// A drawing scale: the denominator `N` of 1:`N` (`48`), or text read by
+/// `cc_core::scale::parse` (`"1:48"`, `"1/4\" = 1'-0\""`).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ScaleArg {
+    Ratio(u32),
+    Text(String),
+}
+
+impl From<u32> for ScaleArg {
+    fn from(n: u32) -> Self {
+        ScaleArg::Ratio(n)
+    }
+}
+
+impl ScaleArg {
+    /// The denominator, at least 1; an unreadable text is invalid.
+    pub fn ratio(&self) -> Result<u32> {
+        match self {
+            ScaleArg::Ratio(n) => Ok((*n).max(1)),
+            ScaleArg::Text(t) => cc_core::scale::parse(t).ok_or_else(|| {
+                EngineError::invalid(format!("unreadable scale \"{t}\": write 1:50, 50 or a label like 1/4\" = 1'-0\""))
+            }),
+        }
+    }
+}
+
 /// A point in plan, `[x, y]` in meters.
 pub type Point = [f64; 2];
 
@@ -63,6 +90,21 @@ pub fn level(p: &Project, r: &Ref) -> Result<LevelId> {
             p.level(LevelId(*id)).map(|l| l.id).ok_or_else(|| EngineError::not_found(format!("no level with id {id}")))
         }
         Ref::Name(n) => unique("level", n, p.levels.iter().filter(|l| matches(&l.name, n)).map(|l| l.id).collect()),
+    }
+}
+
+/// A project browser organization scheme.
+pub fn browser_scheme(p: &Project, r: &Ref) -> Result<cc_core::BrowserSchemeId> {
+    let schemes = &p.browser.schemes;
+    match r {
+        Ref::Id(id) => schemes
+            .iter()
+            .find(|s| s.id.0 == *id)
+            .map(|s| s.id)
+            .ok_or_else(|| EngineError::not_found(format!("no browser scheme with id {id}"))),
+        Ref::Name(n) => {
+            unique("browser scheme", n, schemes.iter().filter(|s| matches(&s.name, n)).map(|s| s.id).collect())
+        }
     }
 }
 
@@ -178,10 +220,20 @@ pub fn elements(p: &Project, ids: &[u64]) -> Result<Vec<ElementId>> {
     ids.iter().map(|id| element(p, *id)).collect()
 }
 
-/// A category by its English name (`wall`, `door`…), case-insensitive.
+/// A category by its English name (`wall`, `door`…, `titleblock`), case-insensitive.
 pub fn category(name: &str) -> Result<Category> {
-    Category::ALL
-        .into_iter()
+    find_category(&Category::NAMED, name)
+}
+
+/// A category that views draw and filter (not title blocks), by name.
+pub fn view_category(name: &str) -> Result<Category> {
+    find_category(&Category::ALL, name)
+}
+
+fn find_category(among: &[Category], name: &str) -> Result<Category> {
+    among
+        .iter()
+        .copied()
         .find(|c| format!("{c:?}").eq_ignore_ascii_case(name.trim()))
         .ok_or_else(|| EngineError::invalid(format!("unknown category '{name}'")))
 }
@@ -227,6 +279,91 @@ pub fn phase(p: &Project, r: &Ref) -> Result<cc_core::PhaseId> {
     }
 }
 
+/// A design option set by id or name.
+pub fn option_set(p: &Project, r: &Ref) -> Result<cc_core::OptionSetId> {
+    match r {
+        Ref::Id(id) => {
+            let id = cc_core::OptionSetId(*id);
+            p.option_set(id)
+                .map(|_| id)
+                .ok_or_else(|| EngineError::not_found(format!("no design option set with id {}", id.0)))
+        }
+        Ref::Name(n) => {
+            unique("design option set", n, p.option_sets.iter().filter(|s| matches(&s.name, n)).map(|s| s.id).collect())
+        }
+    }
+}
+
+/// A design option by id, by name (unique in the project), or as
+/// `"Set: Option"`.
+pub fn design_option(p: &Project, r: &Ref) -> Result<cc_core::OptionId> {
+    match r {
+        Ref::Id(id) => {
+            let id = cc_core::OptionId(*id);
+            p.design_option(id)
+                .map(|_| id)
+                .ok_or_else(|| EngineError::not_found(format!("no design option with id {}", id.0)))
+        }
+        Ref::Name(n) => {
+            let all = || p.option_sets.iter().flat_map(|s| s.options.iter().map(move |o| (s, o)));
+            let found: Vec<cc_core::OptionId> = match n.split_once(':') {
+                Some((set, option)) => all()
+                    .filter(|(s, o)| matches(&s.name, set) && matches(&o.name, option))
+                    .map(|(_, o)| o.id)
+                    .collect(),
+                None => Vec::new(),
+            };
+            if !found.is_empty() {
+                return unique("design option", n, found);
+            }
+            unique("design option", n, all().filter(|(_, o)| matches(&o.name, n)).map(|(_, o)| o.id).collect())
+        }
+    }
+}
+
+/// One of the project's line styles by id or name.
+pub fn line_style(p: &Project, r: &Ref) -> Result<cc_core::LineStyleId> {
+    match r {
+        Ref::Id(id) => {
+            let id = cc_core::LineStyleId(*id);
+            p.line_style(id)
+                .map(|_| id)
+                .ok_or_else(|| EngineError::not_found(format!("no line style with id {}", id.0)))
+        }
+        Ref::Name(n) => {
+            unique("line style", n, p.line_styles.values().filter(|s| matches(&s.name, n)).map(|s| s.id).collect())
+        }
+    }
+}
+
+/// A custom fill pattern by id or name.
+pub fn fill_pattern(p: &Project, r: &Ref) -> Result<cc_core::FillPatternId> {
+    match r {
+        Ref::Id(id) => {
+            let id = cc_core::FillPatternId(*id);
+            p.fill_pattern(id)
+                .map(|_| id)
+                .ok_or_else(|| EngineError::not_found(format!("no fill pattern with id {}", id.0)))
+        }
+        Ref::Name(n) => {
+            unique("fill pattern", n, p.fill_patterns.values().filter(|s| matches(&s.name, n)).map(|s| s.id).collect())
+        }
+    }
+}
+
+/// A structural profile by id or name.
+pub fn profile(p: &Project, r: &Ref) -> Result<cc_core::ProfileId> {
+    match r {
+        Ref::Id(id) => {
+            let id = cc_core::ProfileId(*id);
+            p.profile(id).map(|_| id).ok_or_else(|| EngineError::not_found(format!("no profile with id {}", id.0)))
+        }
+        Ref::Name(n) => {
+            unique("profile", n, p.profiles.values().filter(|s| matches(&s.name, n)).map(|s| s.id).collect())
+        }
+    }
+}
+
 /// A phase filter by id or name.
 pub fn phase_filter(p: &Project, r: &Ref) -> Result<cc_core::PhaseFilterId> {
     match r {
@@ -250,4 +387,29 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(d).map(Some)
+}
+
+/// A detail level by name: `coarse`, `medium` or `fine`.
+pub fn detail_level(name: &str) -> Result<cc_core::DetailLevel> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "coarse" => Ok(cc_core::DetailLevel::Coarse),
+        "medium" => Ok(cc_core::DetailLevel::Medium),
+        "fine" => Ok(cc_core::DetailLevel::Fine),
+        other => Err(EngineError::invalid(format!("unknown detail level '{other}': use coarse, medium or fine"))),
+    }
+}
+
+/// A visual style by name (`wireframe`, `hidden_line`, `shaded`,
+/// `consistent_colors`, `textures`), or `default` for the usual style of
+/// the view's kind (`None`).
+pub fn visual_style(name: &str) -> Result<Option<cc_core::VisualStyle>> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+        return Ok(None);
+    }
+    cc_core::VisualStyle::from_name(trimmed).map(Some).ok_or_else(|| {
+        EngineError::invalid(format!(
+            "unknown visual style '{trimmed}': use wireframe, hidden_line, shaded, consistent_colors, textures or default"
+        ))
+    })
 }

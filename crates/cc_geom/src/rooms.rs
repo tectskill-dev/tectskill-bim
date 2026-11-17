@@ -136,36 +136,65 @@ pub fn room_boundary(walls: &[Vec<DVec2>], point: DVec2) -> Option<Vec<DVec2>> {
     if walls.iter().any(|w| polygon::contains(w, point)) {
         return None;
     }
-    let (points, edges) = arrangement(walls);
-    let mut neighbors: BTreeMap<Key, Vec<Key>> = BTreeMap::new();
-    for &(a, b) in &edges {
-        neighbors.entry(a).or_default().push(b);
-        neighbors.entry(b).or_default().push(a);
-    }
-    // Edges hit by a ray from the point towards +X (nudged off vertex heights), nearest first.
-    let y = point.y + 1.234_567e-7;
-    let mut hits: Vec<(f64, (Key, Key))> = edges
-        .iter()
-        .filter_map(|&(ka, kb)| {
-            let (a, b) = (points[&ka], points[&kb]);
-            if (a.y > y) == (b.y > y) {
-                return None;
-            }
-            let x = a.x + (y - a.y) / (b.y - a.y) * (b.x - a.x);
-            (x > point.x).then_some((x - point.x, (ka, kb)))
-        })
-        .collect();
-    hits.sort_by(|x, y| x.0.total_cmp(&y.0));
-    for (_, (ka, kb)) in hits {
-        let (a, b) = (points[&ka], points[&kb]);
-        // Orient the edge so the point lies on its left.
-        let start = if (b - a).perp_dot(point - a) > 0.0 { (ka, kb) } else { (kb, ka) };
-        let Some(face) = trace_face(&points, &neighbors, start) else { continue };
-        if polygon::signed_area(&face) > 0.0 && polygon::contains(&face, point) {
-            return Some(simplify(face));
+    RoomArrangement::new(walls.to_vec()).boundary(point)
+}
+
+/// The arrangement of a set of wall footprints, made once to find the
+/// boundaries of many rooms among the same walls (see [`room_boundary`]).
+pub struct RoomArrangement {
+    walls: Vec<Vec<DVec2>>,
+    points: BTreeMap<Key, DVec2>,
+    edges: BTreeSet<(Key, Key)>,
+    neighbors: BTreeMap<Key, Vec<Key>>,
+}
+
+impl RoomArrangement {
+    pub fn new(walls: Vec<Vec<DVec2>>) -> Self {
+        let (points, edges) = arrangement(&walls);
+        let mut neighbors: BTreeMap<Key, Vec<Key>> = BTreeMap::new();
+        for &(a, b) in &edges {
+            neighbors.entry(a).or_default().push(b);
+            neighbors.entry(b).or_default().push(a);
         }
+        Self { walls, points, edges, neighbors }
     }
-    None
+
+    /// [`room_boundary`] among these walls.
+    pub fn room_boundary(&self, point: DVec2) -> Option<Vec<DVec2>> {
+        if self.walls.iter().any(|w| polygon::contains(w, point)) {
+            return None;
+        }
+        self.boundary(point)
+    }
+
+    /// The boundary of the face around `point` (not inside a wall).
+    fn boundary(&self, point: DVec2) -> Option<Vec<DVec2>> {
+        let (points, edges, neighbors) = (&self.points, &self.edges, &self.neighbors);
+        // Edges hit by a ray from the point towards +X (nudged off vertex heights), nearest first.
+        let y = point.y + 1.234_567e-7;
+        let mut hits: Vec<(f64, (Key, Key))> = edges
+            .iter()
+            .filter_map(|&(ka, kb)| {
+                let (a, b) = (points[&ka], points[&kb]);
+                if (a.y > y) == (b.y > y) {
+                    return None;
+                }
+                let x = a.x + (y - a.y) / (b.y - a.y) * (b.x - a.x);
+                (x > point.x).then_some((x - point.x, (ka, kb)))
+            })
+            .collect();
+        hits.sort_by(|x, y| x.0.total_cmp(&y.0));
+        for (_, (ka, kb)) in hits {
+            let (a, b) = (points[&ka], points[&kb]);
+            // Orient the edge so the point lies on its left.
+            let start = if (b - a).perp_dot(point - a) > 0.0 { (ka, kb) } else { (kb, ka) };
+            let Some(face) = trace_face(points, neighbors, start) else { continue };
+            if polygon::signed_area(&face) > 0.0 && polygon::contains(&face, point) {
+                return Some(simplify(face));
+            }
+        }
+        None
+    }
 }
 
 /// Most edges an outline is traced from (the arrangement grows with the
@@ -326,5 +355,28 @@ mod tests {
         w.push(rect(2.5, 1.0, 2.7, 2.0));
         let b = room_boundary(&w, DVec2::new(1.0, 1.5)).unwrap();
         assert!((polygon::area(&b) - 4.0 * 3.0).abs() < 1e-9);
+    }
+
+    /// One arrangement finds every room of a grid of rooms, as tracing each
+    /// on its own does.
+    #[test]
+    fn one_arrangement_bounds_many_rooms() {
+        let n = 8;
+        let mut w = Vec::new();
+        for i in 0..=n {
+            let x = i as f64 * 3.0;
+            w.push(rect(x - 0.1, -0.1, x + 0.1, n as f64 * 3.0 + 0.1));
+            w.push(rect(-0.1, x - 0.1, n as f64 * 3.0 + 0.1, x + 0.1));
+        }
+        let arrangement = RoomArrangement::new(w.clone());
+        for i in 0..n {
+            for j in 0..n {
+                let p = DVec2::new(i as f64 * 3.0 + 1.5, j as f64 * 3.0 + 1.5);
+                let b = arrangement.room_boundary(p).unwrap();
+                assert!((polygon::area(&b) - 2.8 * 2.8).abs() < 1e-9, "{b:?}");
+                assert_eq!(Some(b), room_boundary(&w, p));
+            }
+        }
+        assert_eq!(arrangement.room_boundary(DVec2::new(3.0, 1.5)), None, "inside a wall");
     }
 }

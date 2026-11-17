@@ -1,6 +1,6 @@
 use crate::beam::{BeamGeom, BeamInput, ColumnInput, resolve_beams};
 use crate::polygon;
-use crate::wall::{Opening, WallGeom, WallLine, resolve_join};
+use crate::wall::{LayerGap, Opening, WallGeom, WallLine, core_through, embedded_in, resolve_join};
 use crate::{Ray, Solid};
 use cc_core::{Category, ElementId, ElementKind, Project, RoofShape, TypeData};
 use glam::{DVec2, DVec3};
@@ -35,6 +35,22 @@ pub fn opening_parts(
     height: f64,
     half: f64,
 ) -> Vec<cc_core::component::ComponentPart> {
+    opening_parts_with(project, element, width, height, half, &mut OpeningMemo::default())
+}
+
+/// Door and window components resolved once per type and wall thickness by
+/// one build (scripted ones are each element's own).
+type OpeningMemo = std::collections::HashMap<(cc_core::ElementTypeId, u64), Vec<cc_core::component::ComponentPart>>;
+
+/// [`opening_parts`], resolving components through `memo`.
+fn opening_parts_with(
+    project: &Project,
+    element: &cc_core::Element,
+    width: f64,
+    height: f64,
+    half: f64,
+    memo: &mut OpeningMemo,
+) -> Vec<cc_core::component::ComponentPart> {
     let Some(ty) = project.element_type(element.type_id) else { return Vec::new() };
     let TypeData::Component { def, .. } = &ty.data else {
         return hosted_parts(&ty.data, width, height, half)
@@ -53,12 +69,21 @@ pub fn opening_parts(
                 in_plan: false,
                 void: false,
                 plan_only: false,
+                detail: Default::default(),
                 faces: Vec::new(),
             })
             .collect();
     };
     let thickness = [(cc_core::component::WALL_THICKNESS, 2.0 * half)];
-    let parts = crate::resolve_component_in(def, &Default::default(), &thickness);
+    // The pieces depend on the type and the thickness only, unless a script
+    // makes them (a failing one keeps each element's last pieces).
+    let parts = if def.has_script() {
+        crate::resolve_instance(ty, def, element, None, &thickness)
+    } else {
+        memo.entry((element.type_id, half.to_bits()))
+            .or_insert_with(|| crate::resolve_instance(ty, def, element, None, &thickness))
+            .clone()
+    };
     let (fx, fy) = match element.as_hosted() {
         Some(h) => (if h.flip_hand { -1.0 } else { 1.0 }, if h.flip_facing { -1.0 } else { 1.0 }),
         None => (1.0, 1.0),
@@ -118,6 +143,18 @@ pub fn hosted_parts(data: &TypeData, width: f64, height: f64, half: f64) -> Vec<
     }
 }
 
+/// A window's elevation symbol on one face of its wall (see
+/// [`cc_core::WindowOperation::elevation_lines`]): the opening's outline
+/// just off the face, facing out along `normal`, and the symbol's lines on
+/// it, drawn by elevations and sections where nothing stands in front.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpeningSymbol {
+    pub element: ElementId,
+    pub outline: [DVec3; 4],
+    pub normal: DVec3,
+    pub lines: Vec<(DVec3, DVec3, cc_core::SymbolLine)>,
+}
+
 /// All derived geometry of a project.
 #[derive(Debug, Clone, Default)]
 pub struct ModelGeometry {
@@ -127,9 +164,13 @@ pub struct ModelGeometry {
     pub beams: BTreeMap<ElementId, BeamGeom>,
     /// Reinforcement sets: their bars, placed in their hosts.
     pub rebar: BTreeMap<ElementId, crate::rebar::RebarGeom>,
-    /// Pipes and conduits: their center lines and diameters.
+    /// Connections: their plates and bolts, from their members' geometry.
+    pub connections: BTreeMap<ElementId, crate::connection::ConnectionGeom>,
+    /// Pipes, conduits and cable trays: their center lines and sections.
     pub segments: BTreeMap<ElementId, crate::mep::SegmentGeom>,
-    /// Where pipes and conduits meet: nodes, fittings and attached fixtures and devices.
+    /// Valves placed on their pipes.
+    pub valves: BTreeMap<ElementId, crate::mep::ValveGeom>,
+    /// Where pipes, conduits and cable trays meet: nodes, fittings, valves and attached fixtures and devices.
     pub mep: crate::mep_net::MepNetwork,
     /// Foundations: plan outline and elevations (strips meet at corners like beams).
     pub foundations: BTreeMap<ElementId, FoundationGeom>,
@@ -144,21 +185,98 @@ pub struct ModelGeometry {
     pub components: BTreeMap<ElementId, Vec<cc_core::component::ComponentPart>>,
     /// Pieces of each door and window in the world (see [`opening_parts`]).
     pub opening_fills: BTreeMap<ElementId, Vec<cc_core::component::ComponentPart>>,
+    /// The elevation symbols of windows that open, on both faces of their walls.
+    pub opening_symbols: Vec<OpeningSymbol>,
+    /// Conceptual masses: body, volume and mass floors.
+    pub masses: BTreeMap<ElementId, crate::mass::MassGeom>,
+    /// Roofs: their framing members and covering figures.
+    pub roof_framing: BTreeMap<ElementId, crate::roof_framing::RoofFramingGeom>,
+    /// Terrain surfaces: triangles, elevations, area and volume.
+    pub topographies: BTreeMap<ElementId, crate::topography::TopoGeom>,
+    /// Building pads graded into their terrains (see [`crate::pad`]).
+    pub pads: BTreeMap<ElementId, crate::pad::PadGeom>,
+    /// Exact volumes of floors sketched with arcs, circles or ellipses, whose
+    /// solids mesh the curves with chords (see [`Self::volume`]).
+    pub curved_volumes: BTreeMap<ElementId, f64>,
+    /// Piles: axis, section and elevations (see [`crate::pile`]).
+    pub piles: BTreeMap<ElementId, crate::pile::PileGeom>,
+    /// Where each element's solids are in `solids`, made at the end of a
+    /// build (see [`SolidIndex`]).
+    pub solid_index: SolidIndex,
+}
+
+/// The positions of each element's solids in [`ModelGeometry::solids`], in
+/// order, so that finding an element's solids does not scan them all. It is
+/// used only while `solids` has the length it was made for; geometry put
+/// together by hand (or changed after the build) is scanned instead.
+#[derive(Debug, Clone, Default)]
+pub struct SolidIndex {
+    of: std::collections::HashMap<ElementId, Vec<usize>>,
+    len: usize,
+}
+
+impl SolidIndex {
+    fn new(solids: &[Solid]) -> Self {
+        let mut of: std::collections::HashMap<ElementId, Vec<usize>> = std::collections::HashMap::new();
+        for (i, s) in solids.iter().enumerate() {
+            of.entry(s.element).or_default().push(i);
+        }
+        Self { of, len: solids.len() }
+    }
+
+    /// The positions of `id`'s solids, or `None` when the index does not fit `solids`.
+    fn get(&self, solids: &[Solid], id: ElementId) -> Option<&[usize]> {
+        if self.len != solids.len() {
+            return None;
+        }
+        Some(self.of.get(&id).map_or(&[], Vec::as_slice))
+    }
 }
 
 /// A foundation's body: a vertical prism.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FoundationGeom {
     pub element: ElementId,
-    /// Plan outline, counter-clockwise.
+    /// Plan outline, counter-clockwise (an arc strip's arcs as short chords).
     pub footprint: Vec<DVec2>,
     /// Bottom and top elevations.
     pub z_range: (f64, f64),
+    /// An arc strip footing's exact plan (`None` for straight strips, pads and slabs).
+    pub arc: Option<crate::StripArc>,
+    /// The plan area of a slab drawn with arcs or circles, which its
+    /// footprint follows with chords.
+    pub drawn_area: Option<f64>,
+    /// A strip's frame, section and ends after joins (`None` for pads and slabs).
+    pub strip: Option<BeamGeom>,
+    /// Holes through the footprint (a ring pile cap's), counter-clockwise.
+    pub holes: Vec<Vec<DVec2>>,
+    /// A pile cap's frame, plan and piles (`None` for other foundations).
+    pub cap: Option<crate::pile::CapGeom>,
 }
 
 impl FoundationGeom {
+    /// Plan area, exact for arc strips and slabs drawn with curves.
+    pub fn area(&self) -> f64 {
+        match (self.drawn_area, &self.arc) {
+            (Some(area), _) => area,
+            (None, Some(a)) => a.area(),
+            (None, None) => polygon::area(&self.footprint),
+        }
+    }
+
+    /// The body of a haunched strip (an inverted T): its section swept
+    /// along the strip, straight or arc. `None` for plain bodies, which are
+    /// their footprint extruded.
+    pub fn body(&self) -> Option<&BeamGeom> {
+        self.strip.as_ref().filter(|g| g.section.outer.len() != 4)
+    }
+
+    /// Volume, exact for arc strips, haunched strips and slabs drawn with curves.
     pub fn volume(&self) -> f64 {
-        polygon::area(&self.footprint) * (self.z_range.1 - self.z_range.0)
+        match self.body() {
+            Some(body) => body.volume(),
+            None => self.area() * (self.z_range.1 - self.z_range.0),
+        }
     }
 }
 
@@ -181,20 +299,23 @@ impl BoxPart {
     }
 }
 
-/// Plan outline of a column section's bounding shape (counter-clockwise):
-/// its box, or its circle for round sections.
-pub fn column_outline(section: cc_core::ColumnSection, position: DVec2, rotation_deg: f64) -> Vec<DVec2> {
+/// Plan outline of a column type's section (counter-clockwise), placed at
+/// `position` and turned by `rotation_deg`: the outer boundary of its
+/// profile. Empty for other types or a section that fails.
+pub fn column_outline(project: &Project, data: &TypeData, position: DVec2, rotation_deg: f64) -> Vec<DVec2> {
+    project
+        .type_section(data)
+        .map(|s| crate::section::column_body(&s.outline, position, rotation_deg).0)
+        .unwrap_or_default()
+}
+
+/// A `width` x `depth` rectangle (counter-clockwise) centered at `position`,
+/// turned by `rotation_deg`: the footprint of a pad footing.
+pub fn rect_outline(width: f64, depth: f64, position: DVec2, rotation_deg: f64) -> Vec<DVec2> {
     let u = DVec2::from_angle(rotation_deg.to_radians());
     let v = u.perp();
-    match section {
-        cc_core::ColumnSection::Rectangular { width, depth } | cc_core::ColumnSection::Profile { width, depth, .. } => {
-            let (w, d) = (width / 2.0, depth / 2.0);
-            [(-w, -d), (w, -d), (w, d), (-w, d)].iter().map(|&(a, b)| position + u * a + v * b).collect()
-        }
-        cc_core::ColumnSection::Round { diameter } | cc_core::ColumnSection::Pipe { diameter, .. } => (0..24)
-            .map(|i| position + DVec2::from_angle(i as f64 / 24.0 * std::f64::consts::TAU) * (diameter / 2.0))
-            .collect(),
-    }
+    let (w, d) = (width / 2.0, depth / 2.0);
+    [(-w, -d), (w, -d), (w, d), (-w, d)].iter().map(|&(a, b)| position + u * a + v * b).collect()
 }
 
 /// Solid pieces of a placed component in world coordinates (voids cut
@@ -207,10 +328,9 @@ pub fn component_parts(
     element: &cc_core::Element,
     component: &cc_core::Component,
 ) -> Vec<cc_core::component::ComponentPart> {
-    let Some(TypeData::Component { def, .. }) = project.element_type(element.type_id).map(|t| &t.data) else {
-        return Vec::new();
-    };
-    place_parts(project, element, component, crate::resolve_component(def, &component.overrides))
+    let Some(ty) = project.element_type(element.type_id) else { return Vec::new() };
+    let TypeData::Component { def, .. } = &ty.data else { return Vec::new() };
+    place_parts(project, element, component, crate::resolve_instance(ty, def, element, Some(component), &[]))
 }
 
 /// A component's connector in the world: where a run joins it (`point`, its
@@ -281,19 +401,38 @@ fn place_parts(
 }
 
 impl ModelGeometry {
+    /// Geometry of the model as views without a design option choice show
+    /// it: the main model plus the primary (or active) option of each set,
+    /// so elements of other options neither join nor bound rooms (see
+    /// [`cc_core::design_option`]).
     pub fn build(project: &Project) -> Self {
+        match project.with_options(&project.shown_options(None)) {
+            Some(shown) => Self::build_all(&shown),
+            None => Self::build_all(project),
+        }
+    }
+
+    /// Geometry of every element of `project`, whatever its design option.
+    fn build_all(project: &Project) -> Self {
         let mut geom = Self::default();
         geom.build_walls(project);
         geom.build_hosted(project);
         geom.build_slabs(project);
+        geom.attach_wall_tops(project);
         geom.build_beams(project);
         geom.build_foundations(project);
+        geom.build_piles(project);
         geom.build_structure(project);
-        geom.rebar = crate::rebar::build_rebar(project, &geom.beams);
+        geom.rebar = crate::rebar::build_rebar(project, &geom.beams, &geom.walls, &geom.foundations);
+        geom.build_connections(project);
         geom.build_components(project);
+        geom.build_masses(project);
+        geom.build_topographies(project);
         geom.build_mep(project);
         geom.apply_joins(project);
         geom.build_rooms(project);
+        crate::paint::apply(project, &mut geom.solids);
+        geom.solid_index = SolidIndex::new(&geom.solids);
         geom
     }
 
@@ -301,14 +440,14 @@ impl ModelGeometry {
     /// leaves its joints open, so it is rebuilt with both ends capped.
     fn closed_meshes(&self, id: ElementId) -> Vec<Vec<Vec<DVec3>>> {
         let mesh = |s: &Solid| s.faces.iter().map(|f| f.verts.clone()).collect::<Vec<_>>();
-        if let Some(wall) = self.walls.get(&id) {
+        if let Some(wall) = self.walls.get(&id).filter(|w| w.curtain.is_none()) {
             let mut closed = wall.clone();
             closed.start_joined = false;
             closed.end_joined = false;
             closed.face_gaps.clear();
             return vec![mesh(&closed.to_solid([0, 0, 0]))];
         }
-        self.solids_of(id).map(mesh).collect()
+        self.body_of(id).map(mesh).collect()
     }
 
     /// Volume the bodies of `a` and `b` share (0 when they only touch). Bodies
@@ -333,6 +472,11 @@ impl ModelGeometry {
     /// plan and joints are analytic: their shared volume is deducted from
     /// their quantity instead, and views merge the outlines.
     fn apply_joins(&mut self, project: &Project) {
+        if project.joins.is_empty() {
+            return;
+        }
+        // Joins add and remove no solids: the index holds throughout.
+        self.solid_index = SolidIndex::new(&self.solids);
         for &(cutting, cut) in &project.joins {
             let cutters = self.closed_meshes(cutting);
             if self.walls.contains_key(&cut) {
@@ -350,7 +494,12 @@ impl ModelGeometry {
                 *self.join_deductions.entry(cut).or_default() += shared;
                 continue;
             }
-            for solid in self.solids.iter_mut().filter(|s| s.element == cut) {
+            let positions = self.solid_index.get(&self.solids, cut).map(<[usize]>::to_vec).unwrap_or_default();
+            for i in positions {
+                let Some(solid) = self.solids.get_mut(i) else { continue };
+                if solid.element != cut || solid.secondary {
+                    continue;
+                }
                 for cutter in &cutters {
                     let body: Vec<Vec<DVec3>> = solid.faces.iter().map(|f| f.verts.clone()).collect();
                     if !crate::csg::bounds_overlap(&body, cutter) {
@@ -370,18 +519,29 @@ impl ModelGeometry {
     /// material. Components of one type and the same instance values share
     /// the resolution (and its boolean cuts).
     fn build_components(&mut self, project: &Project) {
-        type Key = (cc_core::ElementTypeId, Vec<(String, u64)>);
+        type Key = (cc_core::ElementTypeId, Vec<(String, u64)>, Vec<(String, String)>, Vec<(String, [u64; 3])>);
         let mut resolved: std::collections::HashMap<Key, Vec<cc_core::component::ComponentPart>> = Default::default();
         for e in project.elements.values() {
             let ElementKind::Component(c) = &e.kind else { continue };
-            let Some(TypeData::Component { def, .. }) = project.element_type(e.type_id).map(|t| &t.data) else {
-                continue;
+            let Some(ty) = project.element_type(e.type_id) else { continue };
+            let TypeData::Component { def, .. } = &ty.data else { continue };
+            // A script that fails shows each element's own last pieces, so
+            // elements with scripts do not share.
+            let local = if def.has_script() {
+                crate::resolve_instance(ty, def, e, Some(c), &[])
+            } else {
+                let key = (
+                    e.type_id,
+                    c.overrides.iter().map(|(k, v)| (k.clone(), v.to_bits())).collect(),
+                    c.text_overrides.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    c.hotspots.iter().map(|(k, p)| (k.clone(), p.map(f64::to_bits))).collect(),
+                );
+                resolved.entry(key).or_insert_with(|| crate::resolve_instance(ty, def, e, Some(c), &[])).clone()
             };
-            let key = (e.type_id, c.overrides.iter().map(|(k, v)| (k.clone(), v.to_bits())).collect());
-            let local = resolved.entry(key).or_insert_with(|| crate::resolve_component(def, &c.overrides)).clone();
             let parts = place_parts(project, e, c, local);
             for part in parts.iter().filter(|p| !p.plan_only) {
                 let mut s = Solid::of_material(e.id, e.category(), project, &part.material);
+                s.detail = part.detail;
                 if part.faces.is_empty() {
                     s.add_prism(&part.footprint, |_| part.z0, |_| part.z1);
                 } else {
@@ -395,16 +555,66 @@ impl ModelGeometry {
         }
     }
 
-    /// Columns, beams, stairs, ramps and railings.
+    /// Connections: the plates and bolts of each from its member (after the
+    /// beams' ends are resolved), one steel solid per connection.
+    fn build_connections(&mut self, project: &Project) {
+        self.connections = crate::connection::build_connections(project, &self.beams);
+        for g in self.connections.values() {
+            let faces = g.faces();
+            if faces.is_empty() {
+                continue;
+            }
+            let mut s = crate::connection::solid(project, g.element);
+            s.add_polygons(faces);
+            self.solids.push(s);
+        }
+    }
+
+    /// Conceptual masses: see-through bodies, and their mass floors.
+    fn build_masses(&mut self, project: &Project) {
+        for e in project.elements.values() {
+            let ElementKind::Mass(m) = &e.kind else { continue };
+            let Some(g) = crate::mass::mass_geom(project, e, m) else { continue };
+            let material = project.element_type(e.type_id).map_or("", |t| t.main_material());
+            let mut s = Solid::of_material(e.id, e.category(), project, material);
+            // Masses are studied through: at least partly transparent.
+            s.transparency = s.transparency.max(0.4);
+            s.add_polygons(g.faces.clone());
+            self.solids.push(s);
+            self.masses.insert(e.id, g);
+        }
+    }
+
+    /// Terrain: the surface closed down to its base, in its earth material.
+    fn build_topographies(&mut self, project: &Project) {
+        for e in project.elements.values() {
+            let ElementKind::Topography(t) = &e.kind else { continue };
+            let Some((g, pads)) = crate::topography::topo_geom_with_pads(project, e, t) else { continue };
+            self.pads.extend(pads);
+            let material = project.element_type(e.type_id).map_or("", |t| t.main_material());
+            let mut s = Solid::of_material(e.id, e.category(), project, material);
+            crate::topography::add_solid(&mut s, &g);
+            self.solids.push(s);
+            self.topographies.insert(e.id, g);
+        }
+    }
+
+    /// Columns, beams, stairs, ramps, railings and swept profiles.
     fn build_structure(&mut self, project: &Project) {
         for e in project.elements.values() {
             let Some(ty) = project.element_type(e.type_id) else { continue };
             let mut s = Solid::of_material(e.id, e.category(), project, ty.main_material());
             match (&e.kind, &ty.data) {
-                (ElementKind::Column(c), TypeData::Column { section, .. }) => {
+                (ElementKind::Column(c), TypeData::Column { .. }) => {
+                    let Some(section) = project.type_section(&ty.data) else { continue };
                     let (base, top) = project.column_span(e, c);
-                    for part in crate::section::column_parts(*section, c.position, c.rotation_deg) {
-                        s.add_prism(&part, |_| base, |_| top);
+                    let (outer, holes) = crate::section::column_body(&section.outline, c.position, c.rotation_deg);
+                    crate::section::add_column_body(&mut s, &outer, &holes, base, top, section.curved);
+                    // Exact for sections with arcs (the solid meshes them with chords).
+                    if section.curved
+                        && let Some(area) = project.exact_section_area(&ty.data)
+                    {
+                        self.curved_volumes.insert(e.id, area * (top - base).max(0.0));
                     }
                 }
                 (ElementKind::Beam(_), TypeData::Beam { .. }) => {
@@ -420,6 +630,10 @@ impl ModelGeometry {
                     g.add_to(*thickness, &mut s);
                 }
                 (ElementKind::Railing(r), TypeData::Railing { .. }) => crate::add_railing(project, e, r, &mut s),
+                (ElementKind::Sweep(sw), TypeData::Sweep { .. }) => {
+                    let Some(faces) = crate::profile_sweep::sweep_faces(project, e, sw) else { continue };
+                    s.add_polygons(faces);
+                }
                 _ => continue,
             }
             if !s.faces.is_empty() {
@@ -434,36 +648,69 @@ impl ModelGeometry {
         let mut columns = Vec::new();
         for e in project.elements.values() {
             match (&e.kind, project.element_type(e.type_id).map(|t| &t.data)) {
-                (ElementKind::Beam(b), Some(TypeData::Beam { width, height, shape, .. })) if b.length() > 1e-6 => {
+                (ElementKind::Beam(b), Some(data @ TypeData::Beam { width, height, .. })) if b.length() > 1e-6 => {
                     // Joins work on the body centerline, whatever the justification.
                     let (start, end) = project.beam_axis(e, b);
-                    let section = crate::section::shape_rects(*shape, *width, *height)
-                        .into_iter()
-                        .map(|(a, b)| (DVec2::new(a.x, a.y + height / 2.0), DVec2::new(b.x, b.y + height / 2.0)))
-                        .collect();
+                    // The profile's section, or the type's box when the profile fails.
+                    let (section, curved) = match project.type_section(data) {
+                        Some(s) => (s.outline, s.curved),
+                        None => (crate::beam::box_section(*width, *height), false),
+                    };
+                    let (section, half) = crate::beam::beam_section(&section);
                     beams.push(BeamInput {
                         element: e.id,
                         start,
                         end,
-                        half: width / 2.0,
+                        half,
                         z_range: project.beam_z(e, b),
-                        slope: b.rise() / b.length(),
+                        // An arc beam is level.
+                        slope: if b.arc().is_some() { 0.0 } else { b.rise() / b.length() },
                         section,
+                        curved,
                         join_start: b.join_start,
                         join_end: b.join_end,
+                        bulge: b.bulge,
                     });
                 }
-                (ElementKind::Column(c), Some(TypeData::Column { section, .. })) if c.structural => {
+                (ElementKind::Column(c), Some(data @ TypeData::Column { .. })) if c.structural => {
                     columns.push(ColumnInput {
                         element: e.id,
-                        outline: column_outline(*section, c.position, c.rotation_deg),
+                        // Beams frame into the hull: the box of an I, C or L.
+                        outline: polygon::convex_hull(&column_outline(project, data, c.position, c.rotation_deg)),
                         z_range: project.column_span(e, c),
                     });
+                }
+                // Tie beams stop at the faces of the pile caps they frame into (not a ring's).
+                (ElementKind::Foundation(_), Some(TypeData::Foundation { thickness, .. })) => {
+                    let Some(cap) = crate::pile::cap_geom(project, e) else { continue };
+                    if matches!(cap.outline, cc_core::pile::CapOutline::Ring { .. }) {
+                        continue;
+                    }
+                    let Some(outline) = cap.loops().into_iter().next() else { continue };
+                    let top = project.level_elevation(e.level) + project.pile_cap(e).map_or(0.0, |c| c.top_offset);
+                    columns.push(ColumnInput { element: e.id, outline, z_range: (top - thickness, top) });
                 }
                 _ => {}
             }
         }
         self.beams = resolve_beams(&beams, &columns).into_iter().map(|g| (g.element, g)).collect();
+        // Exact for sections with arcs: the swept volume scaled from the
+        // chorded outline's area to the section's.
+        for g in self.beams.values().filter(|g| g.curved || g.arc.is_some()) {
+            let Some(e) = project.element(g.element) else { continue };
+            let exact = project.element_type(e.type_id).and_then(|t| project.exact_section_area(&t.data));
+            let chorded = g.section.properties(0.0).area;
+            match exact {
+                Some(exact) if g.curved && chorded > 0.0 => {
+                    self.curved_volumes.insert(g.element, g.volume() * exact / chorded);
+                }
+                // An arc beam of a plain section: its solid meshes the arc with chords.
+                _ if g.arc.is_some() => {
+                    self.curved_volumes.insert(g.element, g.volume());
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Pads, strips (meeting at corners and tees like beams) and slabs.
@@ -471,20 +718,37 @@ impl ModelGeometry {
         let mut strips = Vec::new();
         for e in project.elements.values() {
             let ElementKind::Foundation(f) = &e.kind else { continue };
-            let Some(TypeData::Foundation { width, length, thickness, .. }) =
+            let Some(data @ TypeData::Foundation { width, length, thickness, .. }) =
                 project.element_type(e.type_id).map(|t| &t.data)
             else {
                 continue;
             };
             let top = project.level_elevation(e.level) + f.top_offset;
-            let z_range = (top - thickness, top);
+            let z_range = (top - data.foundation_depth(), top);
+            let haunch = data.strip_haunch();
+            // A pile cap: its outline from the layout, exact in area.
+            if let Some(cap) = crate::pile::cap_geom(project, e) {
+                let mut loops = cap.loops().into_iter();
+                let footprint = loops.next().unwrap_or_default();
+                let g = FoundationGeom {
+                    element: e.id,
+                    footprint,
+                    z_range,
+                    arc: None,
+                    drawn_area: Some(cap.outline.area()),
+                    strip: None,
+                    holes: loops.collect(),
+                    cap: Some(cap),
+                };
+                self.foundations.insert(e.id, g);
+                continue;
+            }
             let footprint = match &f.shape {
                 cc_core::FoundationShape::Pad { position, rotation_deg } => {
-                    let section = cc_core::ColumnSection::Rectangular { width: *width, depth: *length };
-                    column_outline(section, *position, *rotation_deg)
+                    rect_outline(*width, *length, *position, *rotation_deg)
                 }
                 cc_core::FoundationShape::Slab { boundary } => polygon::ccw(boundary),
-                cc_core::FoundationShape::Strip { start, end } => {
+                cc_core::FoundationShape::Strip { start, end, bulge } => {
                     if start.distance(*end) > 1e-6 {
                         strips.push(BeamInput {
                             element: e.id,
@@ -493,29 +757,85 @@ impl ModelGeometry {
                             half: width / 2.0,
                             z_range,
                             slope: 0.0,
-                            section: Vec::new(),
+                            section: match haunch {
+                                Some(h) => {
+                                    cc_core::SectionOutline { outer: h.outline(*width, *thickness), holes: Vec::new() }
+                                }
+                                None => crate::beam::box_section(*width, *thickness),
+                            },
+                            curved: false,
                             join_start: true,
                             join_end: true,
+                            bulge: *bulge,
                         });
                     }
                     continue;
                 }
             };
-            self.foundations.insert(e.id, FoundationGeom { element: e.id, footprint, z_range });
+            let drawn_area = f.sketch.as_ref().filter(|s| s.is_curved()).and_then(|_| f.slab_area());
+            let g = FoundationGeom {
+                element: e.id,
+                footprint,
+                z_range,
+                arc: None,
+                drawn_area,
+                strip: None,
+                holes: Vec::new(),
+                cap: None,
+            };
+            self.foundations.insert(e.id, g);
         }
+        // Strips meet at the true crossings of their faces, arcs included.
         for g in resolve_beams(&strips, &[]) {
-            let footprint = g.footprint().to_vec();
-            self.foundations.insert(g.element, FoundationGeom { element: g.element, footprint, z_range: g.z_range });
+            let arc = g.arc.map(|arc| crate::StripArc {
+                arc,
+                half: g.half,
+                left: (g.start_ext.0, g.end_ext.0),
+                right: (g.start_ext.1, g.end_ext.1),
+            });
+            let footprint = arc.map_or_else(|| g.footprint().to_vec(), |a| a.outline());
+            let geom = FoundationGeom {
+                element: g.element,
+                footprint,
+                z_range: g.z_range,
+                arc,
+                drawn_area: None,
+                strip: Some(g),
+                holes: Vec::new(),
+                cap: None,
+            };
+            self.foundations.insert(geom.element, geom);
         }
         for (id, g) in &self.foundations {
             let Some(e) = project.element(*id) else { continue };
             let material = project.element_type(e.type_id).map_or("", |t| t.main_material());
             let mut s = Solid::of_material(*id, Category::Foundation, project, material);
             let (z0, z1) = g.z_range;
-            s.add_prism(&g.footprint, |_| z0, |_| z1);
+            match (g.body(), &g.arc, &g.cap) {
+                (Some(body), _, _) => body.add_to(&mut s),
+                (None, Some(arc), _) => arc.add_to(&mut s, z0, z1),
+                (None, None, Some(cap)) => cap.add_to(&mut s, z0, z1),
+                (None, None, None) => s.add_prism(&g.footprint, |_| z0, |_| z1),
+            }
             if !s.faces.is_empty() {
                 self.solids.push(s);
             }
+        }
+    }
+
+    /// Piles: round ones as cylinders of smooth facets (their volume exact), square ones as prisms.
+    fn build_piles(&mut self, project: &Project) {
+        for e in project.elements.values() {
+            let ElementKind::Pile(p) = &e.kind else { continue };
+            let Some(g) = crate::pile::pile_geom(project, e, p) else { continue };
+            let material = project.element_type(e.type_id).map_or("", |t| t.main_material());
+            let mut s = Solid::of_material(e.id, e.category(), project, material);
+            g.add_to(&mut s);
+            if !s.faces.is_empty() {
+                self.solids.push(s);
+                self.curved_volumes.insert(e.id, g.volume());
+            }
+            self.piles.insert(e.id, g);
         }
     }
 
@@ -554,14 +874,15 @@ impl ModelGeometry {
     /// they are created in.
     fn build_rooms(&mut self, project: &Project) {
         let phased = !project.phases.is_empty();
-        let mut footprints: BTreeMap<(cc_core::LevelId, usize), Vec<Vec<DVec2>>> = BTreeMap::new();
+        // One arrangement of the bounding walls per level and phase, shared by its rooms.
+        let mut arrangements: BTreeMap<(cc_core::LevelId, usize), crate::RoomArrangement> = BTreeMap::new();
         for e in project.elements.values() {
             let ElementKind::Room(room) = &e.kind else { continue };
             let phase = project.created_index(e);
-            let walls = footprints
-                .entry((e.level, phase))
-                .or_insert_with(|| self.bounding_footprints(project, e.level, phased.then_some(phase)));
-            if let Some(boundary) = crate::room_boundary(walls, room.position) {
+            let walls = arrangements.entry((e.level, phase)).or_insert_with(|| {
+                crate::RoomArrangement::new(self.bounding_footprints(project, e.level, phased.then_some(phase)))
+            });
+            if let Some(boundary) = walls.room_boundary(room.position) {
                 self.rooms.insert(e.id, boundary);
             }
         }
@@ -573,16 +894,147 @@ impl ModelGeometry {
     /// the phase. Rooms of earlier phases keep their boundaries from `full`
     /// (the geometry of the whole model).
     pub fn build_phase(project: &Project, phase: usize, full: &ModelGeometry) -> Self {
+        Self::build_view(project, Some(phase), &project.shown_options(None), full)
+    }
+
+    /// Geometry of the model as a view shows it: in phase number `phase`
+    /// (see [`ModelGeometry::build_phase`]; `None`: every phase) and with
+    /// the main model plus the design options `options` only, so elements
+    /// of other options neither join, open walls nor bound rooms. `full` is
+    /// the geometry of [`ModelGeometry::build`].
+    pub fn build_view(
+        project: &Project,
+        phase: Option<usize>,
+        options: &std::collections::BTreeSet<cc_core::OptionId>,
+        full: &ModelGeometry,
+    ) -> Self {
         let mut present = project.clone();
-        present.elements.retain(|_, e| project.present_at(e, phase));
+        present
+            .elements
+            .retain(|_, e| phase.is_none_or(|ph| project.present_at(e, ph)) && project.option_shows(e, options));
         present.joins.retain(|(a, b)| present.elements.contains_key(a) && present.elements.contains_key(b));
-        let mut geom = Self::build(&present);
-        for (id, boundary) in &full.rooms {
-            if present.elements.get(id).is_some_and(|e| present.created_index(e) < phase) {
-                geom.rooms.insert(*id, boundary.clone());
+        let mut geom = Self::build_all(&present);
+        // Rooms of earlier phases keep the boundaries they had (when the
+        // options shown are those of the whole model's geometry).
+        if let Some(phase) = phase
+            && *options == project.shown_options(None)
+        {
+            for (id, boundary) in &full.rooms {
+                if present.elements.get(id).is_some_and(|e| present.created_index(e) < phase) {
+                    geom.rooms.insert(*id, boundary.clone());
+                }
             }
         }
         geom
+    }
+
+    /// Walls whose top is attached to a roof, ceiling or floor: along its
+    /// centerline the top follows the plane of the target's underside above
+    /// it (the lowest where several meet, as along a ridge), and keeps its
+    /// own height where the target is not above. A wall straddling the
+    /// target's edge counts as under it. Arc walls keep their own top.
+    fn attach_wall_tops(&mut self, project: &Project) {
+        let attached: Vec<(ElementId, ElementId)> = project
+            .walls()
+            .filter(|(_, w)| w.bulge.abs() < 1e-9)
+            .filter_map(|(e, w)| Some((e.id, w.attach_top?)))
+            .collect();
+        if attached.is_empty() {
+            return;
+        }
+        // Tops change faces only: the index holds throughout.
+        self.solid_index = SolidIndex::new(&self.solids);
+        for (wall, target) in attached {
+            // Curtain walls keep their grid under a flat top.
+            let Some(g) = self.walls.get(&wall).filter(|g| g.curtain.is_none()) else { continue };
+            // The target's undersides (faces turned down) as plan outlines,
+            // reaching half the wall further, with their planes.
+            let reach = g.half + 0.01;
+            let planes: Vec<(Vec<DVec2>, DVec3, DVec3)> = self
+                .body_of(target)
+                .flat_map(|s| s.faces.iter())
+                .filter(|f| f.normal.z < -1e-6 && f.verts.len() >= 3)
+                .map(|f| {
+                    let plan = polygon::offset(&f.verts.iter().map(|p| p.truncate()).collect::<Vec<_>>(), reach);
+                    (plan, f.normal, f.verts[0])
+                })
+                .collect();
+            if planes.is_empty() {
+                continue;
+            }
+            let z_on = |(n, p0): (DVec3, DVec3), p: DVec2| p0.z - (n.x * (p.x - p0.x) + n.y * (p.y - p0.y)) / n.z;
+            let (u_start, u_end) = (g.start_ext.0.min(g.start_ext.1), g.end_ext.0.max(g.end_ext.1));
+            let at = |u: f64| g.origin + g.dir * u;
+            // Where the centerline crosses an outline's edges, the plane above may change.
+            let mut breaks = vec![u_start, u_end];
+            for (plan, _, _) in &planes {
+                for i in 0..plan.len() {
+                    let (a, b) = (plan[i], plan[(i + 1) % plan.len()]);
+                    let d = b - a;
+                    let den = g.dir.perp_dot(d);
+                    if den.abs() < 1e-12 {
+                        continue;
+                    }
+                    let w = a - g.origin;
+                    let (u, t) = (w.perp_dot(d) / den, w.perp_dot(g.dir) / den);
+                    if (-1e-9..=1.0 + 1e-9).contains(&t) && u > u_start && u < u_end {
+                        breaks.push(u);
+                    }
+                }
+            }
+            // Where two planes cross over the centerline (a ridge), the lower one changes.
+            let line = |(n, p0): (DVec3, DVec3)| {
+                let z0 = z_on((n, p0), at(0.0));
+                (z0, z_on((n, p0), at(1.0)) - z0)
+            };
+            for (i, a) in planes.iter().enumerate() {
+                for b in &planes[i + 1..] {
+                    let ((za, ka), (zb, kb)) = (line((a.1, a.2)), line((b.1, b.2)));
+                    if (ka - kb).abs() > 1e-12 {
+                        let u = (zb - za) / (ka - kb);
+                        if u > u_start && u < u_end {
+                            breaks.push(u);
+                        }
+                    }
+                }
+            }
+            breaks.sort_by(f64::total_cmp);
+            breaks.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+            let mut profile: Vec<(f64, f64, f64, f64)> = Vec::new();
+            for w in breaks.windows(2) {
+                let (ua, ub) = (w[0], w[1]);
+                let mid = at((ua + ub) * 0.5);
+                let above = planes
+                    .iter()
+                    .filter(|(plan, _, _)| polygon::contains(plan, mid))
+                    .min_by(|a, b| z_on((a.1, a.2), mid).total_cmp(&z_on((b.1, b.2), mid)));
+                profile.push(match above {
+                    Some((_, n, p0)) => (ua, ub, z_on((*n, *p0), at(ua)), z_on((*n, *p0), at(ub))),
+                    None => (ua, ub, g.top_z, g.top_z),
+                });
+            }
+            if profile.iter().all(|s| (s.2 - g.top_z).abs() < 1e-9 && (s.3 - g.top_z).abs() < 1e-9) {
+                continue;
+            }
+            let mut g = g.clone();
+            // Openings stay below the top; the columns are rebuilt from scratch.
+            let high = profile.iter().flat_map(|s| [s.2, s.3]).fold(g.top_z, f64::max);
+            let low = profile.iter().flat_map(|s| [s.2, s.3]).fold(f64::INFINITY, f64::min).max(g.base_z + 0.01);
+            g.top_z = high;
+            let openings = g.openings.clone();
+            g.set_openings(openings.into_iter().filter(|o| o.z1 <= low).collect());
+            g.set_top_profile(profile);
+            let found = self.solid_index.get(&self.solids, wall).and_then(|positions| {
+                positions
+                    .iter()
+                    .copied()
+                    .find(|&i| self.solids.get(i).is_some_and(|s| s.element == wall && s.category == Category::Wall))
+            });
+            if let Some(s) = found.and_then(|i| self.solids.get_mut(i)) {
+                s.faces = g.to_solid(s.color).faces;
+            }
+            self.walls.insert(wall, g);
+        }
     }
 
     fn build_walls(&mut self, project: &Project) {
@@ -593,9 +1045,17 @@ impl ModelGeometry {
                 by_level.entry(e.level).or_default().push((e, w));
             }
         }
+        // Doors and windows by host, in element order.
+        let mut hosted_by: BTreeMap<ElementId, Vec<&cc_core::Element>> = BTreeMap::new();
+        for h in project.elements.values() {
+            if let Some(x) = h.as_hosted() {
+                hosted_by.entry(x.host).or_default().push(h);
+            }
+        }
         for walls in by_level.values() {
-            // Joins work on the body centerlines (location lines shifted by the location line setting).
-            let lines: Vec<WallLine> = walls
+            // Joins work on the body centerlines (location lines shifted by the location line
+            // setting); ends meet where the drawn location lines do.
+            let mut lines: Vec<WallLine> = walls
                 .iter()
                 .map(|(e, w)| {
                     let (start, end) = project.wall_axis(e, w);
@@ -606,50 +1066,103 @@ impl ModelGeometry {
                         join_start: w.join_start,
                         join_end: w.join_end,
                         bulge: w.bulge,
+                        drawn: [w.start, w.end],
                     }
                 })
                 .collect();
+            let curtains: Vec<Option<&cc_core::curtain::CurtainSystem>> =
+                walls.iter().map(|(e, _)| project.element_type(e.type_id).and_then(|t| t.curtain())).collect();
+            // A curtain wall inside another wall opens it where it stands, and joins nothing.
+            let mut embedded: Vec<(usize, Opening)> = Vec::new();
+            for (i, (e, w)) in walls.iter().enumerate() {
+                if curtains[i].is_none() {
+                    continue;
+                }
+                let host = (0..lines.len())
+                    .filter(|&j| curtains[j].is_none())
+                    .find_map(|j| Some((j, embedded_in(&lines[i], &lines[j])?)));
+                let Some((j, (u0, u1))) = host else { continue };
+                let (z0, z1) = (project.wall_base_z(e, w), project.wall_top_z(e, w));
+                embedded.push((j, Opening { element: e.id, u0, u1, z0, z1 }));
+                lines[i].join_start = false;
+                lines[i].join_end = false;
+            }
+            // Each wall's layers as `(v_from, v_to, material)` from the left face
+            // inward, and the offsets of its core's faces.
+            let layered: Vec<Layered> = walls
+                .iter()
+                .zip(&lines)
+                .map(|((e, _), line)| {
+                    let ty = project.element_type(e.type_id);
+                    let mut layers = Vec::new();
+                    let mut v = line.half;
+                    for layer in ty.map(|t| t.layers()).unwrap_or_default() {
+                        layers.push((v, v - layer.thickness, layer.material.clone()));
+                        v -= layer.thickness;
+                    }
+                    (layers, ty.and_then(|t| wall_core(t, line.half)))
+                })
+                .collect();
             let mut gaps: Vec<(usize, [DVec2; 2])> = Vec::new();
+            let mut layer_gaps: Vec<(usize, LayerGap)> = Vec::new();
             let mut ids = Vec::new();
             for (i, (e, w)) in walls.iter().enumerate() {
                 let base_z = project.wall_base_z(e, w);
                 let top_z = project.wall_top_z(e, w);
                 let ty = project.element_type(e.type_id);
-                let mut layers = Vec::new();
-                let mut v = lines[i].half;
-                for layer in ty.map(|t| t.layers()).unwrap_or_default() {
-                    layers.push((v, v - layer.thickness, layer.material.clone()));
-                    v -= layer.thickness;
-                }
+                let (layers, core) = layered[i].clone();
                 let (start_join, end_join) = (resolve_join(&lines, i, true), resolve_join(&lines, i, false));
                 let mut g = WallGeom::new(e.id, lines[i], base_z, top_z, start_join, end_join, layers);
-                // Where this wall meets another in a T, that wall's face opens.
-                for (join, u_left, u_right) in
-                    [(start_join, g.start_ext.0, g.start_ext.1), (end_join, g.end_ext.0, g.end_ext.1)]
-                {
-                    if let Some(host) = join.and_then(|j| j.host) {
-                        let pts = [g.world(u_left, g.half), g.world(u_right, -g.half)];
-                        gaps.push((host, pts));
+                g.core = core;
+                // Where this wall meets another in a T, that wall's face opens; its
+                // core runs on through the other wall's outer layers to its core.
+                let ends = [(start_join, g.start_ext.0, g.start_ext.1), (end_join, g.end_ext.0, g.end_ext.1)];
+                for (k, (join, u_left, u_right)) in ends.into_iter().enumerate() {
+                    let Some(host) = join.and_then(|j| j.host) else { continue };
+                    gaps.push((host, [g.world(u_left, g.half), g.world(u_right, -g.half)]));
+                    let (Some(core), Some((host_layers, Some(host_core)))) = (core, layered.get(host)) else {
+                        continue;
+                    };
+                    if let Some((at, mut gap)) = core_through(&lines, i, k == 0, host, core, *host_core) {
+                        g.core_ends[k] = Some(at);
+                        gap.merge = cores_match(&layered[i].0, core, host_layers, &gap);
+                        layer_gaps.push((host, gap));
                     }
                 }
-                let openings = project
-                    .hosted_by(e.id)
-                    .filter_map(|h| {
-                        let host = h.as_hosted()?;
-                        let (width, height) = project.element_type(h.type_id)?.opening_size()?;
-                        let z0 = base_z + host.sill_height;
-                        Some(Opening {
-                            element: h.id,
-                            u0: host.offset - width * 0.5,
-                            u1: host.offset + width * 0.5,
-                            z0,
-                            z1: z0 + height,
-                        })
-                    })
-                    .collect();
+                // Curtain walls host no doors or windows: their panels are the openings.
+                let hosted = hosted_by.get(&e.id).into_iter().flatten().copied().filter(|_| curtains[i].is_none());
+                // Doors and windows open the wall through; niches recess one face.
+                let mut openings: Vec<Opening> = Vec::new();
+                let mut recesses: Vec<crate::wall::Recess> = Vec::new();
+                for h in hosted {
+                    let (Some(host), Some(ty)) = (h.as_hosted(), project.element_type(h.type_id)) else { continue };
+                    let Some((width, height)) = ty.opening_size() else { continue };
+                    let z0 = base_z + host.sill_height;
+                    let (u0, u1, z1) = (host.offset - width * 0.5, host.offset + width * 0.5, z0 + height);
+                    match (&h.kind, ty.opening_depth()) {
+                        (ElementKind::Niche(_), Some(depth)) => {
+                            let side = if host.flip_facing { -1.0 } else { 1.0 };
+                            recesses.push(crate::wall::Recess { element: h.id, u0, u1, z0, z1, side, depth });
+                        }
+                        // A niche with no depth cuts nothing.
+                        (ElementKind::Niche(_), None) => {}
+                        _ => openings.push(Opening { element: h.id, u0, u1, z0, z1 }),
+                    }
+                }
+                openings.extend(embedded.iter().filter(|(j, _)| *j == i).map(|(_, o)| o.clone()));
                 g.set_openings(openings);
+                g.set_recesses(recesses);
+                if let Some(system) = curtains[i] {
+                    let c = crate::curtain::build(project, e, &g, system);
+                    self.solids.extend(crate::curtain::solids(project, e, &c));
+                    g.curtain = Some(c);
+                    ids.push(e.id);
+                    self.walls.insert(e.id, g);
+                    continue;
+                }
                 let material = ty.map_or("", |t| t.main_material());
                 let mut solid = g.to_solid(project.material_color(material));
+                solid.set_appearance(project, material);
                 solid.transparency = project.material_transparency(material);
                 self.solids.push(solid);
                 ids.push(e.id);
@@ -661,15 +1174,22 @@ impl ModelGeometry {
                 let side = if g.local(pts[0]).1 >= 0.0 { 1.0 } else { -1.0 };
                 g.face_gaps.push((side, us[0].min(us[1]), us[0].max(us[1])));
             }
+            for (host, gap) in layer_gaps {
+                let Some(g) = ids.get(host).and_then(|id| self.walls.get_mut(id)) else { continue };
+                g.layer_gaps.push(gap);
+            }
         }
     }
 
     fn build_hosted(&mut self, project: &Project) {
         let mut fills = BTreeMap::new();
+        let mut symbols = Vec::new();
+        let mut memo = OpeningMemo::default();
         for wall in self.walls.values() {
             for o in &wall.openings {
                 let Some(e) = project.element(o.element) else { continue };
-                let parts = opening_parts(project, e, o.u1 - o.u0, o.z1 - o.z0, wall.half);
+                symbols.extend(opening_symbols(project, e, wall, o));
+                let parts = opening_parts_with(project, e, o.u1 - o.u0, o.z1 - o.z0, wall.half, &mut memo);
                 // In an arc wall the pieces are square to the wall at the opening's center.
                 let (origin, dir, normal) = wall.frame_at((o.u0 + o.u1) * 0.5);
                 let world = |p: DVec2| origin + dir * (o.u0 + p.x) + normal * p.y;
@@ -698,6 +1218,7 @@ impl ModelGeometry {
                     } else {
                         s.add_polygons(p.faces.clone());
                     }
+                    s.detail = p.detail;
                     if !s.faces.is_empty() {
                         self.solids.push(s);
                     }
@@ -705,8 +1226,21 @@ impl ModelGeometry {
                 }
                 fills.insert(e.id, placed);
             }
+            // A niche is picked in elevations by the outline of its recess, just off its face.
+            for r in &wall.recesses {
+                let (origin, dir, normal) = wall.frame_at((r.u0 + r.u1) * 0.5);
+                let v = r.side * (wall.half + SYMBOL_OFFSET);
+                let at = |u: f64, z: f64| (origin + dir * u + normal * v).extend(z);
+                symbols.push(OpeningSymbol {
+                    element: r.element,
+                    outline: [at(r.u0, r.z0), at(r.u1, r.z0), at(r.u1, r.z1), at(r.u0, r.z1)],
+                    normal: (normal * r.side).extend(0.0),
+                    lines: Vec::new(),
+                });
+            }
         }
         self.opening_fills = fills;
+        self.opening_symbols = symbols;
     }
 
     fn build_slabs(&mut self, project: &Project) {
@@ -720,8 +1254,7 @@ impl ModelGeometry {
                     let top = level_z + f.height_offset;
                     // Openings clockwise inside the counter-clockwise boundary.
                     let holes: Vec<Vec<DVec2>> = f
-                        .openings
-                        .iter()
+                        .all_openings()
                         .map(|o| {
                             let mut o = polygon::ccw(o);
                             o.reverse();
@@ -734,10 +1267,28 @@ impl ModelGeometry {
                     } else {
                         s.add_prism_with_holes(&polygon::ccw(&f.boundary), &holes, |_| top - thk, |_| top);
                     }
+                    if f.sketch.as_ref().is_some_and(|k| k.is_curved()) {
+                        self.curved_volumes.insert(e.id, f.area() * thk);
+                    }
                 }
                 ElementKind::Ceiling(c) => {
                     let bottom = level_z + c.height_offset;
-                    s.add_prism(&c.boundary, |_| bottom, |_| bottom + thk);
+                    // Shafts cut through, clockwise inside the counter-clockwise outline.
+                    let holes: Vec<Vec<DVec2>> = c
+                        .cuts
+                        .iter()
+                        .map(|o| {
+                            let mut o = polygon::ccw(o);
+                            o.reverse();
+                            o
+                        })
+                        .filter(|o| o.len() >= 3)
+                        .collect();
+                    if holes.is_empty() {
+                        s.add_prism(&c.boundary, |_| bottom, |_| bottom + thk);
+                    } else {
+                        s.add_prism_with_holes(&polygon::ccw(&c.boundary), &holes, |_| bottom, |_| bottom + thk);
+                    }
                 }
                 ElementKind::Roof(r) => {
                     let fp = polygon::ccw(&polygon::offset(&r.footprint, r.overhang));
@@ -751,6 +1302,12 @@ impl ModelGeometry {
                             h
                         })
                         .filter(|h| h.len() >= 3 && polygon::signed_area(h) < 0.0)
+                        // Shafts cut their own outline: no eaves reach over them.
+                        .chain(r.cuts.iter().map(|c| {
+                            let mut c = polygon::ccw(c);
+                            c.reverse();
+                            c
+                        }))
                         .collect();
                     let base = level_z + r.base_offset;
                     match r.shape {
@@ -794,12 +1351,36 @@ impl ModelGeometry {
                 }
                 _ => continue,
             }
+            // A roof's framing and covering figures, from its sloped faces.
+            if let (ElementKind::Roof(_), TypeData::Roof { covering, framing, .. }) = (&e.kind, &ty.data) {
+                let g = crate::roof_framing::roof_framing(&s, framing, *covering);
+                if !g.members.is_empty() {
+                    // Its own solid, in the framing's material, apart from the
+                    // roof's body (left out of its volume, joins and IFC body).
+                    let mut members = Solid::of_material(e.id, Category::Beam, project, &framing.material);
+                    members.secondary = true;
+                    for m in &g.members {
+                        m.add_to(&mut members);
+                    }
+                    self.solids.push(members);
+                }
+                self.roof_framing.insert(e.id, g);
+            }
             self.solids.push(s);
         }
     }
 
     pub fn solids_of(&self, id: ElementId) -> impl Iterator<Item = &Solid> {
-        self.solids.iter().filter(move |s| s.element == id)
+        let indexed = self.solid_index.get(&self.solids, id);
+        let scan = indexed.is_none().then(|| self.solids.iter()).into_iter().flatten();
+        let found = indexed.into_iter().flatten().filter_map(|i| self.solids.get(*i));
+        found.chain(scan).filter(move |s| s.element == id)
+    }
+
+    /// The solids of an element's body: its solids without secondary parts
+    /// such as a roof's framing.
+    pub fn body_of(&self, id: ElementId) -> impl Iterator<Item = &Solid> {
+        self.solids_of(id).filter(|s| !s.secondary)
     }
 
     pub fn bounds(&self) -> Option<(DVec3, DVec3)> {
@@ -810,7 +1391,7 @@ impl ModelGeometry {
     /// segment (the sides of a column, the faces of a component).
     pub fn plan_edges(&self, id: ElementId) -> Vec<(DVec2, DVec2)> {
         let mut out = Vec::new();
-        for face in self.solids_of(id).flat_map(|s| s.faces.iter()) {
+        for face in self.body_of(id).flat_map(|s| s.faces.iter()) {
             let n = DVec2::new(face.normal.x, face.normal.y);
             if face.normal.z.abs() > 1e-6 || n.length_squared() < 0.5 {
                 continue;
@@ -836,10 +1417,28 @@ impl ModelGeometry {
     /// Volume of an element's main body (frames/glass excluded for openings).
     pub fn volume(&self, id: ElementId) -> f64 {
         if let Some(wall) = self.walls.get(&id) {
+            if let Some(c) = &wall.curtain {
+                return crate::curtain::volume(c);
+            }
             let shared = self.join_deductions.get(&id).copied().unwrap_or(0.0);
             return (wall.volume() - shared).max(0.0);
         }
-        self.solids_of(id).map(Solid::volume).sum()
+        if let Some(t) = self.topographies.get(&id) {
+            return t.volume;
+        }
+        // A niche: what its recess takes out of its wall.
+        if let Some(v) = self.walls.values().find_map(|w| w.recess_of(id).map(|r| w.recess_volume(r))) {
+            return v;
+        }
+        // Exact for arc strips, slabs drawn with curves and curved floors
+        // (their solids mesh the arcs with chords).
+        if let Some(f) = self.foundations.get(&id).filter(|f| f.arc.is_some() || f.drawn_area.is_some()) {
+            return f.volume();
+        }
+        if let Some(v) = self.curved_volumes.get(&id) {
+            return *v;
+        }
+        self.body_of(id).map(Solid::volume).sum()
     }
 
     /// The nearest solid along `ray` among the elements `shown` accepts.
@@ -880,6 +1479,87 @@ impl ModelGeometry {
     }
 }
 
+/// A wall's layers as `(v_from, v_to, material)` from its left face inward,
+/// and the offsets of its core's faces.
+type Layered = (Vec<(f64, f64, String)>, Option<(f64, f64)>);
+
+/// Offsets `(left, right)` of a wall type's core faces for a wall of
+/// half-thickness `half`, when it has a structure core with other layers
+/// beside it (what a T-join's layer cleanup runs through or stops at).
+fn wall_core(ty: &cc_core::ElementType, half: f64) -> Option<(f64, f64)> {
+    let layers = ty.layers();
+    if layers.len() < 2 || !layers.iter().any(|l| l.function == cc_core::LayerFunction::Structure) {
+        return None;
+    }
+    let (ext, int) = ty.core_range();
+    let core = (half - ext, half - int);
+    (core.0 < half - 1e-6 || core.1 > -half + 1e-6).then_some(core)
+}
+
+/// Whether every core layer of a joining wall (its `layers` within `core`)
+/// is of the material of the host's core layer at the gap's core face.
+fn cores_match(layers: &[(f64, f64, String)], core: (f64, f64), host: &[(f64, f64, String)], gap: &LayerGap) -> bool {
+    let near = |a: f64| (a - gap.v_core).abs() < 1e-6;
+    // Layers run from `v_from` down to `v_to`: on the left the core's face is
+    // its first layer's `v_from`, on the right its last layer's `v_to`.
+    let left = gap.v_face > gap.v_core;
+    let Some((_, _, host_material)) = host.iter().find(|(from, to, _)| if left { near(*from) } else { near(*to) })
+    else {
+        return false;
+    };
+    layers
+        .iter()
+        .filter(|(from, to, _)| *from <= core.0 + 1e-6 && *to >= core.1 - 1e-6)
+        .all(|(_, _, material)| material == host_material)
+}
+
+/// The elevation symbol of door or window `e` in opening `o` of `wall`, on
+/// both faces: a window's by its operation, a swing door's (unless it draws
+/// its own symbol) as side-hung panels hinged where its plan swings are.
+fn opening_symbols(
+    project: &Project,
+    e: &cc_core::Element,
+    wall: &WallGeom,
+    o: &crate::wall::Opening,
+) -> Vec<OpeningSymbol> {
+    let Some(ty) = project.element_type(e.type_id) else { return Vec::new() };
+    let own_symbol = match &ty.data {
+        TypeData::Component { def, .. } => def.opening.as_ref().is_some_and(|o| o.own_symbol),
+        _ => false,
+    };
+    let (w, h) = (o.u1 - o.u0, o.z1 - o.z0);
+    let (host, lines) = match &e.kind {
+        ElementKind::Window(host) => (host, ty.window_operation().elevation_lines(w, h)),
+        ElementKind::Door(host) if !own_symbol => (host, ty.door_operation().elevation_lines(w, h)),
+        _ => return Vec::new(),
+    };
+    if lines.is_empty() || !(w > 0.0 && h > 0.0) {
+        return Vec::new();
+    }
+    // Square to the wall at the opening's center, as its pieces are.
+    let (origin, dir, normal) = wall.frame_at((o.u0 + o.u1) * 0.5);
+    [1.0, -1.0]
+        .into_iter()
+        .map(|side: f64| {
+            // Just off the face, so the wall around the opening never covers it.
+            let v = side * (wall.half + SYMBOL_OFFSET);
+            let at = |(x, z): (f64, f64)| {
+                let x = if host.flip_hand { w - x } else { x };
+                (origin + dir * (o.u0 + x) + normal * v).extend(o.z0 + z)
+            };
+            OpeningSymbol {
+                element: e.id,
+                outline: [at((0.0, 0.0)), at((w, 0.0)), at((w, h)), at((0.0, h))],
+                normal: (normal * side).extend(0.0),
+                lines: lines.iter().map(|&(a, b, style)| (at(a), at(b), style)).collect(),
+            }
+        })
+        .collect()
+}
+
+/// How far off the wall's face a window's elevation symbol stands, meters.
+const SYMBOL_OFFSET: f64 = 1e-3;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,6 +1593,8 @@ mod tests {
                     }),
                     phase_created: Default::default(),
                     phase_demolished: None,
+                    design_option: None,
+                    paints: Vec::new(),
                 });
             }
             let id = ElementId(e.alloc_id());
@@ -932,6 +1614,8 @@ mod tests {
                 }),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             });
             let id = ElementId(e.alloc_id());
             e.add_element(Element {
@@ -944,6 +1628,8 @@ mod tests {
                 kind: ElementKind::Floor(Floor::new(pts.to_vec(), 0.0)),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             });
         });
         doc
@@ -968,6 +1654,8 @@ mod tests {
                 kind: ElementKind::Beam(cc_core::Beam::new(DVec2::new(0.0, 3.0), DVec2::new(8.0, 3.0), top_offset)),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             });
         });
         (doc, beam)
@@ -1061,6 +1749,8 @@ mod tests {
                     kind,
                     phase_created: Default::default(),
                     phase_demolished: None,
+                    design_option: None,
+                    paints: Vec::new(),
                 })
             };
             let arc =
@@ -1170,6 +1860,8 @@ mod tests {
                     uid: Default::default(),
                     phase_created: Default::default(),
                     phase_demolished: None,
+                    design_option: None,
+                    paints: Vec::new(),
                 })
             };
             let top = WallTop::Level { level: upper, offset: 0.0 };

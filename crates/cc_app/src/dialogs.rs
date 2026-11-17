@@ -21,22 +21,46 @@ fn done(state: &mut AppState, r: &egui::Response) {
 }
 
 pub fn show(ctx: &Context, state: &mut AppState) {
+    // Before any dialog begins its edits over a session a dropped profile sketch left open.
+    crate::profiles_dialog::settle_abandoned(state);
     project_info(ctx, state);
+    crate::site_ui::show(ctx, state);
     crate::units_dialog::show(ctx, state);
     levels(ctx, state);
     crate::material_browser::show(ctx, state);
     crate::type_dialog::show(ctx, state);
-    crate::component_editor::show(ctx, state);
     crate::schedule_ui::dialog(ctx, state);
     crate::systems_dialog::show(ctx, state);
     crate::systems_dialog::sizing(ctx, state);
+    crate::lps_cabling_ui::show(ctx, state);
     crate::graphics_dialog::show(ctx, state);
     crate::phases_dialog::show(ctx, state);
+    crate::design_options_ui::show(ctx, state);
+    crate::line_styles_dialog::show(ctx, state);
+    crate::browser_org_dialog::show(ctx, state);
+    crate::sun_ui::show(ctx, state);
+    // After Sun Settings: the render window opens again when the Sun Settings it opened close.
+    crate::render_ui::show(ctx, state);
+    // After the material browser, type properties and graphics, which open it over themselves.
+    crate::fill_patterns_dialog::show(ctx, state);
+    crate::profiles_dialog::show(ctx, state);
+    crate::grid_frame_ui::show(ctx, state);
+    crate::steel_building_ui::show(ctx, state);
+    crate::wall_framing_ui::show(ctx, state);
     crate::library::show(ctx, state);
+    crate::obj_ui::show(ctx, state);
+    crate::plugins_ui::drain_messages(state);
+    crate::plugins_ui::show(ctx, state);
+    // After the library window, which opens it over itself.
+    crate::preferences::show(ctx, state);
+    // Before the unsaved changes question its Create may ask.
+    crate::new_component_dialog::show(ctx, state);
+    crate::new_project_dialog::show(ctx, state);
     confirm(ctx, state);
     error(ctx, state);
     about(ctx, state);
     update_report(ctx, state);
+    update_install(ctx, state);
 }
 
 /// Footer of a data dialog: OK keeps the edits, Cancel (or Esc / close) undoes them.
@@ -85,7 +109,9 @@ fn project_info(ctx: &Context, state: &mut AppState) {
                 for (label, field, value) in fields {
                     form_label(ui, &label);
                     let mut text = value;
-                    let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(300.0));
+                    let r = crate::table::live_text(ui, ("project-info", field), &mut text, |ui, t| {
+                        ui.add(egui::TextEdit::singleline(t).desired_width(300.0))
+                    });
                     if r.changed() {
                         crate::engine_edit::info(state, Some(key(("info", field))), |info| match field {
                             "name" => info.name = text,
@@ -99,6 +125,7 @@ fn project_info(ctx: &Context, state: &mut AppState) {
                     ui.end_row();
                 }
             });
+            project_fields(ui, state);
         },
         |f| {
             ok = f.primary(t!("action-ok"));
@@ -110,46 +137,172 @@ fn project_info(ctx: &Context, state: &mut AppState) {
     }
 }
 
+/// Add a project field with an unused name (`Field 1`, `Field 2`…) and no value.
+pub(crate) fn add_project_field(state: &mut AppState) -> bool {
+    let base = t!("info-new-field");
+    let info = &state.project().info;
+    let Some(name) = (1..=10_000).map(|i| format!("{base} {i}")).find(|n| info.field(n).is_none()) else {
+        return false;
+    };
+    crate::engine_edit::info(state, None, |i| i.fields.push(cc_core::ProjectField { name, value: String::new() }))
+}
+
+/// Rename project field `old` (refused when the new name is empty or taken).
+pub(crate) fn rename_project_field(state: &mut AppState, old: &str, new: &str) -> bool {
+    let new = new.trim().to_string();
+    if new.is_empty() || state.project().info.field(&new).is_some() {
+        state.message = t!("msg-field-name-taken");
+        return false;
+    }
+    // A text reads it as `{project:Name}`: no braces, and a key short enough.
+    if !cc_core::title_block::project_field_name_ok(&new) {
+        state.message = t!("msg-field-name-invalid");
+        return false;
+    }
+    crate::engine_edit::info(state, None, |i| {
+        if let Some(f) = i.fields.iter_mut().find(|f| f.name == old) {
+            f.name = new;
+        }
+    })
+}
+
+/// Remove project field `name`.
+pub(crate) fn remove_project_field(state: &mut AppState, name: &str) -> bool {
+    crate::engine_edit::info(state, None, |i| i.fields.retain(|f| f.name != name))
+}
+
+/// The project fields table: name (committed on Enter), value (as typed), ×.
+fn project_fields(ui: &mut Ui, state: &mut AppState) {
+    ui.add_space(12.0);
+    ui.label(theme::title(t!("info-project-fields")));
+    ui.add_space(4.0);
+    let fields = state.project().info.fields.clone();
+    egui::Grid::new("info-fields").num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
+        form_label(ui, &t!("prop-name"));
+        form_label(ui, &t!("prop-value"));
+        ui.end_row();
+        for f in &fields {
+            if let Some(new) = crate::table::commit_text(ui, ("info-field-name", &f.name), &f.name, 140.0, "") {
+                rename_project_field(state, &f.name, &new);
+            }
+            let mut value = f.value.clone();
+            let r = crate::table::live_text(ui, ("info-field-value", &f.name), &mut value, |ui, t| {
+                ui.add(egui::TextEdit::singleline(t).desired_width(220.0))
+            });
+            if r.changed() {
+                let name = f.name.clone();
+                crate::engine_edit::info(state, Some(key(("info-field", &f.name))), |i| {
+                    if let Some(x) = i.fields.iter_mut().find(|x| x.name == name) {
+                        x.value = value;
+                    }
+                });
+            }
+            done(state, &r);
+            if ui.small_button("×").on_hover_text(t!("action-delete")).clicked() {
+                remove_project_field(state, &f.name);
+            }
+            ui.end_row();
+        }
+    });
+    if ui.button(format!("+ {}", t!("info-add-field"))).clicked() {
+        add_project_field(state);
+    }
+}
+
+/// The least distance the levels dialog leaves between two levels, meters.
+const LEVEL_GAP: f64 = 0.01;
+
+/// A length field of the levels table. Its value is taken when the field is
+/// left, not at every key: a half-typed number must not move the levels.
+fn level_drag(value: &mut f64) -> egui::DragValue<'_> {
+    crate::properties::length_drag(value).speed(0.01).update_while_editing(false).clamp_existing_to_range(false)
+}
+
 fn levels(ctx: &Context, state: &mut AppState) {
     if !state.dialogs.levels {
         return;
     }
     session::begin(state);
     let mut ok = 0;
-    let response = Dialog::new("levels", t!("dlg-levels")).width(460.0).show(
+    let response = Dialog::new("levels", t!("dlg-levels")).width(560.0).show(
         ctx,
         |ui| {
+            // Lowest first; the table lists them from the top down.
             let levels = state.project().levels.clone();
-            egui::Grid::new("levels").num_columns(3).striped(true).spacing([12.0, 6.0]).show(ui, |ui| {
+            let selected = state
+                .dialogs
+                .level_selected
+                .filter(|id| levels.iter().any(|l| l.id == *id))
+                .or(levels.last().map(|l| l.id));
+            state.dialogs.level_selected = selected;
+            egui::Grid::new("levels").num_columns(4).striped(true).spacing([12.0, 6.0]).show(ui, |ui| {
+                ui.label("");
                 form_label(ui, &t!("prop-name"));
                 form_label(ui, &t!("level-elevation"));
-                ui.label("");
+                form_label(ui, &t!("level-height"));
                 ui.end_row();
-                for level in levels.iter().rev() {
+                for (i, level) in levels.iter().enumerate().rev() {
+                    let mut pick = ui.radio(selected == Some(level.id), "").clicked();
                     let mut name = level.name.clone();
-                    let r = ui.add_sized([220.0, 22.0], egui::TextEdit::singleline(&mut name));
+                    let r = crate::table::live_text(ui, ("level-name", level.id), &mut name, |ui, t| {
+                        ui.add_sized([200.0, 22.0], egui::TextEdit::singleline(t))
+                    });
                     if r.changed() {
                         crate::engine_edit::level(state, level.id, Some(key((level.id, "name"))), |l| l.name = name);
                     }
+                    pick |= r.gained_focus();
                     done(state, &r);
+                    // The elevation stays between the neighbors, so no value
+                    // typed here changes the order of the levels (issue #297).
+                    let below = i.checked_sub(1).and_then(|j| levels.get(j));
+                    let above = levels.get(i + 1);
+                    let lowest = below.map_or(f64::NEG_INFINITY, |l| l.elevation + LEVEL_GAP);
+                    let highest = above.map_or(f64::INFINITY, |l| l.elevation - LEVEL_GAP);
                     let mut elev = level.elevation;
-                    let r = ui.add(crate::properties::length_drag(&mut elev).speed(0.01));
+                    let mut drag = level_drag(&mut elev);
+                    if lowest <= highest {
+                        drag = drag.range(lowest..=highest);
+                    }
+                    let r = ui.add(drag);
                     if r.changed() {
                         crate::engine_edit::level(state, level.id, Some(key((level.id, "elev"))), |l| {
                             l.elevation = elev;
                         });
                     }
+                    pick |= r.gained_focus();
                     done(state, &r);
-                    if ui.add_enabled(levels.len() > 1, egui::Button::new(t!("action-delete"))).clicked() {
-                        state.dialogs.delete_level = Some(level.id);
+                    // The height up to the next level: the levels above move along.
+                    if let Some(above) = above {
+                        let mut height = above.elevation - level.elevation;
+                        let r = ui.add(level_drag(&mut height).range(LEVEL_GAP..=f64::INFINITY));
+                        if r.changed() {
+                            crate::engine_edit::level_height(state, level.id, Some(key((level.id, "height"))), height);
+                        }
+                        pick |= r.gained_focus();
+                        done(state, &r);
+                    } else {
+                        ui.label(RichText::new("—").color(PALETTE.text_muted));
+                    }
+                    if pick {
+                        state.dialogs.level_selected = Some(level.id);
                     }
                     ui.end_row();
                 }
             });
             ui.add_space(4.0);
-            if ui.button(t!("level-add")).clicked() {
-                actions::add_level(state);
-            }
+            let Some(level) = selected else { return };
+            ui.horizontal(|ui| {
+                for (label, above) in [(t!("level-add-above"), true), (t!("level-add-below"), false)] {
+                    if ui.button(label).clicked()
+                        && let Some(new) = actions::add_level_beside(state, level, above)
+                    {
+                        state.dialogs.level_selected = Some(new);
+                    }
+                }
+                if ui.add_enabled(levels.len() > 1, egui::Button::new(t!("action-delete"))).clicked() {
+                    state.dialogs.delete_level = Some(level);
+                }
+            });
         },
         |f| {
             ok = f.primary(t!("action-ok"));
@@ -265,7 +418,6 @@ fn about(ctx: &Context, state: &mut AppState) {
     let repository = env!("CARGO_PKG_REPOSITORY");
     let mut open_repo = 0;
     let mut check = 0;
-    let auto = &mut state.updates.auto;
     let response = Dialog::new("about", t!("dlg-about")).width(440.0).show(
         ctx,
         |ui| {
@@ -293,7 +445,7 @@ fn about(ctx: &Context, state: &mut AppState) {
                 ui.label(theme::muted(t!("about-author")));
                 // TectSkill BIM is a fork: the original author stays credited.
                 let original = env!("CARGO_PKG_AUTHORS").split(" <").next().unwrap_or_default();
-                ui.label(format!("TectSkill · ConstructCAD: {original}"));
+                ui.label(format!("TectSkill · ConstructCraft: {original}"));
                 ui.end_row();
                 ui.label(theme::muted(t!("about-license-label")));
                 ui.hyperlink_to("GPL-3.0-or-later", "https://www.gnu.org/licenses/gpl-3.0.html");
@@ -302,8 +454,6 @@ fn about(ctx: &Context, state: &mut AppState) {
                 ui.hyperlink_to(repository.trim_start_matches("https://"), repository);
                 ui.end_row();
             });
-            ui.add_space(4.0);
-            ui.checkbox(auto, t!("update-auto")).on_hover_text(t!("update-auto-hint"));
             ui.add_space(8.0);
             ui.label(theme::title(t!("about-credits")));
             for line in [t!("about-built-with"), t!("about-font-credit"), t!("about-icon-credit")] {
@@ -340,7 +490,8 @@ fn update_report(ctx: &Context, state: &mut AppState) {
     }
     let report = updates.report.clone();
     let current = env!("CARGO_PKG_VERSION");
-    let (mut download, mut skip) = (usize::MAX, usize::MAX);
+    let (mut download, mut skip, mut now) = (usize::MAX, usize::MAX, usize::MAX);
+    let installable = matches!(&report, Some(Outcome::Available(r)) if crate::update::plan(r).is_some());
     let mut dialog = Dialog::new("update-check", t!("action-check-updates")).width(420.0);
     if matches!(report, Some(Outcome::Failed | Outcome::Disabled)) {
         dialog = dialog.kind(Kind::Warning);
@@ -370,7 +521,12 @@ fn update_report(ctx: &Context, state: &mut AppState) {
         },
         |f| {
             if matches!(report, Some(Outcome::Available(_))) {
-                download = f.primary(t!("update-download"));
+                if installable {
+                    now = f.primary(t!("update-now"));
+                    download = f.secondary(t!("update-download"));
+                } else {
+                    download = f.primary(t!("update-download"));
+                }
                 skip = f.extra(t!("update-skip"));
                 f.secondary(t!("action-close"));
             } else {
@@ -379,6 +535,12 @@ fn update_report(ctx: &Context, state: &mut AppState) {
         },
     );
     match response.clicked {
+        Some(i) if i == now => {
+            if let Some(Outcome::Available(release)) = &report {
+                updates.update_now(ctx, release);
+            }
+            updates.cancel_report();
+        }
         Some(i) if i == download => {
             if let Some(Outcome::Available(release)) = &report {
                 ctx.open_url(egui::OpenUrl::new_tab(&release.url));
@@ -393,5 +555,140 @@ fn update_report(ctx: &Context, state: &mut AppState) {
         Some(_) => updates.cancel_report(),
         None if response.dismissed => updates.cancel_report(),
         None => {}
+    }
+}
+
+/// Update Now: the download's progress, then what is left to do (restart,
+/// run the installer, drag the app) or why it failed.
+fn update_install(ctx: &Context, state: &mut AppState) {
+    use crate::update::Install;
+    use crate::update_install::Next;
+    use std::sync::atomic::Ordering;
+    let Some(install) = &state.updates.install else { return };
+    let mut ids = [usize::MAX; 3];
+    let mut dialog = Dialog::new("update-install", t!("dlg-update-install")).width(440.0);
+    if matches!(install, Install::Failed(..)) {
+        dialog = dialog.kind(Kind::Warning);
+    }
+    let response = dialog.show(
+        ctx,
+        |ui| match install {
+            Install::Running(version, _, running) => {
+                ui.label(t!("update-downloading", "version" => version.to_string()));
+                let (done, total) =
+                    (running.progress.done.load(Ordering::Relaxed), running.progress.total.load(Ordering::Relaxed));
+                let mb = |b: u64| format!("{:.1}", b as f64 / 1_048_576.0);
+                let bar = if total > 0 {
+                    egui::ProgressBar::new(done as f32 / total as f32).text(format!("{} / {} MB", mb(done), mb(total)))
+                } else {
+                    egui::ProgressBar::new(0.0).animate(true).text(format!("{} MB", mb(done)))
+                };
+                ui.add(bar);
+                ui.label(theme::muted(t!("update-verify-note")));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            Install::Ready(version, Next::Restart(_)) => {
+                ui.label(t!("update-installed-restart", "version" => version.to_string()));
+            }
+            Install::Ready(version, Next::Installer(..)) => {
+                ui.label(t!("update-installer-ready", "version" => version.to_string()));
+            }
+            Install::Ready(_, Next::Opened) => {
+                ui.label(t!("update-dmg-opened"));
+            }
+            Install::Command(command, _) => {
+                ui.label(t!("update-deb-command"));
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(RichText::new(command).monospace()).wrap());
+                    if ui.small_button(t!("update-copy")).clicked() {
+                        ui.ctx().copy_text(command.clone());
+                    }
+                });
+            }
+            Install::Failed(why, _) => {
+                ui.label(t!("update-install-failed"));
+                ui.label(theme::muted(why.clone()));
+            }
+        },
+        |f| match install {
+            Install::Running(..) => {
+                ids[0] = f.secondary(t!("action-cancel"));
+            }
+            Install::Ready(_, Next::Restart(_)) => {
+                ids[0] = f.primary(t!("update-restart"));
+                ids[1] = f.secondary(t!("update-later"));
+            }
+            Install::Ready(_, Next::Installer(..)) => {
+                ids[0] = f.primary(t!("update-install-close"));
+                ids[1] = f.secondary(t!("update-install-on-exit"));
+            }
+            Install::Ready(_, Next::Opened) => {
+                ids[1] = f.primary(t!("action-close"));
+            }
+            Install::Command(..) | Install::Failed(..) => {
+                ids[2] = f.primary(t!("update-download"));
+                ids[1] = f.secondary(t!("action-close"));
+            }
+        },
+    );
+    let Some(clicked) = response.clicked.or(response.dismissed.then_some(usize::MAX - 1)) else { return };
+    let updates = &mut state.updates;
+    match updates.install.take() {
+        Some(Install::Running(version, url, running)) => {
+            if clicked == ids[0] || clicked == usize::MAX - 1 {
+                running.progress.cancel.store(true, Ordering::Relaxed);
+                // The thread ends on its own; its result is no longer read.
+            } else {
+                updates.install = Some(Install::Running(version, url, running));
+            }
+        }
+        Some(Install::Ready(_, next @ (Next::Restart(_) | Next::Installer(..)))) => {
+            let now = clicked == ids[0];
+            // The installer runs when the app closes, now or later; a replaced
+            // copy restarts only when asked (its files are already in place).
+            if now || matches!(next, Next::Installer(..)) {
+                updates.on_exit = Some(next);
+            }
+            if now {
+                actions::guarded(state, crate::state::PendingAction::Quit);
+            }
+        }
+        Some(Install::Command(_, url) | Install::Failed(_, url)) if clicked == ids[2] => {
+            ctx.open_url(egui::OpenUrl::new_tab(&url));
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_fields_are_added_renamed_and_removed() {
+        let mut state = AppState::new(cc_core::Document::new(crate::actions::new_project()));
+        assert!(add_project_field(&mut state));
+        assert!(add_project_field(&mut state));
+        let names: Vec<String> = state.project().info.fields.iter().map(|f| f.name.clone()).collect();
+        let base = t!("info-new-field");
+        assert_eq!(names, [format!("{base} 1"), format!("{base} 2")]);
+        assert!(rename_project_field(&mut state, &names[0], "Engineer"));
+        assert_eq!(state.project().info.field("Engineer"), Some(""));
+        // Empty and taken names are refused.
+        assert!(!rename_project_field(&mut state, "Engineer", " "));
+        assert!(!rename_project_field(&mut state, "Engineer", &names[1]));
+        assert_eq!(state.message, t!("msg-field-name-taken"));
+        // So are names a text could not read as `{project:Name}`.
+        let depth = state.session.doc.undo_depth();
+        for bad in ["Eng{x}", "a}b", &"n".repeat(193)] {
+            state.message.clear();
+            assert!(!rename_project_field(&mut state, "Engineer", bad), "{bad}");
+            assert_eq!(state.message, t!("msg-field-name-invalid"));
+        }
+        assert_eq!(state.session.doc.undo_depth(), depth);
+        assert!(rename_project_field(&mut state, "Engineer", &"n".repeat(192)));
+        assert!(rename_project_field(&mut state, &"n".repeat(192), "Engineer"));
+        assert!(remove_project_field(&mut state, "Engineer"));
+        assert_eq!(state.project().info.fields.len(), 1);
     }
 }

@@ -8,11 +8,11 @@ use crate::state::AppState;
 use crate::t;
 use crate::theme::{self, PALETTE};
 use cc_core::Material;
-use cc_core::material::{Behavior, Finish, MaterialClass, Pattern, PatternFill};
+use cc_core::material::{Behavior, Finish, MaterialClass, PatternFill};
 use cc_engine::Ref;
 use cc_engine::commands::materials;
+use cc_views::format;
 use egui::{Color32, Context, DragValue, Pos2, Rect, RichText, Sense, Stroke, Ui, vec2};
-use glam::DVec2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tab {
@@ -90,7 +90,10 @@ fn body(ui: &mut Ui, state: &mut AppState) {
     // inherit the row's horizontal layout and line every field up side by
     // side, making the dialog far wider than the screen.)
     let list_w = 270.0;
-    let details_w = (ui.available_width() - list_w - 16.0).max(300.0);
+    // What the list, the divider and the gaps around it leave.
+    const DIVIDER_W: f32 = 9.0;
+    let gaps = 2.0 * ui.spacing().item_spacing.x;
+    let details_w = (ui.available_width() - list_w - DIVIDER_W - gaps).max(300.0);
     let column = egui::Layout::top_down(egui::Align::Min);
     ui.horizontal_top(|ui| {
         ui.allocate_ui_with_layout(vec2(list_w, height), column, |ui| {
@@ -100,7 +103,7 @@ fn body(ui: &mut Ui, state: &mut AppState) {
         });
         // A fixed-height divider: `ui.separator()` in a row stretches to the
         // available height, which is unbounded in a modal.
-        let (divider, _) = ui.allocate_exact_size(vec2(9.0, height), Sense::hover());
+        let (divider, _) = ui.allocate_exact_size(vec2(DIVIDER_W, height), Sense::hover());
         ui.painter().vline(divider.center().x, divider.y_range(), Stroke::new(1.0, PALETTE.border));
         ui.allocate_ui_with_layout(vec2(details_w, height), column, |ui| {
             ui.set_width(details_w);
@@ -117,38 +120,29 @@ fn body(ui: &mut Ui, state: &mut AppState) {
 }
 
 /// Small swatch: the shading color with the surface pattern over it.
-fn swatch(painter: &egui::Painter, rect: Rect, m: &Material) {
+fn swatch(painter: &egui::Painter, rect: Rect, m: &Material, project: &cc_core::Project) {
     let [r, g, b] = m.shading_color();
     painter.rect_filled(rect, 3.0, Color32::from_rgb(r, g, b));
     let fill = if m.graphics.surface.is_empty() { &m.graphics.cut } else { &m.graphics.surface };
-    paint_pattern(&painter.with_clip_rect(rect), rect.shrink(1.0), fill, 6.0, false);
+    paint_pattern(&painter.with_clip_rect(rect), rect.shrink(1.0), fill, 6.0, false, project);
     painter.rect_stroke(rect, 3.0, Stroke::new(1.0, PALETTE.border_strong), egui::StrokeKind::Inside);
 }
 
 /// Paint a pattern fill into `rect` with lines `spacing` points apart.
-fn paint_pattern(painter: &egui::Painter, rect: Rect, fill: &PatternFill, spacing: f64, background: bool) {
-    let poly: Vec<DVec2> = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()]
-        .iter()
-        .map(|p| DVec2::new(p.x as f64, p.y as f64))
-        .collect();
-    let layer = |pattern: Pattern, color: [u8; 3]| {
-        let c = Color32::from_rgb(color[0], color[1], color[2]);
-        if pattern == Pattern::Solid {
-            painter.rect_filled(rect, 0.0, c);
-            return;
-        }
-        for (a, b) in cc_views::hatch::hatch(pattern, &poly, spacing) {
-            painter.line_segment(
-                [Pos2::new(a.x as f32, a.y as f32), Pos2::new(b.x as f32, b.y as f32)],
-                Stroke::new(1.0, c),
-            );
-        }
-    };
+fn paint_pattern(
+    painter: &egui::Painter,
+    rect: Rect,
+    fill: &PatternFill,
+    spacing: f64,
+    background: bool,
+    project: &cc_core::Project,
+) {
     if background {
         painter.rect_filled(rect, 0.0, Color32::WHITE);
     }
-    layer(fill.background, fill.background_color);
-    layer(fill.foreground, fill.foreground_color);
+    for (pattern, color) in [(fill.background, fill.background_color), (fill.foreground, fill.foreground_color)] {
+        crate::fill_patterns_dialog::paint(painter, rect, project, pattern, color, spacing);
+    }
 }
 
 fn list(ui: &mut Ui, state: &mut AppState, height: f32) {
@@ -186,7 +180,7 @@ fn list(ui: &mut Ui, state: &mut AppState, height: f32) {
                         ui.painter().rect_filled(rect, 0.0, PALETTE.hover);
                     }
                     let sw = Rect::from_min_size(rect.left_top() + vec2(6.0, 5.0), vec2(24.0, 24.0));
-                    swatch(ui.painter(), sw, m);
+                    swatch(ui.painter(), sw, m, state.project());
                     ui.painter().text(
                         rect.left_center() + vec2(38.0, -6.0),
                         egui::Align2::LEFT_CENTER,
@@ -409,10 +403,20 @@ fn optional_value(
 ) {
     ui.horizontal(|ui| {
         let mut on = value.is_some();
-        if ui.checkbox(&mut on, "").changed() {
+        if crate::table::checkbox(ui, &mut on).changed() {
             update(state, &m.name, field, |x| set(x, if on { Some(value.unwrap_or(0.0)) } else { None }));
         }
-        if let Some(mut v) = value {
+        // Densities and strengths read in lb/ft³ and ksi in imperial projects.
+        let quantity = match unit {
+            "kg/m³" => Some(format::Quantity::Density),
+            "MPa" => Some(format::Quantity::Stress),
+            _ => None,
+        };
+        let system = format::system();
+        let per = quantity.map_or(1.0, |q| q.per_si(system));
+        let unit = quantity.map_or(unit, |q| q.symbol(system));
+        if let Some(stored) = value {
+            let mut v = stored * per;
             let speed = (v.abs() * 0.01).max(1e-6);
             let small = v != 0.0 && v.abs() < 1e-3;
             let mut drag = DragValue::new(&mut v).speed(speed);
@@ -428,7 +432,7 @@ fn optional_value(
             }
             let r = ui.add(drag);
             if r.changed() {
-                update(state, &m.name, field, |x| set(x, Some(v)));
+                update(state, &m.name, field, |x| set(x, Some(v / per)));
             }
             done(state, &r);
         } else {
@@ -476,11 +480,7 @@ fn pattern_rows(
         };
         ui.label(theme::muted(t!("mat-pattern")));
         let mut p = pattern;
-        egui::ComboBox::from_id_salt((which, layer)).selected_text(tr(p.key())).width(200.0).show_ui(ui, |ui| {
-            for option in Pattern::ALL {
-                ui.selectable_value(&mut p, option, tr(option.key()));
-            }
-        });
+        crate::fill_patterns_dialog::picker(ui, (which, layer), state.project(), &mut p, 170.0);
         if p != pattern {
             let mut f = fill;
             if layer == 0 {
@@ -506,7 +506,7 @@ fn pattern_rows(
     }
     ui.label(theme::muted(t!("mat-preview")));
     let (rect, _) = ui.allocate_exact_size(vec2(200.0, 60.0), Sense::hover());
-    paint_pattern(&ui.painter().with_clip_rect(rect), rect, &fill, 7.0, true);
+    paint_pattern(&ui.painter().with_clip_rect(rect), rect, &fill, 7.0, true, state.project());
     ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, PALETTE.border_strong), egui::StrokeKind::Inside);
     ui.end_row();
 }
@@ -536,6 +536,10 @@ fn graphics(ui: &mut Ui, state: &mut AppState, m: &Material) {
     });
     heading(ui, t!("mat-cut-pattern"));
     grid(ui, "mat-cut", |ui| pattern_rows(ui, state, m, "cut", m.graphics.cut, |x, f| x.graphics.cut = f));
+    ui.add_space(4.0);
+    if ui.button(t!("fp-manage")).on_hover_text(t!("cmd-desc-fill-patterns")).clicked() {
+        crate::fill_patterns_dialog::open(state);
+    }
 }
 
 /// A shaded sphere in the appearance color, with a highlight by finish.
@@ -596,6 +600,104 @@ fn appearance(ui: &mut Ui, state: &mut AppState, m: &Material) {
             |m, v| m.appearance.description = v,
         );
     });
+    texture(ui, state, m);
+}
+
+/// Picture files a texture is read from.
+const TEXTURE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "bmp", "webp"];
+
+/// The material's texture: a thumbnail, loading and clearing the image, and
+/// the size, offset and rotation of one repeat on the faces.
+fn texture(ui: &mut Ui, state: &mut AppState, m: &Material) {
+    heading(ui, t!("mat-texture"));
+    let tex = m.appearance.texture.as_ref();
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(72.0, 72.0), Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 3.0, Color32::from_gray(70));
+        match tex.and_then(|t| crate::paint::image_texture(ui.ctx(), &t.image, false)) {
+            Some(handle) => {
+                let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                painter.image(handle.id(), rect.shrink(2.0), uv, Color32::WHITE);
+            }
+            None => {
+                let c = m.appearance.color;
+                painter.rect_filled(rect.shrink(2.0), 2.0, Color32::from_rgb(c[0], c[1], c[2]));
+            }
+        }
+        ui.vertical(|ui| {
+            match tex {
+                Some(t) => {
+                    ui.label(theme::muted(t!("mat-texture-pixels", "w" => t.image.width, "h" => t.image.height)))
+                }
+                None => ui.label(theme::muted(t!("mat-texture-none"))),
+            };
+            ui.horizontal(|ui| {
+                if ui.button(t!("mat-texture-load")).clicked() {
+                    let mut dialog = rfd::FileDialog::new().add_filter(t!("file-filter-image"), &TEXTURE_EXTENSIONS);
+                    if let Some(dir) = state.prefs.projects_dir() {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    if let Some(path) = dialog.pick_file() {
+                        let command = materials::MaterialTextureSet {
+                            material: Ref::Name(m.name.clone()),
+                            path: Some(path),
+                            data: None,
+                            width: None,
+                            height: None,
+                            offset: None,
+                            rotation: None,
+                        };
+                        crate::actions::run_command(state, command);
+                    }
+                }
+                if tex.is_some() && ui.button(t!("mat-texture-clear")).clicked() {
+                    let command = materials::MaterialTextureClear { material: Ref::Name(m.name.clone()) };
+                    crate::actions::run_command(state, command);
+                }
+            });
+        });
+    });
+    let Some(t) = tex else { return };
+    let (lo, hi) = (cc_core::material::MIN_TEXTURE_SIZE, cc_core::material::MAX_TEXTURE_SIZE);
+    grid(ui, "mat-texture", |ui| {
+        type Set = fn(&mut cc_core::material::MaterialTexture, f64);
+        let rows: [(String, &str, f64, Set); 4] = [
+            (t!("mat-texture-width"), "tex-w", t.width, |x, v| x.width = v),
+            (t!("mat-texture-height"), "tex-h", t.height, |x, v| x.height = v),
+            (t!("mat-texture-offset-x"), "tex-x", t.offset[0], |x, v| x.offset[0] = v),
+            (t!("mat-texture-offset-y"), "tex-y", t.offset[1], |x, v| x.offset[1] = v),
+        ];
+        for (i, (label, field, value, set)) in rows.into_iter().enumerate() {
+            ui.label(theme::muted(label));
+            let mut v = value;
+            let drag = crate::properties::length_drag(&mut v);
+            // Sizes stay positive; offsets may be anything.
+            let r = ui.add(if i < 2 { drag.range(lo..=hi) } else { drag.range(-1e5..=1e5) });
+            if r.changed() {
+                update(state, &m.name, field, |x| {
+                    if let Some(t) = x.appearance.texture.as_mut() {
+                        set(t, v);
+                    }
+                });
+            }
+            done(state, &r);
+            ui.end_row();
+        }
+        ui.label(theme::muted(t!("prop-rotation")));
+        let mut r = t.rotation_deg;
+        let resp = ui.add(DragValue::new(&mut r).speed(1.0).suffix("°"));
+        if resp.changed() {
+            update(state, &m.name, "tex-r", |x| {
+                if let Some(t) = x.appearance.texture.as_mut() {
+                    t.rotation_deg = r.rem_euclid(360.0);
+                }
+            });
+        }
+        done(state, &resp);
+        ui.end_row();
+    });
+    ui.label(theme::muted(t!("mat-texture-hint")));
 }
 
 /// A physical property row: key, value, unit and setter.

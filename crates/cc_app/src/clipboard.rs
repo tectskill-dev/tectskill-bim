@@ -65,7 +65,9 @@ pub fn cut(ctx: &egui::Context, state: &mut AppState) {
 }
 
 /// Ctrl+V: place the clipboard with a click in a plan view; elsewhere paste
-/// it where it was copied.
+/// it where it was copied. What was drawn in a view (detail lines, regions,
+/// notes, dimensions…) goes into the active view when it is a 2D view that
+/// holds such elements, else back into its own view.
 pub fn paste(state: &mut AppState) {
     if state.clipboard.is_empty() {
         state.message = t!("msg-clipboard-empty");
@@ -93,11 +95,21 @@ pub fn paste_aligned(state: &mut AppState, current_level: bool) {
     paste_with(state, DVec2::ZERO, level);
 }
 
+/// The view the clipboard's view-owned elements paste into: the active one,
+/// when it is a 2D view that holds detailing.
+fn target_view(state: &AppState) -> Option<ViewId> {
+    let id = state.active_view?;
+    let view = state.project().view(id)?;
+    let owned = state.clipboard.elements.iter().any(|e| e.owner_view().is_some());
+    (owned && cc_views::hosts_cad(&view.kind)).then_some(id)
+}
+
 fn paste_with(state: &mut AppState, delta: DVec2, level: Option<LevelId>) {
     let command = cc_engine::commands::modify::ElementsPaste {
         elements: serde_json::to_value(&state.clipboard.elements).unwrap_or_default(),
         delta: Some(delta.to_array()),
         level: level.map(|l| cc_engine::Ref::Id(l.0)),
+        view: target_view(state).map(|v| cc_engine::Ref::Id(v.0)),
     };
     let Some(out) = crate::actions::run_command(state, command) else { return };
     let new: Vec<ElementId> = out["created"]
@@ -118,6 +130,7 @@ fn preview(state: &mut AppState, view: ViewId, level: LevelId) -> Option<(Rc<Dra
     {
         return Some((p.drawing.clone(), p.ids.clone(), p.anchor));
     }
+    let target = target_view(state);
     let mut project = state.project().clone();
     let elements = &state.clipboard.elements;
     let copied: BTreeSet<ElementId> = elements.iter().map(|e| e.id).collect();
@@ -127,18 +140,23 @@ fn preview(state: &mut AppState, view: ViewId, level: LevelId) -> Option<(Rc<Dra
         .filter(|h| !copied.contains(&h.host))
         .filter_map(|h| project.element(h.host).cloned())
         .collect();
-    project.elements = elements
+    let pasted: Vec<Element> = elements
         .iter()
         .cloned()
         .map(|mut e| {
+            // Detailing shows in the view it will be pasted into.
+            if let Some(target) = target {
+                e.set_owner_view(target);
+            }
             if e.as_hosted().is_none_or(|h| copied.contains(&h.host)) {
+                // As the paste does it: tops move up with the base.
+                project.move_top_with_base(&mut e, level);
                 e.level = level;
             }
             e
         })
-        .chain(hosts)
-        .map(|e| (e.id, e))
         .collect();
+    project.elements = pasted.into_iter().chain(hosts).map(|e| (e.id, e)).collect();
     let geom = cc_geom::ModelGeometry::build(&project);
     let drawing = Rc::new(cc_views::generate(&project, &geom, project.view(view)?)?);
     let pts = drawing.prims.iter().flat_map(|p| match p {
@@ -297,5 +315,43 @@ mod tests {
         let w = state.project().element(wall).and_then(|e| e.as_wall()).unwrap();
         // The anchor lies near the wall's middle (its faces surround the axis).
         assert!(anchor.distance((w.start + w.end) * 0.5) < 0.5, "{anchor}");
+    }
+
+    #[test]
+    fn detailing_pastes_into_the_active_view() {
+        let mut state = sample();
+        let plan = state.project().views.values().find(|v| v.is_plan()).map(|v| v.id).unwrap();
+        let out = state
+            .session
+            .execute(
+                "filled_region_create",
+                serde_json::json!({"view": plan.0, "curves": [{"kind": "rectangle", "corner": [0, 0], "opposite": [3, 2]}]}),
+            )
+            .unwrap();
+        let region = ElementId(out["id"].as_u64().unwrap());
+        let other = state.session.execute("view_duplicate", serde_json::json!({"view": plan.0})).unwrap();
+        let other = ViewId(other["id"].as_u64().unwrap());
+        state.selection = [region].into_iter().collect();
+        copy(&egui::Context::default(), &mut state);
+
+        // Shown in the preview of the plan it goes to, then pasted there.
+        state.active_view = Some(other);
+        let level = state.active_level().unwrap();
+        let (_, ids, _) = preview(&mut state, other, level).expect("the region previews in the other plan");
+        assert!(ids.contains(&region));
+        paste_aligned(&mut state, false);
+        let pasted: Vec<ElementId> = state.selection.iter().copied().collect();
+        assert_eq!(pasted.len(), 1);
+        assert_eq!(state.project().element(pasted[0]).and_then(|e| e.owner_view()), Some(other));
+
+        // From a 3D view it goes back into its own plan.
+        let three_d = state.project().views.values().find(|v| v.category() == cc_core::ViewCategory::ThreeD);
+        state.active_view = three_d.map(|v| v.id);
+        assert!(state.active_view.is_some(), "the sample has a 3D view");
+        state.selection = [region].into_iter().collect();
+        copy(&egui::Context::default(), &mut state);
+        paste_aligned(&mut state, false);
+        let pasted = state.selection.first().copied().unwrap();
+        assert_eq!(state.project().element(pasted).and_then(|e| e.owner_view()), Some(plan));
     }
 }

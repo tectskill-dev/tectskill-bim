@@ -9,15 +9,13 @@ use crate::icons::{self, Icon};
 use crate::state::AppState;
 use crate::t;
 use crate::table::{header_block, padded, readonly_row, row, section};
-use crate::theme::{self, PALETTE};
-use cc_core::{Category, Element, ElementId, ElementKind, RoofShape, SheetSize, ViewId, ViewKind};
+use crate::theme::PALETTE;
+use cc_core::{Category, Element, ElementId, ElementKind, RoofShape, SystemClass, ViewId, ViewKind};
 use cc_views::format;
 use egui::{DragValue, Response, RichText, Sense, Ui, vec2};
 use std::hash::{Hash, Hasher};
 
-const SCALES: [u32; 9] = [10, 20, 25, 50, 75, 100, 200, 500, 1000];
-
-fn key(parts: impl Hash) -> u64 {
+pub(crate) fn key(parts: impl Hash) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     parts.hash(&mut h);
     h.finish()
@@ -55,7 +53,12 @@ fn level_row(ui: &mut Ui, state: &mut AppState, el: &Element) {
     let mut level = el.level;
     let levels: Vec<_> = state.project().levels.iter().map(|l| (l.id, l.name.clone())).collect();
     let selected = state.project().level_name(el.level).to_string();
-    row(ui, &t!("prop-level"), |ui| {
+    let label = if cc_engine::element_params(&el.kind).get("top").is_some() {
+        t!("prop-base-constraint")
+    } else {
+        t!("prop-level")
+    };
+    row(ui, &label, |ui| {
         egui::ComboBox::from_id_salt(("level", el.id.0)).selected_text(selected).show_ui(ui, |ui| {
             for (id, name) in levels {
                 ui.selectable_value(&mut level, id, name);
@@ -96,19 +99,39 @@ fn dimension_value_row(ui: &mut Ui, state: &mut AppState, id: ElementId, d: &cc_
 
 fn text_row(ui: &mut Ui, label: &str, value: String) -> (Response, String) {
     let mut text = value;
-    let r = row(ui, label, |ui| ui.text_edit_singleline(&mut text));
+    let r = row(ui, label, |ui| {
+        crate::table::live_text(ui, ("prop-text", label), &mut text, |ui, t| ui.text_edit_singleline(t))
+    });
     (r, text)
 }
 
-/// Panel entry point.
+/// The properties palette with its header (the app docks it with `side_panels`).
+#[cfg(test)]
 pub fn show(ui: &mut Ui, state: &mut AppState) {
-    theme::panel_header(ui, &t!("props-title"), None);
+    crate::theme::panel_header(ui, &t!("props-title"), None);
+    body(ui, state);
+}
+
+/// The properties of the selection (or the active view), under a header drawn by the caller.
+pub fn body(ui: &mut Ui, state: &mut AppState) {
     egui::ScrollArea::vertical().id_salt("props").auto_shrink([false, false]).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
+        // An open sketch shows its selected curve.
+        if state.sketch.is_some() {
+            crate::sketch_mode::properties(ui, state);
+            return;
+        }
         if let Some((sheet, index)) = state.sheet_selection
             && state.active_view == Some(sheet)
         {
             viewport_props(ui, state, sheet, index);
+            return;
+        }
+        if state.selection.is_empty()
+            && let Some(section) = state.section_selection
+            && state.project().view(section).is_some()
+        {
+            view_props(ui, state, section);
             return;
         }
         match state.selection.len() {
@@ -131,23 +154,354 @@ pub fn show(ui: &mut Ui, state: &mut AppState) {
 }
 
 fn multi_props(ui: &mut Ui, state: &mut AppState, n: usize) {
+    let mut counts = std::collections::BTreeMap::new();
+    for id in &state.selection {
+        if let Some(e) = state.project().element(*id) {
+            *counts.entry(e.category()).or_insert(0) += 1;
+        }
+    }
+    let single = (counts.len() == 1).then(|| counts.keys().next().copied()).flatten();
     padded(ui, |ui| {
         header_block(ui, Icon::Select, &t!("props-multi", "count" => n), "");
-        let mut counts = std::collections::BTreeMap::new();
-        for id in &state.selection {
-            if let Some(e) = state.project().element(*id) {
-                *counts.entry(e.category()).or_insert(0) += 1;
-            }
-        }
-        for (c, k) in counts {
+        for (c, k) in &counts {
             ui.horizontal(|ui| {
                 let (r, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
-                icons::paint(ui.painter(), r, crate::ribbon::category_icon(c), PALETTE.text_muted);
-                ui.label(format!("{}: {k}", actions::t_category(c)));
+                icons::paint(ui.painter(), r, crate::ribbon::category_icon(*c), PALETTE.text_muted);
+                ui.label(format!("{}: {k}", actions::t_category(*c)));
             });
         }
         if ui.button(t!("action-delete")).clicked() {
             state.delete_selection();
+        }
+    });
+    if let Some(category) = single {
+        multi_edit(ui, state, category);
+    }
+}
+
+/// How a parameter shared by the selection is edited.
+#[derive(Clone, Copy, PartialEq)]
+enum Shared {
+    Length,
+    Angle,
+    Flag,
+}
+
+/// The parameters several elements of one category are changed together by:
+/// their path in `element_get`'s `params`, label and kind.
+const SHARED: [(&[&str], &str, Shared); 14] = [
+    (&["base_offset"], "prop-base-offset", Shared::Length),
+    (&["height"], "prop-height", Shared::Length),
+    (&["top", "Level", "offset"], "prop-top-offset", Shared::Length),
+    (&["top_offset"], "prop-top-offset", Shared::Length),
+    (&["height_offset"], "prop-height-offset", Shared::Length),
+    (&["sill_height"], "prop-sill", Shared::Length),
+    (&["overhang"], "prop-overhang", Shared::Length),
+    (&["rotation_deg"], "prop-rotation", Shared::Angle),
+    (&["structural"], "prop-structural", Shared::Flag),
+    (&["room_bounding"], "prop-room-bounding", Shared::Flag),
+    (&["flip_facing"], "prop-flip-facing", Shared::Flag),
+    (&["flip_hand"], "prop-flip-hand", Shared::Flag),
+    (&["join_start"], "prop-join-start", Shared::Flag),
+    (&["join_end"], "prop-join-end", Shared::Flag),
+];
+
+/// The value at `path` of a JSON object.
+fn at_path<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
+    path.iter().try_fold(v, |v, k| v.get(*k))
+}
+
+/// The patch that sets `path` to `value`.
+fn patch_at(path: &[&str], value: serde_json::Value) -> serde_json::Value {
+    path.iter().rev().fold(value, |v, k| serde_json::json!({ *k: v }))
+}
+
+/// The selected elements and their parameters as the multi-selection rows read them, kept while
+/// the document and the selection stay the same (copying and serializing every selected element
+/// each frame is costly for large selections).
+pub struct MultiSummary {
+    revision: u64,
+    ids: Vec<ElementId>,
+    elements: Vec<cc_core::Element>,
+    params: Vec<serde_json::Value>,
+}
+
+/// The summary of the current selection, from the cache when it is still current; `None` when a
+/// selected element is missing.
+fn multi_summary(state: &mut AppState) -> Option<std::sync::Arc<MultiSummary>> {
+    let revision = state.session.doc.revision();
+    if let Some(s) = &state.multi_summary
+        && s.revision == revision
+        && s.ids.iter().eq(state.selection.iter())
+    {
+        return Some(s.clone());
+    }
+    let ids: Vec<ElementId> = state.selection.iter().copied().collect();
+    let elements: Vec<cc_core::Element> = ids.iter().filter_map(|id| state.project().element(*id).cloned()).collect();
+    if elements.len() != ids.len() {
+        state.multi_summary = None;
+        return None;
+    }
+    let params = elements.iter().map(|e| cc_engine::element_params(&e.kind)).collect();
+    let summary = std::sync::Arc::new(MultiSummary { revision, ids, elements, params });
+    state.multi_summary = Some(summary.clone());
+    Some(summary)
+}
+
+/// The type, level and shared parameters of several elements of one
+/// category, changed on all of them at once; a value that differs among
+/// them is marked, and typing one sets it on every element.
+fn multi_edit(ui: &mut Ui, state: &mut AppState, category: Category) {
+    let Some(summary) = multi_summary(state) else { return };
+    let MultiSummary { ids, elements, params, .. } = &*summary;
+    let (ids, elements, params) = (ids.as_slice(), elements.as_slice(), params.as_slice());
+
+    section(ui, "multi-type", t!("section-type"), |ui| {
+        // The type: one of the category's, or marked when they differ.
+        let types: Vec<_> = state.project().types_of(category).map(|t| (t.id, t.name.clone())).collect();
+        let first = elements[0].type_id;
+        let same_type = elements.iter().all(|e| e.type_id == first);
+        let mut type_id = same_type.then_some(first);
+        row(ui, &t!("prop-type"), |ui| {
+            let shown = type_id.map_or_else(|| t!("props-varies"), |t| state.project().type_name(t).to_string());
+            egui::ComboBox::from_id_salt("multi-type").selected_text(shown).show_ui(ui, |ui| {
+                for (tid, name) in &types {
+                    ui.selectable_value(&mut type_id, Some(*tid), name);
+                }
+            });
+        });
+        if let Some(t) = type_id.filter(|t| !same_type || *t != first) {
+            let command = cc_engine::commands::edit::ElementsSetType {
+                ids: ids.iter().map(|id| id.0).collect(),
+                type_ref: cc_engine::Ref::Id(t.0),
+            };
+            actions::run_command(state, command);
+        }
+        // The level, for elements that stand on one (doors and windows follow their walls).
+        if !matches!(category, Category::Door | Category::Window | Category::Niche) {
+            let level0 = elements[0].level;
+            let same_level = elements.iter().all(|e| e.level == level0);
+            let mut level = same_level.then_some(level0);
+            let levels: Vec<_> = state.project().levels.iter().map(|l| (l.id, l.name.clone())).collect();
+            // Elements with a top constraint stand on their base constraint.
+            let label = if params.iter().all(|p| p.get("top").is_some()) {
+                t!("prop-base-constraint")
+            } else {
+                t!("prop-level")
+            };
+            row(ui, &label, |ui| {
+                let shown = level.map_or_else(|| t!("props-varies"), |l| state.project().level_name(l).to_string());
+                egui::ComboBox::from_id_salt("multi-level").selected_text(shown).show_ui(ui, |ui| {
+                    for (lid, name) in &levels {
+                        ui.selectable_value(&mut level, Some(*lid), name);
+                    }
+                });
+            });
+            if let Some(l) = level.filter(|l| !same_level || *l != level0) {
+                crate::engine_edit::elements(state, ids, None, Some(l), None);
+            }
+        }
+    });
+
+    // The shared parameters every selected element has (a height only where
+    // the top is not attached to a level).
+    let attached = params.iter().any(|p| at_path(p, &["top", "Level"]).is_some());
+    let fields: Vec<_> = SHARED
+        .iter()
+        .filter(|(path, _, kind)| {
+            if *path == ["height"] && attached {
+                return false;
+            }
+            params.iter().all(|p| match (at_path(p, path), kind) {
+                (Some(v), Shared::Flag) => v.is_boolean(),
+                (Some(v), _) => v.is_number(),
+                (None, _) => false,
+            })
+        })
+        .collect();
+    let tops = params.iter().all(|p| p.get("top").is_some_and(|t| t.is_string() || t.get("Level").is_some()));
+    let located = params.iter().all(|p| p.get("location_line").is_some_and(|v| v.is_string()));
+    let shown = !fields.is_empty() || tops || located;
+    if shown {
+        section(ui, "multi-params", t!("section-constraints"), |ui| {
+            // In the order of one element's rows: location, base offset, top, the rest.
+            let (base, rest): (Vec<_>, Vec<_>) = fields.iter().partition(|f| f.0 == ["base_offset"]);
+            if located {
+                multi_location_line(ui, state, ids, params);
+            }
+            shared_rows(ui, state, ids, params, &base, tops);
+            if tops {
+                multi_top(ui, state, ids, elements, params);
+            }
+            shared_rows(ui, state, ids, params, &rest, tops);
+        });
+    }
+    multi_identity(ui, state, ids, elements, category);
+}
+
+/// Rows of the shared parameters in `fields`, each changed on every element.
+fn shared_rows(
+    ui: &mut Ui,
+    state: &mut AppState,
+    ids: &[ElementId],
+    params: &[serde_json::Value],
+    fields: &[&(&[&str], &str, Shared)],
+    tops: bool,
+) {
+    let common = |values: Vec<String>| values.windows(2).all(|w| w[0] == w[1]);
+    let key_of = |field: &str| key(("multi", field, ids.first().map_or(0, |id| id.0)));
+    for (path, label, kind) in fields.iter().map(|f| (f.0, f.1, &f.2)) {
+        // The height of elements with a top constraint is their unconnected height.
+        let label = if path == ["height"] && tops { "prop-unconnected-height" } else { label };
+        let values: Vec<&serde_json::Value> = params.iter().filter_map(|p| at_path(p, path)).collect();
+        let same = common(values.iter().map(|v| v.to_string()).collect());
+        let field = path.join(".");
+        match kind {
+            Shared::Flag => {
+                let mut on = values.first().and_then(|v| v.as_bool()).unwrap_or(false);
+                // Differing values show as an indeterminate box.
+                let r = row(ui, &crate::i18n::tr(label), |ui| {
+                    ui.add(crate::table::boxed(egui::Checkbox::without_text(&mut on).indeterminate(!same)))
+                });
+                if r.changed() {
+                    crate::engine_edit::elements(state, ids, None, None, Some(patch_at(path, on.into())));
+                }
+            }
+            Shared::Length | Shared::Angle => {
+                let mut v = values.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let r = row(ui, &crate::i18n::tr(label), |ui| {
+                    let drag = match (kind, same) {
+                        (Shared::Angle, true) => DragValue::new(&mut v).speed(1.0).suffix("°"),
+                        (_, true) => length_drag(&mut v),
+                        // Differing values show as such until one is typed or dragged.
+                        (Shared::Angle, false) => {
+                            let varies = t!("props-varies");
+                            DragValue::new(&mut v).speed(1.0).custom_formatter(move |_, _| varies.clone())
+                        }
+                        (_, false) => {
+                            let varies = t!("props-varies");
+                            let (units, _) = format::current();
+                            DragValue::new(&mut v)
+                                .speed(0.005)
+                                .custom_formatter(move |_, _| varies.clone())
+                                .custom_parser(move |s| format::parse_length_with(&units, s))
+                        }
+                    };
+                    ui.add(drag)
+                });
+                if r.changed() && v.is_finite() {
+                    let v = if *kind == Shared::Angle { v.rem_euclid(360.0) } else { v };
+                    let k = Some(key_of(&field));
+                    crate::engine_edit::elements(state, ids, k, None, Some(patch_at(path, v.into())));
+                }
+                finish(state, &r);
+            }
+        }
+    }
+}
+
+/// The location line of several walls.
+fn multi_location_line(ui: &mut Ui, state: &mut AppState, ids: &[ElementId], params: &[serde_json::Value]) {
+    use cc_core::LocationLine;
+    let of =
+        |p: &serde_json::Value| -> Option<LocationLine> { serde_json::from_value(p["location_line"].clone()).ok() };
+    let first = params.first().and_then(of);
+    let same = params.iter().all(|p| of(p) == first);
+    let current = if same { first } else { None };
+    let mut choice = current;
+    row(ui, &t!("prop-location-line"), |ui| {
+        let shown = choice.map_or_else(|| t!("props-varies"), |l| tr(l.key()));
+        egui::ComboBox::from_id_salt("multi-location").selected_text(shown).show_ui(ui, |ui| {
+            for l in LocationLine::ALL {
+                ui.selectable_value(&mut choice, Some(l), tr(l.key()));
+            }
+        });
+    });
+    if let Some(l) = choice.filter(|_| choice != current) {
+        let value = serde_json::to_value(l).unwrap_or_default();
+        crate::engine_edit::elements(state, ids, None, None, Some(serde_json::json!({ "location_line": value })));
+    }
+}
+
+/// The top constraint of several walls, columns, stairs, ramps or shafts:
+/// unconnected or up to a level. Walls switched to unconnected keep their
+/// height, as one wall does.
+fn multi_top(ui: &mut Ui, state: &mut AppState, ids: &[ElementId], elements: &[Element], params: &[serde_json::Value]) {
+    // `None`: unconnected; `Some(level)`: up to it.
+    let of = |p: &serde_json::Value| -> Option<cc_core::LevelId> {
+        at_path(p, &["top", "Level", "level"]).and_then(|v| v.as_u64()).map(cc_core::LevelId)
+    };
+    let first = params.first().and_then(of);
+    let same = params.iter().all(|p| of(p) == first);
+    let levels: Vec<_> = state.project().levels.iter().map(|l| (l.id, l.name.clone())).collect();
+    let label = |top: Option<cc_core::LevelId>| match top {
+        None => t!("top-unconnected"),
+        Some(level) => {
+            t!("top-up-to", "level" => levels.iter().find(|l| l.0 == level).map_or("?", |l| l.1.as_str()))
+        }
+    };
+    // `None` while the elements differ, until one is picked.
+    let current = same.then_some(first);
+    let mut choice = current;
+    row(ui, &t!("prop-top-constraint"), |ui| {
+        let shown = choice.map_or_else(|| t!("props-varies"), label);
+        egui::ComboBox::from_id_salt("multi-top").selected_text(shown).show_ui(ui, |ui| {
+            ui.selectable_value(&mut choice, Some(None), t!("top-unconnected"));
+            for (lid, _) in &levels {
+                ui.selectable_value(&mut choice, Some(Some(*lid)), label(Some(*lid)));
+            }
+        });
+    });
+    let Some(picked) = choice.filter(|_| choice != current) else { return };
+    match picked {
+        // Up to a level: those already up to one keep their offsets.
+        Some(level) => {
+            let top = if params.iter().all(|p| of(p).is_some()) {
+                serde_json::json!({ "Level": { "level": level.0 } })
+            } else {
+                serde_json::json!({ "Level": { "level": level.0, "offset": 0.0 } })
+            };
+            crate::engine_edit::elements(state, ids, None, None, Some(serde_json::json!({ "top": top })));
+        }
+        // Unconnected, each wall at its current height, in one undo step.
+        None => {
+            let k = key(("multi-top", ids.first().map_or(0, |id| id.0)));
+            for e in elements {
+                let mut patch = serde_json::json!({ "top": "Unconnected" });
+                if let ElementKind::Wall(w) = &e.kind {
+                    patch["height"] = state.project().wall_height(e, w).into();
+                }
+                crate::engine_edit::elements(state, &[e.id], Some(k), None, Some(patch));
+            }
+            state.session.doc.break_merge();
+        }
+    }
+}
+
+/// The mark (model elements) and comments of several elements: the value
+/// they share, or empty with the hint that they differ; typing sets it on
+/// every element.
+fn multi_identity(ui: &mut Ui, state: &mut AppState, ids: &[ElementId], elements: &[Element], category: Category) {
+    let mut rows: Vec<(String, bool, Vec<&str>)> =
+        vec![(t!("col-comments"), false, elements.iter().map(|e| e.comments.as_str()).collect())];
+    if category.is_model() {
+        rows.insert(0, (t!("col-mark"), true, elements.iter().map(|e| e.mark.as_str()).collect()));
+    }
+    let title = if category.is_model() { t!("section-identity") } else { t!("section-other") };
+    section(ui, "multi-identity", title, |ui| {
+        for (label, mark, values) in rows {
+            let same = values.windows(2).all(|w| w[0] == w[1]);
+            let mut text = if same { values.first().map(|s| s.to_string()).unwrap_or_default() } else { String::new() };
+            let r = row(ui, &label, |ui| {
+                let edit = egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY);
+                ui.add(if same { edit } else { edit.hint_text(t!("props-varies")) })
+            });
+            if r.changed() {
+                let k = Some(key(("multi-identity", mark, ids.first().map_or(0, |id| id.0))));
+                let (m, c) = if mark { (Some(text), None) } else { (None, Some(text)) };
+                crate::engine_edit::elements_identity(state, ids, k, m, c);
+            }
+            finish(state, &r);
         }
     });
 }
@@ -183,12 +537,21 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
     }
 
     match &el.kind {
+        ElementKind::SteelBuilding(b) => crate::steel_building_ui::props(ui, state, id, b),
+        ElementKind::Truss(t) => crate::truss_ui::props(ui, state, id, t),
+        ElementKind::Bracing(b) => crate::bracing_ui::props(ui, state, id, b),
+        ElementKind::WallFraming(f) => crate::wall_framing_ui::props(ui, state, id, f),
+        ElementKind::Connection(c) => crate::connection_ui::props(ui, state, id, c),
+        ElementKind::Mass(m) => mass_props(ui, state, &el, m),
+        ElementKind::Topography(t) => topography_props(ui, state, &el, t),
+        ElementKind::Pad(p) => pad_props(ui, state, &el, p),
+        ElementKind::Pile(p) => pile_props(ui, state, &el, p),
         ElementKind::Component(c) => component_props(ui, state, &el, c),
         ElementKind::Wall(w) => {
             section(ui, "constraints", t!("section-constraints"), |ui| wall_constraints(ui, state, &el, w));
             section(ui, "structural", t!("section-structural"), |ui| {
                 let mut on = w.structural;
-                if row(ui, &t!("prop-structural"), |ui| ui.checkbox(&mut on, "")).changed() {
+                if row(ui, &t!("prop-structural"), |ui| crate::table::checkbox(ui, &mut on)).changed() {
                     modify(state, id, "structural", |e| {
                         if let ElementKind::Wall(w) = &mut e.kind {
                             w.structural = on;
@@ -235,11 +598,17 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
                 let height = state.project().wall_height(&el, w);
                 readonly_row(ui, &t!("prop-height"), format::length(height));
                 let thickness = state.project().thickness_of(&el);
-                readonly_row(ui, &t!("prop-thickness"), format::length(thickness));
+                readonly_row(ui, &t!("prop-thickness"), format::size(thickness, format::MetricSize::Length));
                 readonly_row(ui, &t!("prop-volume"), format::volume(state.session.geom().volume(id)));
             });
+            // A structural wall's reinforcement (and any sets another wall has).
+            let layered = state.project().element_type(el.type_id).is_some_and(|t| !t.layers().is_empty());
+            if layered && (w.structural || state.project().rebar_of(id).next().is_some()) {
+                reinforcement(ui, state, id);
+            }
+            crate::curtain_ui::palette_rows(ui, state, &el, w);
         }
-        ElementKind::Door(h) | ElementKind::Window(h) => {
+        ElementKind::Door(h) | ElementKind::Window(h) | ElementKind::Niche(h) => {
             section(ui, "constraints", t!("section-constraints"), |ui| {
                 readonly_row(ui, &t!("prop-level"), state.project().level_name(el.level).to_string());
                 let host = state.project().element(h.host).map(|w| w.id.to_string()).unwrap_or_default();
@@ -249,10 +618,18 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
                         h.offset = v;
                     }
                 });
-                if category == Category::Window {
-                    length_row(ui, state, &t!("prop-sill"), id, "sill", h.sill_height, |e, v| {
+                // Doors too may stand above the wall's base (a raised floor, a step).
+                let sill_label = if category == Category::Door { t!("prop-base-offset") } else { t!("prop-sill") };
+                length_row(ui, state, &sill_label, id, "sill", h.sill_height, |e, v| {
+                    if let Some(h) = e.as_hosted_mut() {
+                        h.sill_height = v.max(0.0);
+                    }
+                });
+                // The head: typing it moves the opening, keeping its height.
+                if let Some((_, height)) = state.project().element_type(el.type_id).and_then(|t| t.opening_size()) {
+                    length_row(ui, state, &t!("prop-head-height"), id, "head", h.sill_height + height, |e, v| {
                         if let Some(h) = e.as_hosted_mut() {
-                            h.sill_height = v.max(0.0);
+                            h.sill_height = (v - height).max(0.0);
                         }
                     });
                 }
@@ -262,7 +639,7 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
                     [(t!("prop-flip-facing"), "ff", h.flip_facing), (t!("prop-flip-hand"), "fh", h.flip_hand)]
                 {
                     let mut v = value;
-                    if row(ui, &label, |ui| ui.checkbox(&mut v, "")).changed() {
+                    if row(ui, &label, |ui| crate::table::checkbox(ui, &mut v)).changed() {
                         crate::engine_edit::element(state, id, None, |x| {
                             if let Some(h) = x.as_hosted_mut() {
                                 if field == "ff" {
@@ -305,7 +682,7 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
             });
             section(ui, "structural", t!("section-structural"), |ui| {
                 let mut on = c.structural;
-                if row(ui, &t!("prop-structural"), |ui| ui.checkbox(&mut on, "")).changed() {
+                if row(ui, &t!("prop-structural"), |ui| crate::table::checkbox(ui, &mut on)).changed() {
                     modify(state, id, "structural", |e| {
                         if let ElementKind::Column(c) = &mut e.kind {
                             c.structural = on;
@@ -321,7 +698,22 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
             reinforcement(ui, state, id);
         }
         ElementKind::Rebar(r) => rebar_props(ui, state, &el, r),
-        ElementKind::Pipe(s) | ElementKind::Conduit(s) => segment_props(ui, state, &el, s),
+        ElementKind::ShapedRebar(r) => {
+            rebar_dimensions(ui, state, id);
+            for (i, set) in r.properties.iter().enumerate() {
+                section(ui, &format!("bar-set-{i}"), set.name.clone(), |ui| {
+                    for p in &set.properties {
+                        property_rows(ui, &p.name, &p.value);
+                    }
+                });
+            }
+        }
+        ElementKind::Pipe(s) | ElementKind::Conduit(s) | ElementKind::CableTray(s) => segment_props(ui, state, &el, s),
+        ElementKind::LightningConductor(c) => {
+            segment_props(ui, state, &el, &c.run);
+            conductor_role(ui, state, &el, c.role);
+        }
+        ElementKind::Valve(v) => valve_props(ui, state, &el, v),
         ElementKind::Beam(b) => {
             section(ui, "constraints", t!("section-constraints"), |ui| {
                 level_row(ui, state, &el);
@@ -330,19 +722,36 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
                         b.top_offset = v;
                     }
                 });
-                let end = b.end_offset.unwrap_or(b.top_offset);
-                length_row(ui, state, &t!("prop-end-elevation-offset"), id, "beam-end", end, |e, v| {
-                    if let ElementKind::Beam(b) = &mut e.kind {
-                        // Level again when the end returns to the start's elevation.
-                        b.end_offset = ((v - b.top_offset).abs() > 1e-9).then_some(v);
+                // An arc beam is level.
+                if b.arc().is_none() {
+                    let end = b.end_offset.unwrap_or(b.top_offset);
+                    length_row(ui, state, &t!("prop-end-elevation-offset"), id, "beam-end", end, |e, v| {
+                        if let ElementKind::Beam(b) = &mut e.kind {
+                            // Level again when the end returns to the start's elevation.
+                            b.end_offset = ((v - b.top_offset).abs() > 1e-9).then_some(v);
+                        }
+                    });
+                }
+                // Arc beams: the angle the arc turns (0 for a straight beam; level beams only).
+                if b.end_offset.is_none() {
+                    let mut sweep = (4.0 * b.bulge.atan()).to_degrees();
+                    let drag = DragValue::new(&mut sweep).speed(1.0).range(-337.0..=337.0).suffix("°");
+                    let r = row(ui, &t!("prop-arc-angle"), |ui| ui.add(drag));
+                    if r.changed() {
+                        modify(state, id, "sweep", |el| {
+                            if let ElementKind::Beam(b) = &mut el.kind {
+                                b.bulge = if sweep.abs() < 0.01 { 0.0 } else { (sweep.to_radians() / 4.0).tan() };
+                            }
+                        });
                     }
-                });
+                    finish(state, &r);
+                }
                 beam_justification(ui, state, id, b);
                 for (label, at_start, value) in
                     [(t!("prop-join-start"), true, b.join_start), (t!("prop-join-end"), false, b.join_end)]
                 {
                     let mut on = value;
-                    if row(ui, &label, |ui| ui.checkbox(&mut on, "")).changed() {
+                    if row(ui, &label, |ui| crate::table::checkbox(ui, &mut on)).changed() {
                         crate::engine_edit::element(state, id, None, |x| {
                             if let ElementKind::Beam(b) = &mut x.kind {
                                 *(if at_start { &mut b.join_start } else { &mut b.join_end }) = on;
@@ -352,9 +761,17 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
                 }
             });
             section(ui, "dimensions", t!("section-dimensions"), |ui| {
-                readonly_row(ui, &t!("prop-length"), format::length(b.length()));
-                if b.end_offset.is_some() {
-                    readonly_row(ui, &t!("prop-true-length"), format::length(b.true_length()));
+                match b.arc() {
+                    Some(arc) => {
+                        readonly_row(ui, &t!("prop-length"), format::length(arc.length()));
+                        readonly_row(ui, &t!("prop-radius"), format::length(arc.radius));
+                    }
+                    None => {
+                        readonly_row(ui, &t!("prop-length"), format::length(b.length()));
+                        if b.end_offset.is_some() {
+                            readonly_row(ui, &t!("prop-true-length"), format::length(b.true_length()));
+                        }
+                    }
                 }
                 if let Some(g) = state.session.geom().beams.get(&id) {
                     readonly_row(ui, &t!("prop-cut-length"), format::length(g.cut_length()));
@@ -372,12 +789,46 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
                     }
                 });
             });
+            if let cc_core::FoundationShape::Strip { bulge, .. } = f.shape {
+                section(ui, "geometry", t!("section-geometry"), |ui| {
+                    // Arc strips: the angle the arc turns (0 for a straight strip).
+                    let mut sweep = (4.0 * bulge.atan()).to_degrees();
+                    let drag = DragValue::new(&mut sweep).speed(1.0).range(-337.0..=337.0).suffix("°");
+                    let r = row(ui, &t!("prop-arc-angle"), |ui| ui.add(drag));
+                    if r.changed() {
+                        modify(state, id, "sweep", |el| {
+                            if let ElementKind::Foundation(cc_core::Foundation {
+                                shape: cc_core::FoundationShape::Strip { bulge, .. },
+                                ..
+                            }) = &mut el.kind
+                            {
+                                *bulge = if sweep.abs() < 0.01 { 0.0 } else { (sweep.to_radians() / 4.0).tan() };
+                            }
+                        });
+                    }
+                    finish(state, &r);
+                });
+            }
             section(ui, "dimensions", t!("section-dimensions"), |ui| {
+                if matches!(f.shape, cc_core::FoundationShape::Strip { .. }) {
+                    readonly_row(ui, &t!("prop-length"), format::length(f.shape.strip_length()));
+                }
+                if let Some(arc) = f.shape.arc() {
+                    readonly_row(ui, &t!("prop-radius"), format::length(arc.radius));
+                }
                 if let Some(g) = state.session.geom().foundations.get(&id).cloned() {
-                    readonly_row(ui, &t!("col-area"), format::area(cc_geom::polygon::area(&g.footprint)));
+                    readonly_row(ui, &field_label(cc_core::ScheduleField::Area), format::area(g.area()));
                 }
                 readonly_row(ui, &t!("prop-volume"), format::volume(state.session.geom().volume(id)));
+                if state.project().pile_cap(&el).is_some() {
+                    let piles = state.project().piles_of(id).count();
+                    readonly_row(ui, &t!("col-pile-count"), piles.to_string());
+                }
             });
+            // A foundation slab takes a mesh, like a floor; a strip its own bars.
+            if !matches!(f.shape, cc_core::FoundationShape::Pad { .. }) {
+                reinforcement(ui, state, id);
+            }
         }
         ElementKind::Stair(st) => {
             section(ui, "constraints", t!("section-constraints"), |ui| {
@@ -403,13 +854,39 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
                     state.session.doc.break_merge();
                 }
             });
-            if let Some(g) = cc_geom::stair_geom(state.project(), &el, st) {
+            let geom = cc_geom::stair_geom(state.project(), &el, st);
+            let build = match state.project().element_type(el.type_id).map(|t| &t.data) {
+                Some(cc_core::TypeData::Stair { build, .. }) => Some(*build),
+                _ => None,
+            };
+            if let (Some(g), Some(build)) = (&geom, build)
+                && build.construction == cc_core::StairConstruction::Assembled
+                && !g.landings.is_empty()
+            {
+                section(ui, "stair-posts", t!("section-stair-posts"), |ui| {
+                    let mut layout = st.layout;
+                    if crate::stair_ui::posts_rows(ui, &mut layout, g, &build).changed {
+                        modify(state, id, "posts", |e| {
+                            if let ElementKind::Stair(s) = &mut e.kind {
+                                s.layout = layout;
+                            }
+                        });
+                        state.session.doc.break_merge();
+                    }
+                });
+            }
+            if let Some(g) = geom {
                 section(ui, "dimensions", t!("section-stair-check"), |ui| crate::stair_ui::check_rows(ui, &g));
             }
             let railings = state.project().railings_of(id).count();
             if railings == 0 && ui.button(t!("action-stair-railings")).clicked() {
-                let command =
-                    cc_engine::commands::stair::StairRailingsAdd { id: id.0, side: None, type_ref: None, inset: None };
+                let command = cc_engine::commands::stair::StairRailingsAdd {
+                    id: id.0,
+                    side: None,
+                    type_ref: None,
+                    inset: None,
+                    near: None,
+                };
                 actions::run_command(state, command);
             }
         }
@@ -442,10 +919,63 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
             }
             let railings = state.project().railings_of(id).count();
             if railings == 0 && ui.button(t!("action-stair-railings")).clicked() {
-                let command =
-                    cc_engine::commands::stair::StairRailingsAdd { id: id.0, side: None, type_ref: None, inset: None };
+                let command = cc_engine::commands::stair::StairRailingsAdd {
+                    id: id.0,
+                    side: None,
+                    type_ref: None,
+                    inset: None,
+                    near: None,
+                };
                 actions::run_command(state, command);
             }
+        }
+        ElementKind::Shaft(sh) => {
+            section(ui, "constraints", t!("section-constraints"), |ui| {
+                level_row(ui, state, &el);
+                length_row(ui, state, &t!("prop-base-offset"), id, "base", sh.base_offset, |e, v| {
+                    if let ElementKind::Shaft(s) = &mut e.kind {
+                        s.base_offset = v;
+                    }
+                });
+                top_rows(ui, state, &el, sh.top, sh.height);
+            });
+            section(ui, "dimensions", t!("section-dimensions"), |ui| {
+                let (bottom, top) = state.project().shaft_span(&el, sh);
+                readonly_row(ui, &t!("col-height"), format::length(top - bottom));
+                readonly_row(
+                    ui,
+                    &field_label(cc_core::ScheduleField::Area),
+                    format::area(cc_geom::polygon::area(&sh.outline)),
+                );
+            });
+        }
+        ElementKind::Sweep(sw) => {
+            section(ui, "constraints", t!("section-constraints"), |ui| {
+                level_row(ui, state, &el);
+                length_row(ui, state, &t!("prop-base-offset"), id, "base", sw.base_offset, |e, v| {
+                    if let ElementKind::Sweep(s) = &mut e.kind {
+                        s.base_offset = v;
+                    }
+                });
+                let (mut closed, mut flip) = (sw.closed, sw.flip);
+                if row(ui, &t!("opt-sweep-closed"), |ui| crate::table::checkbox(ui, &mut closed)).changed() {
+                    modify(state, id, "sweep-closed", |e| {
+                        if let ElementKind::Sweep(s) = &mut e.kind {
+                            s.closed = closed;
+                        }
+                    });
+                }
+                if row(ui, &t!("opt-sweep-flip"), |ui| crate::table::checkbox(ui, &mut flip)).changed() {
+                    modify(state, id, "sweep-flip", |e| {
+                        if let ElementKind::Sweep(s) = &mut e.kind {
+                            s.flip = flip;
+                        }
+                    });
+                }
+            });
+            section(ui, "dimensions", t!("section-dimensions"), |ui| {
+                readonly_row(ui, &t!("prop-length"), format::length(sw.length()));
+            });
         }
         ElementKind::Railing(r) => {
             section(ui, "constraints", t!("section-constraints"), |ui| {
@@ -462,6 +992,39 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
                     let text =
                         host.map_or(String::new(), |(c, mark)| format!("{} {mark}", tr(c.key())).trim().to_string());
                     readonly_row(ui, &t!("prop-railing-host"), text);
+                    // The side it follows, walking up; or off the host, keeping its plan path.
+                    let mut side = h.side;
+                    row(ui, &t!("prop-railing-side"), |ui| {
+                        egui::ComboBox::from_id_salt(("railing-side", id.0)).selected_text(side_name(side)).show_ui(
+                            ui,
+                            |ui| {
+                                for s in cc_core::StairSide::ALL {
+                                    ui.selectable_value(&mut side, s, side_name(s));
+                                }
+                            },
+                        );
+                    });
+                    if side != h.side {
+                        let name = if side == cc_core::StairSide::Left { "left" } else { "right" };
+                        let command = cc_engine::commands::stair::RailingHostSet {
+                            id: id.0,
+                            host: None,
+                            detach: false,
+                            side: Some(name.into()),
+                            inset: None,
+                        };
+                        actions::run_command(state, command);
+                    }
+                    if ui.button(t!("action-railing-detach")).on_hover_text(t!("action-railing-detach-tip")).clicked() {
+                        let command = cc_engine::commands::stair::RailingHostSet {
+                            id: id.0,
+                            host: None,
+                            detach: true,
+                            side: None,
+                            inset: None,
+                        };
+                        actions::run_command(state, command);
+                    }
                 }
             });
             section(ui, "dimensions", t!("section-dimensions"), |ui| {
@@ -486,6 +1049,13 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
             });
         }
         ElementKind::Text(note) => text_props(ui, state, id, note),
+        ElementKind::LevelMark(m) => crate::level_mark_ui::props(ui, state, id, m),
+        // Placed and changed through bar_tag_create and element_set.
+        ElementKind::BarTag(_) => {}
+        ElementKind::CadImport(c) => crate::cad_ui::props(ui, state, id, c),
+        ElementKind::DetailLine(l) => crate::detail_ui::props(ui, state, id, l),
+        ElementKind::DetailComponent(c) => crate::detail_component_ui::props(ui, state, id, c),
+        ElementKind::FilledRegion(r) | ElementKind::MaskingRegion(r) => crate::region_ui::props(ui, state, id, r),
         ElementKind::Dimension(d) => {
             section(ui, "dimensions", t!("section-dimensions"), |ui| {
                 dimension_value_row(ui, state, id, d);
@@ -508,7 +1078,7 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
                 });
             });
             section(ui, "dimensions", t!("section-dimensions"), |ui| {
-                readonly_row(ui, &t!("col-area"), format::area(f.area()));
+                readonly_row(ui, &field_label(cc_core::ScheduleField::Area), format::area(f.area()));
                 // Openings (shafts, stairwells): sketch one more.
                 row(ui, &t!("prop-roof-openings"), |ui| {
                     ui.label(f.openings.len().to_string());
@@ -523,6 +1093,20 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
                     opening_rows(ui, state, id, &f.openings, true)
                 });
             }
+            section(ui, "structural", t!("section-structural"), |ui| {
+                let mut on = f.structural;
+                if row(ui, &t!("prop-structural"), |ui| crate::table::checkbox(ui, &mut on)).changed() {
+                    modify(state, id, "structural", |e| {
+                        if let ElementKind::Floor(f) = &mut e.kind {
+                            f.structural = on;
+                        }
+                    });
+                }
+            });
+            // A structural slab's reinforcement (and any sets another floor has).
+            if f.structural || state.project().rebar_of(id).next().is_some() {
+                reinforcement(ui, state, id);
+            }
         }
         ElementKind::Ceiling(c) => {
             section(ui, "constraints", t!("section-constraints"), |ui| {
@@ -535,7 +1119,7 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
             });
             section(ui, "dimensions", t!("section-dimensions"), |ui| {
                 let area = cc_geom::polygon::area(&c.boundary);
-                readonly_row(ui, &t!("col-area"), format::area(area));
+                readonly_row(ui, &field_label(cc_core::ScheduleField::Area), format::area(area));
             });
         }
         ElementKind::Roof(r) => {
@@ -556,8 +1140,10 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
                     opening_rows(ui, state, id, &r.holes, false)
                 });
             }
+            roofing_rows(ui, state, &el);
         }
     }
+    crate::wall_framing_ui::member_row(ui, state, id);
 
     // Rooms, grids and dimensions have their own identity rows; only model elements carry a mark.
     let mut identity = vec![(t!("col-comments"), "comments", el.comments.clone())];
@@ -581,18 +1167,37 @@ fn element_props(ui: &mut Ui, state: &mut AppState, id: ElementId) {
             finish(state, &r);
         }
         let mut pinned = state.project().is_pinned(id);
-        if row(ui, &t!("prop-pinned"), |ui| ui.checkbox(&mut pinned, "")).changed() {
+        if row(ui, &t!("prop-pinned"), |ui| crate::table::checkbox(ui, &mut pinned)).changed() {
             crate::actions::run_command(state, cc_engine::commands::modify::ElementsPin { ids: vec![id.0], pinned });
         }
     });
     crate::phases_dialog::element_rows(ui, state, &el);
+    crate::design_options_ui::element_rows(ui, state, &el);
     section(ui, "ifc", t!("section-ifc"), |ui| {
         readonly_row(ui, &t!("prop-ifc-guid"), cc_ifc::guid::encode(el.uid.0));
     });
+    let view = state.active_view;
+    let moved = view.and_then(|v| state.project().view(v)).is_some_and(|v| v.tag_offsets.contains_key(&id));
     padded(ui, |ui| {
-        if ui.button(t!("action-delete")).clicked() {
-            state.delete_selection();
-        }
+        ui.horizontal(|ui| {
+            if ui.button(t!("action-delete")).clicked() {
+                state.delete_selection();
+            }
+            // The tag was moved in this view: put it back.
+            if moved
+                && let Some(view) = view
+                && ui.button(t!("action-reset-tag")).clicked()
+            {
+                let reset = cc_engine::commands::annotate::TagMove {
+                    view: cc_engine::Ref::Id(view.0),
+                    id: id.0,
+                    delta: None,
+                    offset: None,
+                    reset: true,
+                };
+                actions::run_command(state, reset);
+            }
+        });
     });
 }
 
@@ -618,6 +1223,12 @@ fn top_rows(ui: &mut Ui, state: &mut AppState, el: &Element, top: cc_core::WallT
                 r.top = top;
                 if let Some(h) = height {
                     r.height = h;
+                }
+            }
+            ElementKind::Shaft(sh) => {
+                sh.top = top;
+                if let Some(h) = height {
+                    sh.height = h;
                 }
             }
             _ => {}
@@ -653,6 +1264,7 @@ fn top_rows(ui: &mut Ui, state: &mut AppState, el: &Element, top: cc_core::WallT
                 ElementKind::Column(c) => c.top = WallTop::Level { level, offset: v },
                 ElementKind::Stair(s) => s.top = WallTop::Level { level, offset: v },
                 ElementKind::Ramp(r) => r.top = WallTop::Level { level, offset: v },
+                ElementKind::Shaft(sh) => sh.top = WallTop::Level { level, offset: v },
                 _ => {}
             });
         }
@@ -661,10 +1273,83 @@ fn top_rows(ui: &mut Ui, state: &mut AppState, el: &Element, top: cc_core::WallT
                 ElementKind::Column(c) => c.height = v.max(0.1),
                 ElementKind::Stair(s) => s.height = v.max(0.1),
                 ElementKind::Ramp(r) => r.height = v.max(0.01),
+                ElementKind::Shaft(sh) => sh.height = v.max(0.01),
                 _ => {}
             });
         }
     }
+}
+
+/// The rows of an underlay ([`cc_core::Underlay`]): the plan below and the
+/// plan above (none, the next level, or a level), each looking down or up,
+/// and whether it is printed. `own` is the view's level (left out of the
+/// choices), `None` for a template. Returns whether the user changed it.
+pub fn underlay_rows(
+    ui: &mut Ui,
+    state: &AppState,
+    salt: u64,
+    own: Option<cc_core::LevelId>,
+    enabled: bool,
+    u: &mut cc_core::Underlay,
+) -> bool {
+    use cc_core::{Looking, UnderlayLevel, UnderlayPlan};
+    let levels: Vec<_> =
+        state.project().levels.iter().filter(|l| Some(l.id) != own).map(|l| (l.id, l.name.clone())).collect();
+    let before = *u;
+    for (below, slot) in [(true, &mut u.below), (false, &mut u.above)] {
+        let next = if below { t!("underlay-next-below") } else { t!("underlay-next-above") };
+        let name = |level: Option<UnderlayLevel>| match level {
+            None => t!("underlay-none"),
+            Some(UnderlayLevel::Next) => next.clone(),
+            Some(UnderlayLevel::Level(id)) => {
+                levels.iter().find(|l| l.0 == id).map_or_else(|| "?".to_string(), |l| l.1.clone())
+            }
+        };
+        let mut level = slot.map(|p| p.level);
+        let label = if below { t!("prop-underlay-below") } else { t!("prop-underlay-above") };
+        row(ui, &label, |ui| {
+            ui.add_enabled_ui(enabled, |ui| {
+                egui::ComboBox::from_id_salt(("underlay", below, salt)).selected_text(name(level)).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut level, None, name(None));
+                    ui.selectable_value(&mut level, Some(UnderlayLevel::Next), name(Some(UnderlayLevel::Next)));
+                    for (id, lname) in &levels {
+                        ui.selectable_value(&mut level, Some(UnderlayLevel::Level(*id)), lname);
+                    }
+                });
+            });
+        });
+        let looking = slot.map(|p| p.looking).unwrap_or_default();
+        *slot = level.map(|level| UnderlayPlan { level, looking });
+        if let Some(plan) = slot.as_mut() {
+            let mut looking = plan.looking;
+            row(ui, &t!("prop-underlay-looking"), |ui| {
+                ui.add_enabled_ui(enabled, |ui| {
+                    egui::ComboBox::from_id_salt(("underlay-looking", below, salt))
+                        .selected_text(tr(looking.key()))
+                        .show_ui(ui, |ui| {
+                            for l in Looking::ALL {
+                                ui.selectable_value(&mut looking, l, tr(l.key()));
+                            }
+                        });
+                });
+            });
+            plan.looking = looking;
+        }
+    }
+    let mut printed = u.printed;
+    row(ui, &t!("prop-underlay-printed"), |ui| {
+        ui.add_enabled(enabled, crate::table::boxed(egui::Checkbox::without_text(&mut printed)))
+    });
+    u.printed = printed;
+    *u != before
+}
+
+/// The patch of `view_set` or `template_set` that turns a view's or
+/// template's underlay `old` into `new`. Plans set back to none are
+/// cleared (issue #235): the plain JSON of `new` leaves them out, and a
+/// merge would keep the old ones.
+pub fn underlay_patch(old: &cc_core::Underlay, new: &cc_core::Underlay) -> serde_json::Value {
+    cc_engine::value_patch(old, new)
 }
 
 /// Number, name, height and computed area of a room.
@@ -673,29 +1358,186 @@ fn top_rows(ui: &mut Ui, state: &mut AppState, el: &Element, top: cc_core::WallT
 pub fn length_drag(value: &mut f64) -> DragValue<'_> {
     let (units, comma) = format::current();
     let unit = units.length.unit;
-    let decimals = units.length.decimals as usize;
-    let per_meter = unit.per_meter();
     let parse_units = units.clone();
-    DragValue::new(value)
+    let drag = number_drag(value)
         .speed(0.005)
-        .custom_formatter(move |v, _| format::number_with(&units, comma, v * per_meter, decimals))
-        .custom_parser(move |s| format::parse_length_with(&parse_units, s))
-        .suffix(format!(" {}", unit.symbol()))
+        .custom_formatter(move |v, _| format::length_number_with(&units, comma, v))
+        .custom_parser(move |s| format::parse_length_with(&parse_units, s));
+    // Feet and inches carry their own marks.
+    if unit.is_fractional() { drag } else { drag.suffix(format!(" {}", unit.symbol())) }
+}
+
+/// Drag value for a small size stored in meters (a layer, a section's side,
+/// a diameter, a riser): a length in metric projects (see [`length_drag`]),
+/// inches with a fraction in imperial ones (`3/4"`; a bare number typed is
+/// inches, see [`format::parse_size`]).
+pub fn size_drag(value: &mut f64) -> DragValue<'_> {
+    let (units, comma) = format::current();
+    if units.system() == cc_core::MeasurementSystem::Metric {
+        return length_drag(value);
+    }
+    let parse_units = units.clone();
+    number_drag(value)
+        .speed(0.001)
+        .custom_formatter(move |v, _| format::inch_size_with(&units, comma, v))
+        .custom_parser(move |s| format::parse_size_with(&parse_units, s))
+}
+
+/// The header of a schedule field as a label in the current units: `Area
+/// (m²)` in metric projects, `Area` in imperial ones, whose values carry
+/// their own symbols (see [`cc_core::ScheduleField::key_in`]).
+pub fn field_label(field: cc_core::ScheduleField) -> String {
+    crate::i18n::tr(field.key_in(format::system()))
+}
+
+/// Drag value for a slope stored as rise over run, shown and typed in the
+/// project's slope unit (`8,3 %`, `4,76°`, `6:12`; a typed unit or ratio
+/// overrides it, see [`format::parse_slope`]).
+pub fn slope_drag(value: &mut f64) -> DragValue<'_> {
+    let (units, comma) = format::current();
+    let parse_units = units.clone();
+    let speed = match units.slope.unit {
+        cc_core::SlopeUnit::Percent => 0.005,
+        cc_core::SlopeUnit::Degrees => 0.01,
+        cc_core::SlopeUnit::RisePer12 => 1.0 / 48.0,
+    };
+    number_drag(value)
+        .speed(speed)
+        .custom_formatter(move |v, _| format::slope_with(&units, comma, v))
+        .custom_parser(move |s| format::parse_slope_with(&parse_units, s))
+}
+
+/// Drag value for a size on paper stored in millimeters (text heights,
+/// bubbles, gaps, sheet sides): ` mm` after the number in metric
+/// projects; in imperial ones inches with a fraction (`3/32"`), typed in
+/// inches unless a unit says otherwise (see [`format::parse_paper`]).
+pub fn paper_drag(value: &mut f64) -> DragValue<'_> {
+    paper_drag_with(value, format::paper_with)
+}
+
+/// Drag value for a pen weight stored in millimeters: ` mm` after the
+/// number in metric projects, decimal inches in imperial ones (`0.010"`).
+pub fn weight_drag(value: &mut f64) -> DragValue<'_> {
+    paper_drag_with(value, format::paper_weight_with)
+}
+
+/// Drag value for a paper length shown as decimal inches in imperial
+/// projects (`0.125"`, drafting fill patterns), ` mm` after the number in
+/// metric ones.
+pub fn decimal_paper_drag(value: &mut f64) -> DragValue<'_> {
+    paper_drag_with(value, format::paper_weight_with)
+}
+
+fn paper_drag_with(value: &mut f64, show: fn(&cc_core::Units, bool, f64) -> String) -> DragValue<'_> {
+    let (units, comma) = format::current();
+    if units.system() == cc_core::MeasurementSystem::Metric {
+        return number_drag(value).suffix(" mm");
+    }
+    let parse_units = units.clone();
+    number_drag(value)
+        .custom_formatter(move |v, _| show(&units, comma, v))
+        .custom_parser(move |s| format::parse_paper_with(&parse_units, s))
+}
+
+/// A new value typed in a [`param_editor`].
+pub enum ParamEdit {
+    Number(f64),
+    Text(String),
+}
+
+/// The widget of a component parameter of any kind: a drag value, a
+/// checkbox, a text box, or a list of its choices or of the project's
+/// materials. Returns its response and the new value when it changed.
+pub fn param_editor(
+    ui: &mut Ui,
+    p: &cc_core::ComponentParam,
+    number: f64,
+    text: &str,
+    materials: &[String],
+) -> (Response, Option<ParamEdit>) {
+    use cc_core::ParamKind;
+    match p.kind {
+        ParamKind::Boolean => {
+            let mut on = number != 0.0;
+            let r = crate::table::checkbox(ui, &mut on);
+            let changed = r.changed().then(|| ParamEdit::Number(f64::from(u8::from(on))));
+            (r, changed)
+        }
+        ParamKind::Text => {
+            let mut t = text.to_string();
+            let r = ui.add(egui::TextEdit::singleline(&mut t).desired_width(160.0));
+            let changed =
+                (r.changed() && t.len() <= cc_core::component_script::MAX_TEXT_LEN).then_some(ParamEdit::Text(t));
+            (r, changed)
+        }
+        ParamKind::Choice | ParamKind::Material => {
+            let options: Vec<(String, String)> = if p.kind == ParamKind::Choice {
+                p.choices
+                    .iter()
+                    .map(|c| (c.key.clone(), if c.label.is_empty() { c.key.clone() } else { c.label.clone() }))
+                    .collect()
+            } else {
+                std::iter::once((String::new(), t!("param-material-default")))
+                    .chain(materials.iter().map(|m| (m.clone(), m.clone())))
+                    .collect()
+            };
+            let shown = options.iter().find(|(k, _)| k == text).map_or_else(
+                // A saved material that no longer exists keeps its name.
+                || if text.is_empty() { String::new() } else { format!("{text} ?") },
+                |(_, l)| l.clone(),
+            );
+            let mut chosen = None;
+            let r = egui::ComboBox::from_id_salt(("param", p.name.as_str()))
+                .selected_text(shown)
+                .width(160.0)
+                .show_ui(ui, |ui| {
+                    for (k, l) in &options {
+                        if ui.selectable_label(k == text, l).clicked() && k != text {
+                            chosen = Some(k.clone());
+                        }
+                    }
+                })
+                .response;
+            (r, chosen.map(ParamEdit::Text))
+        }
+        ParamKind::Length | ParamKind::Angle | ParamKind::Number => {
+            let mut v = number;
+            let r = ui.add(param_value(&mut v, p.kind));
+            let changed = r.changed().then_some(ParamEdit::Number(v));
+            (r, changed)
+        }
+    }
+}
+
+/// A number field whose typed text is taken when the field is left (Enter,
+/// Tab or a click elsewhere), not at every key. A value written at every key
+/// goes through the model, which clamps or refuses half-typed numbers, and
+/// the field then shows the model's value in place of the text being typed
+/// (issue 319: `1` read `5`, `0.9` over `0.80` gave `0.9.80`). Dragging
+/// still changes the value as it moves.
+pub fn number_drag(value: &mut f64) -> DragValue<'_> {
+    DragValue::new(value).update_while_editing(false)
 }
 
 /// Drag value for a component parameter, with the unit of its kind.
 pub fn param_value(value: &mut f64, kind: cc_core::ParamKind) -> DragValue<'_> {
     match kind {
         cc_core::ParamKind::Length => crate::properties::length_drag(value).speed(0.01),
-        cc_core::ParamKind::Angle => DragValue::new(value).speed(1.0).suffix("°"),
-        cc_core::ParamKind::Number => DragValue::new(value).speed(0.1),
+        cc_core::ParamKind::Angle => number_drag(value).speed(1.0).suffix("°"),
+        cc_core::ParamKind::Boolean => number_drag(value).range(0.0..=1.0).speed(1.0),
+        cc_core::ParamKind::Number
+        | cc_core::ParamKind::Text
+        | cc_core::ParamKind::Choice
+        | cc_core::ParamKind::Material => number_drag(value).speed(0.1),
     }
 }
 
-/// A pipe or conduit: elevations of its ends, its system or circuits, length and slope.
+/// A pipe, conduit or cable tray: elevations of its ends, its system or
+/// circuits, size, length and slope.
 fn segment_props(ui: &mut Ui, state: &mut AppState, el: &Element, s: &cc_core::MepSegment) {
     let id = el.id;
     let pipe = matches!(el.kind, ElementKind::Pipe(_));
+    let conductor = matches!(el.kind, ElementKind::LightningConductor(_));
     section(ui, "constraints", t!("section-constraints"), |ui| {
         level_row(ui, state, el);
         length_row(ui, state, &t!("prop-start-elevation"), id, "seg-start", s.start_offset, |e, v| {
@@ -710,10 +1552,12 @@ fn segment_props(ui: &mut Ui, state: &mut AppState, el: &Element, s: &cc_core::M
         });
     });
     section(ui, "mep-system", t!("section-mep"), |ui| {
-        if pipe {
+        if pipe || conductor {
+            // A pipe or a lightning conductor belongs to one system.
             let mut system = s.system();
+            let classes = if pipe { [SystemClass::Plumbing] } else { [SystemClass::Lightning] };
             let changed = row(ui, &t!("col-system"), |ui| {
-                crate::systems_dialog::system_combo(ui, state, ("pipe-system", id.0), Some(false), &mut system)
+                crate::systems_dialog::system_combo(ui, state, ("pipe-system", id.0), &classes, &mut system)
             });
             if changed {
                 crate::engine_edit::element(state, id, None, |e| {
@@ -723,17 +1567,17 @@ fn segment_props(ui: &mut Ui, state: &mut AppState, el: &Element, s: &cc_core::M
                 });
             }
         } else {
-            // A conduit carries any number of circuits.
+            // A conduit or cable tray carries any number of circuits and cabling systems.
             let circuits: Vec<(cc_core::SystemId, String)> = state
                 .project()
                 .systems
                 .iter()
-                .filter(|(_, c)| c.kind.is_electrical())
+                .filter(|(_, c)| c.kind.is_cabled())
                 .map(|(cid, c)| (*cid, format!("{} – {}", c.label(), c.name)))
                 .collect();
             for (cid, label) in circuits {
                 let mut on = s.systems.contains(&cid);
-                if row(ui, &label, |ui| ui.checkbox(&mut on, "")).changed() {
+                if row(ui, &label, |ui| crate::table::checkbox(ui, &mut on)).changed() {
                     crate::engine_edit::element(state, id, None, |e| {
                         if let Some(s) = e.as_segment_mut() {
                             s.systems.retain(|x| *x != cid);
@@ -747,8 +1591,14 @@ fn segment_props(ui: &mut Ui, state: &mut AppState, el: &Element, s: &cc_core::M
         }
     });
     section(ui, "dimensions", t!("section-dimensions"), |ui| {
-        if let Some(d) = state.project().element_type(el.type_id).and_then(|t| t.diameter()) {
-            readonly_row(ui, &t!("col-diameter"), format::length(d));
+        let ty = state.project().element_type(el.type_id);
+        if let Some(d) = ty.and_then(|t| t.diameter()) {
+            readonly_row(ui, &t!("col-diameter"), format::size(d, format::MetricSize::Length));
+        }
+        if let Some((width, height, style)) = ty.and_then(|t| t.tray_section()) {
+            readonly_row(ui, &t!("col-width"), format::size(width, format::MetricSize::Length));
+            readonly_row(ui, &t!("col-height"), format::size(height, format::MetricSize::Length));
+            readonly_row(ui, &t!("prop-tray-style"), tr(style.key()));
         }
         readonly_row(ui, &t!("prop-length"), format::length(s.length()));
         if pipe && !s.is_vertical() {
@@ -757,16 +1607,75 @@ fn segment_props(ui: &mut Ui, state: &mut AppState, el: &Element, s: &cc_core::M
     });
 }
 
+/// A valve: its pipe, where it sits along it, its kind and the pipe's size and system.
+fn valve_props(ui: &mut Ui, state: &mut AppState, el: &Element, v: &cc_core::Valve) {
+    let id = el.id;
+    let project = state.project();
+    let host = project.valve_host(v).map(|(pipe, run)| {
+        let label = if pipe.mark.is_empty() { tr(pipe.category().key()) } else { pipe.mark.clone() };
+        let system = pipe.systems().first().and_then(|s| project.system(*s)).map(|s| s.name.clone());
+        let diameter = project.element_type(pipe.type_id).and_then(|t| t.diameter());
+        (label, run.length(), system, diameter)
+    });
+    let kind = project.element_type(el.type_id).and_then(|t| t.valve_kind());
+    section(ui, "constraints", t!("section-constraints"), |ui| {
+        let Some((label, length, _, _)) = &host else { return };
+        readonly_row(ui, &t!("prop-valve-pipe"), label.clone());
+        let length = *length;
+        length_row(ui, state, &t!("prop-valve-distance"), id, "valve-at", v.at.min(length), move |e, x| {
+            if let ElementKind::Valve(v) = &mut e.kind {
+                v.at = x.clamp(0.0, length);
+            }
+        });
+    });
+    section(ui, "mep-system", t!("section-mep"), |ui| {
+        if let Some(kind) = kind {
+            readonly_row(ui, &t!("prop-valve-kind"), tr(kind.key()));
+        }
+        if let Some((_, _, system, diameter)) = &host {
+            readonly_row(ui, &t!("col-system"), system.clone().unwrap_or_else(|| t!("value-none")));
+            if let Some(d) = diameter {
+                readonly_row(ui, &t!("col-diameter"), format::size(*d, format::MetricSize::Length));
+            }
+        }
+    });
+}
+
+/// What a lightning protection conductor does (on the roof, down, in the ground).
+fn conductor_role(ui: &mut Ui, state: &mut AppState, el: &Element, role: cc_core::ConductorRole) {
+    let id = el.id;
+    section(ui, "lps-role", t!("section-lightning"), |ui| {
+        let mut chosen = role;
+        row(ui, &t!("prop-conductor-role"), |ui| {
+            egui::ComboBox::from_id_salt(("conductor-role", id.0)).selected_text(tr(role.key())).show_ui(ui, |ui| {
+                for r in cc_core::ConductorRole::ALL {
+                    ui.selectable_value(&mut chosen, r, tr(r.key()));
+                }
+            });
+        });
+        if chosen != role {
+            crate::engine_edit::element(state, id, None, |e| {
+                if let ElementKind::LightningConductor(c) = &mut e.kind {
+                    c.role = chosen;
+                }
+            });
+        }
+    });
+}
+
 /// The system or circuit of a plumbing fixture or electrical device, and its data.
 fn component_services(ui: &mut Ui, state: &mut AppState, el: &Element, c: &cc_core::Component) {
     let Some(mep) = state.project().mep_data(el) else { return };
     let id = el.id;
-    let device = matches!(mep, cc_core::MepData::Device { .. });
+    let class = match mep {
+        cc_core::MepData::Device { device, .. } => device.class(),
+        cc_core::MepData::Fixture { .. } => SystemClass::Plumbing,
+    };
     section(ui, "mep-system", t!("section-mep"), |ui| {
         let mut system = c.system;
-        let label = if device { t!("prop-circuit") } else { t!("col-system") };
+        let label = if class == SystemClass::Circuit { t!("prop-circuit") } else { t!("col-system") };
         let changed = row(ui, &label, |ui| {
-            crate::systems_dialog::system_combo(ui, state, ("comp-system", id.0), Some(device), &mut system)
+            crate::systems_dialog::system_combo(ui, state, ("comp-system", id.0), &[class], &mut system)
         });
         if changed {
             crate::engine_edit::element(state, id, None, |e| {
@@ -776,14 +1685,268 @@ fn component_services(ui: &mut Ui, state: &mut AppState, el: &Element, c: &cc_co
             });
         }
         match mep {
-            cc_core::MepData::Device { device, power } => {
+            cc_core::MepData::Device { device, power, ports } => {
                 readonly_row(ui, &t!("prop-device"), tr(device.key()));
-                readonly_row(ui, &t!("col-power"), format!("{} VA", format::number(power, 0)));
+                if class == SystemClass::Circuit {
+                    readonly_row(ui, &t!("col-power"), format!("{} VA", format::number(power, 0)));
+                }
+                if device == cc_core::DeviceKind::DataOutlet {
+                    readonly_row(ui, &t!("prop-ports"), ports.to_string());
+                    if let Some((_, length)) = state.project().outlet_cable(el) {
+                        readonly_row(ui, &t!("col-cable-length"), format::length(length));
+                    }
+                }
             }
             cc_core::MepData::Fixture { drain_units, supply_weight, .. } => {
                 readonly_row(ui, &t!("col-drain-units"), format::number(drain_units, 1));
                 readonly_row(ui, &t!("prop-supply-weight"), format::number(supply_weight, 2));
             }
+        }
+    });
+}
+
+/// Most points listed in a terrain's properties (scripts edit the rest).
+const MAX_POINT_ROWS: usize = 200;
+
+/// A terrain: its base, its figures and its measured points, each editable.
+fn topography_props(ui: &mut Ui, state: &mut AppState, el: &Element, t: &cc_core::topography::Topography) {
+    let id = el.id;
+    section(ui, "constraints", t!("section-constraints"), |ui| {
+        level_row(ui, state, el);
+        length_row(ui, state, &t!("prop-base-depth"), id, "base-depth", t.base_depth, |e, v| {
+            if let ElementKind::Topography(t) = &mut e.kind {
+                t.base_depth = v.max(0.01);
+            }
+        });
+    });
+    let geom = state.session.geom().topographies.get(&id).cloned();
+    section(ui, "dimensions", t!("section-dimensions"), |ui| {
+        let Some(g) = geom else { return };
+        readonly_row(ui, &t!("prop-lowest"), format::length(g.min_z));
+        readonly_row(ui, &t!("prop-highest"), format::length(g.max_z));
+        readonly_row(ui, &field_label(cc_core::ScheduleField::Area), format::area(g.area));
+        readonly_row(ui, &field_label(cc_core::ScheduleField::Volume), format::volume(g.volume));
+        for w in &g.warnings {
+            readonly_row(ui, &t!("prop-warning"), crate::i18n::tr(&format!("topo-warning-{}", w.code())));
+        }
+    });
+    let title = t!("section-points", "count" => t.points.len());
+    section(ui, "topo-points", title, |ui| {
+        let mut remove = None;
+        for (i, p) in t.points.iter().enumerate().take(MAX_POINT_ROWS) {
+            let mut v = *p;
+            let (changed, done, removed) = row(ui, &(i + 1).to_string(), |ui| {
+                ui.horizontal(|ui| {
+                    let rs = [
+                        ui.add(length_drag(&mut v.x).speed(0.01)),
+                        ui.add(length_drag(&mut v.y).speed(0.01)),
+                        ui.add(length_drag(&mut v.z).speed(0.01)),
+                    ];
+                    let removed = ui.small_button("×").on_hover_text(t!("action-remove-point")).clicked();
+                    (
+                        rs.iter().any(|r| r.changed()),
+                        rs.iter().find(|r| r.drag_stopped() || r.lost_focus()).cloned(),
+                        removed,
+                    )
+                })
+                .inner
+            });
+            if changed {
+                modify(state, id, &format!("point-{i}"), |e| {
+                    if let ElementKind::Topography(t) = &mut e.kind
+                        && let Some(slot) = t.points.get_mut(i)
+                    {
+                        *slot = v;
+                    }
+                });
+            }
+            if let Some(r) = done {
+                finish(state, &r);
+            }
+            if removed {
+                remove = Some(i);
+            }
+        }
+        if t.points.len() > MAX_POINT_ROWS {
+            readonly_row(ui, "", t!("points-more", "count" => t.points.len() - MAX_POINT_ROWS));
+        }
+        if let Some(i) = remove {
+            let command = cc_engine::commands::topography::TopographyPointsSet {
+                id: id.0,
+                remove: vec![i],
+                ..Default::default()
+            };
+            actions::run_command(state, command);
+        }
+        if row(ui, "", |ui| ui.button(t!("edit-boundary")).clicked()) {
+            crate::sketch_mode::edit_boundary(state);
+        }
+    });
+}
+
+/// A pile: its level, head and toe (a pile cap's follow the cap, read
+/// only), its length and volume, and its cap.
+fn pile_props(ui: &mut Ui, state: &mut AppState, el: &Element, p: &cc_core::pile::Pile) {
+    let id = el.id;
+    section(ui, "constraints", t!("section-constraints"), |ui| match p.cap {
+        Some(_) => {
+            readonly_row(ui, &t!("prop-level"), state.project().level_name(el.level).to_string());
+            readonly_row(ui, &t!("col-cut-off"), format::length(p.cut_off));
+            readonly_row(ui, &t!("col-toe"), format::length(p.toe));
+        }
+        None => {
+            level_row(ui, state, el);
+            length_row(ui, state, &t!("col-cut-off"), id, "cut-off", p.cut_off, |e, v| {
+                if let ElementKind::Pile(p) = &mut e.kind {
+                    p.cut_off = v;
+                }
+            });
+            length_row(ui, state, &t!("col-toe"), id, "toe", p.toe, |e, v| {
+                if let ElementKind::Pile(p) = &mut e.kind {
+                    p.toe = v;
+                }
+            });
+        }
+    });
+    section(ui, "dimensions", t!("section-dimensions"), |ui| {
+        readonly_row(ui, &t!("prop-length"), format::length(p.length()));
+        readonly_row(ui, &t!("prop-volume"), format::volume(state.session.geom().volume(id)));
+        if let Some(cap) = p.cap.and_then(|c| state.project().element(c.cap)) {
+            let name = if cap.mark.is_empty() { cap.id.to_string() } else { cap.mark.clone() };
+            readonly_row(ui, &t!("col-host"), name);
+        }
+    });
+}
+
+/// A building pad: its elevation, its slopes (its own or its type's), its
+/// area and earthworks, and *Edit Boundary*.
+fn pad_props(ui: &mut Ui, state: &mut AppState, el: &Element, p: &cc_core::pad::Pad) {
+    let id = el.id;
+    section(ui, "constraints", t!("section-constraints"), |ui| {
+        // The terrain's level: pads follow it.
+        readonly_row(ui, &t!("prop-level"), state.project().level_name(el.level).to_string());
+        length_row(ui, state, &t!("col-elevation"), id, "elevation", p.elevation, |e, v| {
+            if let ElementKind::Pad(p) = &mut e.kind {
+                p.elevation = v;
+            }
+        });
+    });
+    let (type_cut, type_fill) = match state.project().element_type(el.type_id).map(|t| &t.data) {
+        Some(cc_core::TypeData::Pad { cut_slope, fill_slope }) => (*cut_slope, *fill_slope),
+        _ => (cc_core::pad::DEFAULT_CUT_SLOPE, cc_core::pad::DEFAULT_FILL_SLOPE),
+    };
+    section(ui, "pad-slopes", t!("section-slopes"), |ui| {
+        slope_row(ui, state, id, &t!("prop-cut-slope"), "cut", (p.cut_slope, type_cut), |p, v| p.cut_slope = v);
+        slope_row(ui, state, id, &t!("prop-fill-slope"), "fill", (p.fill_slope, type_fill), |p, v| p.fill_slope = v);
+    });
+    let geom = state.session.geom().pads.get(&id).cloned();
+    section(ui, "dimensions", t!("section-dimensions"), |ui| {
+        let Some(g) = geom else { return };
+        readonly_row(ui, &field_label(cc_core::ScheduleField::Area), format::area(g.area));
+        readonly_row(ui, &t!("col-cut-volume"), format::volume(g.cut));
+        readonly_row(ui, &t!("col-fill-volume"), format::volume(g.fill));
+        readonly_row(ui, &t!("prop-net-volume"), format::volume(g.fill - g.cut));
+        for w in &g.warnings {
+            readonly_row(ui, &t!("prop-warning"), crate::i18n::tr(&format!("pad-warning-{}", w.code())));
+        }
+        if row(ui, "", |ui| ui.button(t!("edit-boundary")).clicked()) {
+            crate::sketch_mode::edit_boundary(state);
+        }
+    });
+}
+
+/// A pad's slope ratio (run per unit of rise, shown as 1:n): the type's
+/// while *By type* is on, else its own.
+fn slope_row(
+    ui: &mut Ui,
+    state: &mut AppState,
+    id: ElementId,
+    label: &str,
+    field: &str,
+    (own, of_type): (Option<f64>, f64),
+    set: fn(&mut cc_core::pad::Pad, Option<f64>),
+) {
+    use cc_core::pad::{MAX_SLOPE, MIN_SLOPE};
+    let mut by_type = own.is_none();
+    let mut v = own.unwrap_or(of_type);
+    let (toggled, r) = row(ui, label, |ui| {
+        ui.horizontal(|ui| {
+            let toggled = crate::table::labeled_checkbox(ui, &mut by_type, t!("prop-by-type")).changed();
+            let drag = egui::DragValue::new(&mut v).speed(0.05).range(MIN_SLOPE..=MAX_SLOPE).prefix("1:");
+            (toggled, ui.add_enabled(!by_type, drag))
+        })
+        .inner
+    });
+    if toggled {
+        modify(state, id, &format!("{field}-by-type"), |e| {
+            if let ElementKind::Pad(p) = &mut e.kind {
+                set(p, (!by_type).then_some(v));
+            }
+        });
+        state.session.doc.break_merge();
+    }
+    if r.changed() {
+        modify(state, id, field, |e| {
+            if let ElementKind::Pad(p) = &mut e.kind {
+                set(p, Some(v));
+            }
+        });
+    }
+    finish(state, &r);
+}
+
+/// A conceptual mass: its level, base offset and height, whether it is a
+/// loft, and its mass floors (a box per level it spans, with the area of
+/// each and the totals).
+fn mass_props(ui: &mut Ui, state: &mut AppState, el: &Element, m: &cc_core::mass::Mass) {
+    let id = el.id;
+    section(ui, "constraints", t!("section-constraints"), |ui| {
+        level_row(ui, state, el);
+        length_row(ui, state, &t!("prop-base-offset"), id, "base", m.base_offset, |e, v| {
+            if let ElementKind::Mass(m) = &mut e.kind {
+                m.base_offset = v;
+            }
+        });
+        length_row(ui, state, &t!("prop-height"), id, "height", m.height, |e, v| {
+            if let ElementKind::Mass(m) = &mut e.kind {
+                m.height = v.max(0.1);
+            }
+        });
+        let shape = if m.top.is_some() { t!("mass-loft") } else { t!("mass-extrusion") };
+        readonly_row(ui, &t!("prop-mass-shape"), shape);
+    });
+    let geom = state.session.geom().masses.get(&id).cloned();
+    section(ui, "mass-floors", t!("section-mass-floors"), |ui| {
+        let project = state.project();
+        let base = project.level_elevation(el.level) + m.base_offset;
+        let spanned = cc_engine::commands::mass::spanned_levels(project, base, base + m.height);
+        let rows: Vec<_> = spanned.iter().map(|l| (*l, project.level_name(*l).to_string())).collect();
+        if rows.is_empty() {
+            readonly_row(ui, &t!("section-mass-floors"), t!("mass-no-levels"));
+        }
+        for (level, name) in rows {
+            let mut on = m.floors.contains(&level);
+            let area = geom.as_ref().and_then(|g| g.floors.iter().find(|f| f.level == level)).map(|f| f.area);
+            let changed = row(ui, &name, |ui| {
+                let r = crate::table::labeled_checkbox(ui, &mut on, area.map(format::area).unwrap_or_default());
+                r.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on, &name));
+                r.changed()
+            });
+            if changed {
+                let mut levels: Vec<_> = m.floors.iter().copied().filter(|l| *l != level).collect();
+                if on {
+                    levels.push(level);
+                }
+                let levels = levels.into_iter().map(|l| cc_engine::Ref::Id(l.0)).collect();
+                actions::run_command(
+                    state,
+                    cc_engine::commands::mass::MassFloorsSet { id: id.0, levels: Some(levels) },
+                );
+            }
+        }
+        if let Some(g) = &geom {
+            readonly_row(ui, &t!("col-floor-area"), format::area(g.floor_area()));
+            readonly_row(ui, &t!("prop-volume"), format::volume(g.volume));
         }
     });
 }
@@ -809,8 +1972,9 @@ fn component_props(ui: &mut Ui, state: &mut AppState, el: &Element, c: &cc_core:
         finish(state, &r);
     });
     component_services(ui, state, el, c);
-    let Some(cc_core::TypeData::Component { def, .. }) =
-        state.project().element_type(el.type_id).map(|t| t.data.clone())
+    // The definition is borrowed, not copied (mesh pieces can be large): only the parameters the
+    // rows below edit are cloned.
+    let Some(cc_core::TypeData::Component { def, .. }) = state.project().element_type(el.type_id).map(|t| &t.data)
     else {
         return;
     };
@@ -837,26 +2001,56 @@ fn component_props(ui: &mut Ui, state: &mut AppState, el: &Element, c: &cc_core:
         });
     }
     let instance: Vec<_> = def.params.iter().filter(|p| p.instance).cloned().collect();
+    let shared: Vec<_> = def.params.iter().filter(|p| !p.instance && p.from_script).cloned().collect();
+    let materials: Vec<String> = state.project().materials.iter().map(|m| m.name.clone()).collect();
+    if def.has_script()
+        && let Some(ty) = state.project().element_type(el.type_id)
+    {
+        let errors: Vec<String> =
+            cc_geom::instance_errors(ty, def, el, Some(c)).into_iter().map(|(_, e)| e.to_string()).collect();
+        if !errors.is_empty() {
+            section(ui, "comp-script-errors", t!("section-script-errors"), |ui| {
+                for e in errors {
+                    ui.label(RichText::new(e).color(PALETTE.danger).size(11.0));
+                    ui.end_row();
+                }
+            });
+        }
+    }
     if !instance.is_empty() {
         section(ui, "comp-params", t!("section-instance-params"), |ui| {
             for p in instance {
-                let current = c.overrides.get(&p.name).copied();
-                let mut v = current.unwrap_or(p.value);
-                let (r, reset) = row(ui, &p.name, |ui| {
+                let number = c.overrides.get(&p.name).copied();
+                let text = c.text_overrides.get(&p.name).filter(|t| p.accepts_text(t)).cloned();
+                let overridden = if p.kind.is_text() { text.is_some() } else { number.is_some() };
+                let (r, changed, reset) = row(ui, p.display(), |ui| {
                     ui.horizontal(|ui| {
-                        let r = ui.add(param_value(&mut v, p.kind));
+                        let (r, changed) = param_editor(
+                            ui,
+                            &p,
+                            number.unwrap_or(p.value),
+                            text.as_deref().unwrap_or(&p.text),
+                            &materials,
+                        );
                         let reset = ui
-                            .add_enabled(current.is_some(), egui::Button::new("↺").small())
+                            .add_enabled(overridden, egui::Button::new("↺").small())
                             .on_hover_text(t!("hint-param-reset"));
-                        (r, reset.clicked())
+                        (r, changed, reset.clicked())
                     })
                     .inner
                 });
-                if r.changed() {
+                if let Some(value) = changed {
                     let name = p.name.clone();
                     modify(state, id, &format!("comp-param-{name}"), |e| {
                         if let ElementKind::Component(c) = &mut e.kind {
-                            c.overrides.insert(name, v);
+                            match value {
+                                ParamEdit::Number(v) => {
+                                    c.overrides.insert(name, v);
+                                }
+                                ParamEdit::Text(t) => {
+                                    c.text_overrides.insert(name, t);
+                                }
+                            }
                         }
                     });
                 }
@@ -865,6 +2059,30 @@ fn component_props(ui: &mut Ui, state: &mut AppState, el: &Element, c: &cc_core:
                     crate::engine_edit::element(state, id, None, |x| {
                         if let ElementKind::Component(c) = &mut x.kind {
                             c.overrides.remove(&name);
+                            c.text_overrides.remove(&name);
+                        }
+                    });
+                }
+                finish(state, &r);
+            }
+        });
+    }
+    // Shared values: changing them changes every element of the type.
+    if !shared.is_empty() {
+        let type_id = el.type_id;
+        section(ui, "comp-type-params", t!("section-type-params"), |ui| {
+            for p in shared {
+                let (r, changed) = row(ui, p.display(), |ui| param_editor(ui, &p, p.value, &p.text, &materials));
+                if let Some(value) = changed {
+                    let name = p.name.clone();
+                    crate::engine_edit::element_type(state, type_id, Some(key((type_id, name.as_str()))), |t| {
+                        if let cc_core::TypeData::Component { def, .. } = &mut t.data
+                            && let Some(q) = def.params.iter_mut().find(|q| q.name == name)
+                        {
+                            match value {
+                                ParamEdit::Number(v) => q.value = v,
+                                ParamEdit::Text(t) => q.text = t,
+                            }
                         }
                     });
                 }
@@ -895,15 +2113,13 @@ fn text_props(ui: &mut Ui, state: &mut AppState, id: ElementId, note: &cc_core::
         }
         finish(state, &r);
         let mut multiline = note.width.is_some();
-        if row(ui, &t!("text-multiline"), |ui| ui.checkbox(&mut multiline, "")).changed() {
+        if row(ui, &t!("text-multiline"), |ui| crate::table::checkbox(ui, &mut multiline)).changed() {
             let width = multiline.then_some(state.text_options.width);
             set(state, "multiline", &|n| n.width = width);
         }
         if let Some(width) = note.width {
             let mut w = width;
-            let r = row(ui, &t!("prop-text-width"), |ui| {
-                ui.add(DragValue::new(&mut w).speed(1.0).range(5.0..=1000.0).suffix(" mm"))
-            });
+            let r = row(ui, &t!("prop-text-width"), |ui| ui.add(paper_drag(&mut w).speed(1.0).range(5.0..=1000.0)));
             if r.changed() {
                 set(state, "width", &|n| n.width = Some(w));
             }
@@ -1034,18 +2250,70 @@ fn room_props(ui: &mut Ui, state: &mut AppState, el: &Element, r: &cc_core::Room
     section(ui, "dimensions", t!("section-dimensions"), |ui| match state.session.geom().rooms.get(&id).cloned() {
         Some(boundary) => {
             let area = cc_geom::polygon::area(&boundary);
-            readonly_row(ui, &t!("col-area"), format::area(area));
-            readonly_row(ui, &t!("col-perimeter"), format::length(cc_geom::polygon::perimeter(&boundary)));
+            readonly_row(ui, &field_label(cc_core::ScheduleField::Area), format::area(area));
+            readonly_row(
+                ui,
+                &field_label(cc_core::ScheduleField::Perimeter),
+                format::length(cc_geom::polygon::perimeter(&boundary)),
+            );
             readonly_row(ui, &t!("prop-volume"), format::volume(area * r.height));
         }
-        None => readonly_row(ui, &t!("col-area"), t!("room-not-enclosed")),
+        None => readonly_row(ui, &field_label(cc_core::ScheduleField::Area), t!("room-not-enclosed")),
     });
 }
 
 /// The bar count or the stirrup spacing of a reinforcement set, editable.
-fn rebar_layout_row(ui: &mut Ui, state: &mut AppState, id: ElementId, label: &str, layout: cc_core::RebarLayout) {
+fn rebar_layout_row(ui: &mut Ui, state: &mut AppState, id: ElementId, label: &str, layout: &cc_core::RebarLayout) {
     use cc_core::RebarLayout as L;
-    match layout {
+    match *layout {
+        // A wall's horizontal bars by the spacing of their first zone (the others in `element_get`)...
+        L::WallHorizontal { ref zones, .. } => {
+            let spacing = zones.first().map_or(0.0, |z| z.spacing);
+            length_row(ui, state, label, id, "rebar-spacing", spacing, |e, v| {
+                if let ElementKind::Rebar(x) = &mut e.kind
+                    && let L::WallHorizontal { zones, .. } = &mut x.layout
+                    && let Some(zone) = zones.first_mut()
+                {
+                    zone.spacing = v.max(cc_core::wall_bars::MIN_SPACING);
+                }
+            });
+            if zones.len() > 1 {
+                readonly_row(ui, "", t!("bars-wall-zones", "count" => zones.len()));
+            }
+        }
+        // ...its vertical bars by their spacing along it...
+        L::WallVertical { spacing, .. } => {
+            length_row(ui, state, label, id, "rebar-spacing", spacing, |e, v| {
+                if let ElementKind::Rebar(x) = &mut e.kind
+                    && let L::WallVertical { spacing, .. } = &mut x.layout
+                {
+                    *spacing = v.max(cc_core::wall_bars::MIN_SPACING);
+                }
+            });
+        }
+        // ...and its ties by the bars they skip.
+        L::WallTies { every_horizontal, every_vertical, .. } => {
+            readonly_row(ui, label, format!("1/{every_horizontal} × 1/{every_vertical}"));
+        }
+        // A slab's bars by their spacing, its radial and trimming bars by their count.
+        L::SlabStraight { spacing, .. }
+        | L::SlabRing { spacing, .. }
+        | L::StripTransverse { spacing, .. }
+        | L::StripLongitudinal { spacing, .. } => {
+            length_row(ui, state, label, id, "rebar-spacing", spacing, |e, v| {
+                if let ElementKind::Rebar(x) = &mut e.kind
+                    && let L::SlabStraight { spacing, .. }
+                    | L::SlabRing { spacing, .. }
+                    | L::StripTransverse { spacing, .. }
+                    | L::StripLongitudinal { spacing, .. } = &mut x.layout
+                {
+                    *spacing = v.max(cc_core::wall_bars::MIN_SPACING);
+                }
+            });
+        }
+        L::SlabRadial { count, .. } | L::SlabTrim { count, .. } => {
+            readonly_row(ui, label, format!("{count} ×"));
+        }
         L::Longitudinal { count, .. } => {
             let mut n = count;
             let r = row(ui, label, |ui| ui.add(DragValue::new(&mut n).range(1..=200).suffix(" ×")));
@@ -1060,10 +2328,35 @@ fn rebar_layout_row(ui: &mut Ui, state: &mut AppState, id: ElementId, label: &st
             }
             finish(state, &r);
         }
-        L::Stirrups { spacing } => {
+        L::Stirrups { spacing } | L::Ties { spacing } => {
             length_row(ui, state, label, id, "rebar-spacing", spacing, |e, v| {
                 if let ElementKind::Rebar(x) = &mut e.kind
-                    && let L::Stirrups { spacing } = &mut x.layout
+                    && let L::Stirrups { spacing } | L::Ties { spacing } = &mut x.layout
+                {
+                    *spacing = v.max(0.02);
+                }
+            });
+        }
+        // Side bars by their count on each face...
+        L::Sides { count, .. } if count > 0 => {
+            let mut n = count;
+            let r = row(ui, label, |ui| ui.add(DragValue::new(&mut n).range(1..=200).suffix(" ×")));
+            if r.changed() {
+                modify(state, id, "rebar-count", |e| {
+                    if let ElementKind::Rebar(x) = &mut e.kind
+                        && let L::Sides { count, .. } = &mut x.layout
+                    {
+                        *count = n;
+                    }
+                });
+            }
+            finish(state, &r);
+        }
+        // ...or by their spacing over the height.
+        L::Sides { spacing, .. } => {
+            length_row(ui, state, label, id, "rebar-spacing", spacing, |e, v| {
+                if let ElementKind::Rebar(x) = &mut e.kind
+                    && let L::Sides { spacing, .. } = &mut x.layout
                 {
                     *spacing = v.max(0.02);
                 }
@@ -1073,11 +2366,34 @@ fn rebar_layout_row(ui: &mut Ui, state: &mut AppState, id: ElementId, label: &st
 }
 
 /// What a set is, in a word: its face, or stirrups.
-fn rebar_role(layout: cc_core::RebarLayout) -> String {
+fn rebar_role(layout: &cc_core::RebarLayout) -> String {
     match layout {
         cc_core::RebarLayout::Longitudinal { face, .. } => tr(face.key()),
         cc_core::RebarLayout::Stirrups { .. } => t!("bars-stirrups"),
+        cc_core::RebarLayout::Sides { .. } => t!("bars-sides"),
+        cc_core::RebarLayout::Ties { .. } | cc_core::RebarLayout::WallTies { .. } => t!("bars-ties"),
+        cc_core::RebarLayout::SlabStraight { top, angle_deg, .. } => {
+            format!("{} {angle_deg:.0}° · {}", t!("bars-slab-straight"), slab_layer(*top))
+        }
+        cc_core::RebarLayout::StripTransverse { top, .. } => {
+            format!("{} · {}", t!("bars-strip-transverse"), slab_layer(*top))
+        }
+        cc_core::RebarLayout::StripLongitudinal { top, .. } => {
+            format!("{} · {}", t!("bars-strip-longitudinal"), slab_layer(*top))
+        }
+        cc_core::RebarLayout::SlabRing { top, .. } => format!("{} · {}", t!("bars-slab-ring"), slab_layer(*top)),
+        cc_core::RebarLayout::SlabRadial { top, .. } => format!("{} · {}", t!("bars-slab-radial"), slab_layer(*top)),
+        cc_core::RebarLayout::SlabTrim { top, .. } => format!("{} · {}", t!("bars-slab-trim"), slab_layer(*top)),
+        cc_core::RebarLayout::WallHorizontal { side, .. } => {
+            format!("{} · {}", t!("bars-wall-horizontal"), tr(side.key()))
+        }
+        cc_core::RebarLayout::WallVertical { side, .. } => format!("{} · {}", t!("bars-wall-vertical"), tr(side.key())),
     }
+}
+
+/// A slab layer's name.
+fn slab_layer(top: bool) -> String {
+    if top { t!("bars-top") } else { t!("bars-bottom") }
 }
 
 /// The reinforcement sets of a beam or column: each editable or removable,
@@ -1086,13 +2402,13 @@ fn reinforcement(ui: &mut Ui, state: &mut AppState, host: ElementId) {
     let sets: Vec<(ElementId, cc_core::RebarLayout, String)> = state
         .project()
         .rebar_of(host)
-        .map(|(e, r)| (e.id, r.layout, state.project().type_name(e.type_id).to_string()))
+        .map(|(e, r)| (e.id, r.layout.clone(), state.project().type_name(e.type_id).to_string()))
         .collect();
     section(ui, "reinforcement", t!("section-reinforcement"), |ui| {
         let mut remove = None;
         for (id, layout, name) in &sets {
-            let label = format!("{} · {name}", rebar_role(*layout));
-            rebar_layout_row(ui, state, *id, &label, *layout);
+            let label = format!("{} · {name}", rebar_role(layout));
+            rebar_layout_row(ui, state, *id, &label, layout);
             if row(ui, "", |ui| ui.small_button(t!("action-remove-rebar")).clicked()) {
                 remove = Some(*id);
             }
@@ -1100,14 +2416,43 @@ fn reinforcement(ui: &mut Ui, state: &mut AppState, host: ElementId) {
         if let Some(id) = remove {
             crate::actions::run_command(state, cc_engine::commands::modify::ElementsDelete { ids: vec![id.0] });
         }
+        let wall = matches!(state.project().element(host).map(|e| &e.kind), Some(ElementKind::Wall(_)));
         if sets.is_empty() && row(ui, "", |ui| ui.button(t!("action-rebar-typical")).clicked()) {
-            let command = cc_engine::commands::rebar::RebarTypical { elements: vec![host.0], level: None };
+            let kind = state.project().element(host).map(|e| e.kind.clone());
+            let strip = matches!(
+                &kind,
+                Some(ElementKind::Foundation(f)) if matches!(f.shape, cc_core::FoundationShape::Strip { .. })
+            );
+            let slab = !strip && matches!(&kind, Some(ElementKind::Floor(_) | ElementKind::Foundation(_)));
+            if strip {
+                let command =
+                    cc_engine::commands::strip_rebar::StripRebarCreate { strips: vec![host.0], ..Default::default() };
+                crate::actions::run_command(state, command);
+            } else if wall {
+                let command =
+                    cc_engine::commands::wall_rebar::WallRebarCreate { walls: vec![host.0], ..Default::default() };
+                crate::actions::run_command(state, command);
+            } else if slab {
+                let command =
+                    cc_engine::commands::slab_rebar::SlabRebarCreate { slabs: vec![host.0], ..Default::default() };
+                crate::actions::run_command(state, command);
+            } else {
+                let command = cc_engine::commands::rebar::RebarTypical { elements: vec![host.0], level: None };
+                crate::actions::run_command(state, command);
+            }
+        }
+        // A reinforced beam without side bars can get them.
+        let beam = matches!(state.project().element(host).map(|e| &e.kind), Some(ElementKind::Beam(_)));
+        let sides = sets.iter().any(|(_, layout, _)| matches!(layout, cc_core::RebarLayout::Sides { .. }));
+        if beam && !sets.is_empty() && !sides && row(ui, "", |ui| ui.small_button(t!("action-rebar-sides")).clicked()) {
+            let command =
+                cc_engine::commands::rebar::RebarCreate { host: host.0, layout: "sides".into(), ..Default::default() };
             crate::actions::run_command(state, command);
         }
         if !sets.is_empty() {
             let geom = state.session.geom();
             let weight: f64 = sets.iter().filter_map(|(id, ..)| geom.rebar.get(id)).map(|r| r.weight()).sum();
-            readonly_row(ui, &t!("col-weight"), format!("{} kg", format::number(weight, 2)));
+            readonly_row(ui, &t!("col-weight"), format::quantity(format::Quantity::Mass, weight, 2));
         }
     });
 }
@@ -1121,19 +2466,24 @@ fn rebar_props(ui: &mut Ui, state: &mut AppState, el: &Element, r: &cc_core::Reb
             .element(r.host)
             .map_or(String::new(), |h| if h.mark.is_empty() { tr(h.category().key()) } else { h.mark.clone() });
         readonly_row(ui, &t!("col-host"), host);
-        rebar_layout_row(ui, state, id, &rebar_role(r.layout), r.layout);
+        rebar_layout_row(ui, state, id, &rebar_role(&r.layout), &r.layout);
         length_row(ui, state, &t!("prop-cover"), id, "rebar-cover", r.cover, |e, v| {
             if let ElementKind::Rebar(x) = &mut e.kind {
                 x.cover = v.max(0.0);
             }
         });
     });
+    rebar_dimensions(ui, state, id);
+}
+
+/// Count, lengths and weight of a set of bars.
+fn rebar_dimensions(ui: &mut Ui, state: &mut AppState, id: cc_core::ElementId) {
     if let Some(set) = state.session.geom().rebar.get(&id).cloned() {
         section(ui, "dimensions", t!("section-dimensions"), |ui| {
             readonly_row(ui, &t!("col-bar-count"), set.count().to_string());
             readonly_row(ui, &t!("col-bar-length"), format::length(set.bar_length()));
             readonly_row(ui, &t!("prop-length"), format::length(set.total_length()));
-            readonly_row(ui, &t!("col-weight"), format!("{} kg", format::number(set.weight(), 2)));
+            readonly_row(ui, &t!("col-weight"), format::quantity(format::Quantity::Mass, set.weight(), 2));
         });
     }
 }
@@ -1166,6 +2516,68 @@ fn beam_justification(ui: &mut Ui, state: &mut AppState, id: cc_core::ElementId,
     }
 }
 
+/// A roof's covering and framing, from its type: the tiles and how many,
+/// their weight, the roof's slope against the least the tiles take, and
+/// the framing's lengths and volume.
+fn roofing_rows(ui: &mut Ui, state: &mut AppState, el: &Element) {
+    use cc_geom::roof_framing::MemberKind;
+    let Some(cc_core::TypeData::Roof { covering, framing, .. }) =
+        state.project().element_type(el.type_id).map(|t| &t.data)
+    else {
+        return;
+    };
+    if covering.is_none() && framing.system == cc_core::roofing::FramingSystem::None {
+        return;
+    }
+    let covering = *covering;
+    let Some(g) = state.session.geom().roof_framing.get(&el.id) else { return };
+    section(ui, "roofing", t!("section-roofing"), |ui| {
+        if let Some(kind) = covering {
+            let spec = kind.spec();
+            readonly_row(ui, &t!("prop-covering"), tr(kind.key()));
+            let slope = g.slopes.map(|(lo, _)| lo);
+            let ok = slope.is_some_and(|s| spec.accepts(s));
+            let text = match slope {
+                Some(s) => t!("value-slope-min", "slope" => format::slope(s), "min" => format::slope(spec.min_slope)),
+                None => t!("msg-roof-flat-tiles"),
+            };
+            row(ui, &t!("prop-slope"), |ui| {
+                let color = if ok { PALETTE.text } else { PALETTE.danger };
+                ui.label(RichText::new(text).color(color)).on_hover_text(if ok {
+                    String::new()
+                } else {
+                    t!("hint-roof-too-flat")
+                })
+            });
+            if let Some(n) = spec.tiles(g.sloped_area) {
+                readonly_row(ui, &t!("col-tile-count"), format!("{n:.0}"));
+            }
+            readonly_row(
+                ui,
+                &t!("col-weight"),
+                format::quantity(format::Quantity::Mass, spec.weight_on(g.sloped_area), 0),
+            );
+        }
+        if !g.members.is_empty() {
+            if g.trusses > 0 {
+                readonly_row(ui, &t!("prop-truss-count"), g.trusses.to_string());
+            }
+            for (label, kind) in [
+                ("prop-truss", MemberKind::Truss),
+                ("prop-purlin", MemberKind::Purlin),
+                ("prop-rafter", MemberKind::Rafter),
+                ("prop-batten", MemberKind::Batten),
+            ] {
+                let length = g.length(kind);
+                if length > 0.0 {
+                    readonly_row(ui, &tr(label), format::length(length));
+                }
+            }
+            readonly_row(ui, &t!("col-framing-volume"), format::volume(g.volume()));
+        }
+    });
+}
+
 /// Base and top constraints, location line and room bounding of a wall.
 fn wall_constraints(ui: &mut Ui, state: &mut AppState, el: &Element, w: &cc_core::Wall) {
     use cc_core::{LocationLine, WallTop};
@@ -1194,7 +2606,7 @@ fn wall_constraints(ui: &mut Ui, state: &mut AppState, el: &Element, w: &cc_core
         [(t!("prop-join-start"), true, w.join_start), (t!("prop-join-end"), false, w.join_end)]
     {
         let mut on = value;
-        if row(ui, &label, |ui| ui.checkbox(&mut on, "")).changed() {
+        if row(ui, &label, |ui| crate::table::checkbox(ui, &mut on)).changed() {
             crate::engine_edit::element(state, id, None, |x| {
                 if let ElementKind::Wall(w) = &mut x.kind {
                     if at_start {
@@ -1213,6 +2625,20 @@ fn wall_constraints(ui: &mut Ui, state: &mut AppState, el: &Element, w: &cc_core
             w.base_offset = v;
         }
     });
+
+    // The roof, ceiling or floor the top is attached to, if any.
+    if let Some(target) = w.attach_top {
+        let text = state
+            .project()
+            .element(target)
+            .map(|e| format!("{} {}", tr(e.category().key()), e.mark).trim().to_string())
+            .unwrap_or_default();
+        readonly_row(ui, &t!("prop-attached-to"), text);
+        if ui.button(t!("tool-detach-top")).clicked() {
+            let command = cc_engine::commands::modify::WallAttach { ids: vec![id.0], top: None, detach: true };
+            crate::actions::run_command(state, command);
+        }
+    }
 
     // Top: unconnected (explicit height) or attached to a level.
     let levels: Vec<_> = state.project().levels.iter().map(|l| (l.id, l.name.clone())).collect();
@@ -1270,7 +2696,7 @@ fn wall_constraints(ui: &mut Ui, state: &mut AppState, el: &Element, w: &cc_core
     }
 
     let mut bounding = w.room_bounding;
-    if row(ui, &t!("prop-room-bounding"), |ui| ui.checkbox(&mut bounding, "")).changed() {
+    if row(ui, &t!("prop-room-bounding"), |ui| crate::table::checkbox(ui, &mut bounding)).changed() {
         set(state, "bounding", &|w| w.room_bounding = bounding);
     }
 }
@@ -1340,17 +2766,16 @@ fn roof_rows(ui: &mut Ui, state: &mut AppState, id: ElementId, r: &cc_core::Roof
     }
     if let RoofShape::Gable { slope, ridge_deg } | RoofShape::Shed { slope, direction_deg: ridge_deg } = r.shape {
         let is_gable = matches!(r.shape, RoofShape::Gable { .. });
-        let mut pct = slope * 100.0;
-        let rs = row(ui, &t!("prop-slope"), |ui| {
-            ui.add(DragValue::new(&mut pct).speed(0.5).range(0.0..=200.0).suffix(" %"))
-        });
+        // Rise over run, shown in the project's slope unit.
+        let mut ratio = slope;
+        let rs = row(ui, &t!("prop-slope"), |ui| ui.add(slope_drag(&mut ratio).range(0.0..=2.0)));
         let mut dir = ridge_deg;
         let label = if is_gable { t!("prop-ridge-direction") } else { t!("prop-direction") };
         let rd = row(ui, &label, |ui| ui.add(DragValue::new(&mut dir).speed(1.0).suffix("°")));
         if rs.changed() || rd.changed() {
             modify(state, id, "shape", |e| {
                 if let ElementKind::Roof(r) = &mut e.kind {
-                    let (slope, angle) = (pct / 100.0, dir.rem_euclid(360.0));
+                    let (slope, angle) = (ratio, dir.rem_euclid(360.0));
                     r.shape = if is_gable {
                         RoofShape::Gable { slope, ridge_deg: angle }
                     } else {
@@ -1363,14 +2788,12 @@ fn roof_rows(ui: &mut Ui, state: &mut AppState, id: ElementId, r: &cc_core::Roof
         finish(state, &rd);
     }
     if let RoofShape::Hip { slope } = r.shape {
-        let mut pct = slope * 100.0;
-        let rs = row(ui, &t!("prop-slope"), |ui| {
-            ui.add(DragValue::new(&mut pct).speed(0.5).range(0.0..=200.0).suffix(" %"))
-        });
+        let mut ratio = slope;
+        let rs = row(ui, &t!("prop-slope"), |ui| ui.add(slope_drag(&mut ratio).range(0.0..=2.0)));
         if rs.changed() {
             modify(state, id, "shape", |e| {
                 if let ElementKind::Roof(r) = &mut e.kind {
-                    r.shape = RoofShape::Hip { slope: pct / 100.0 };
+                    r.shape = RoofShape::Hip { slope: ratio };
                 }
             });
         }
@@ -1422,7 +2845,7 @@ fn roof_edge_rows(ui: &mut Ui, state: &mut AppState, id: ElementId, r: &cc_core:
             Some(_) => 2,
         };
         let mut choice = current;
-        let mut pct = effective.get(i).copied().unwrap_or(slope) * 100.0;
+        let mut ratio = effective.get(i).copied().unwrap_or(slope);
         let label = t!("prop-roof-edge", "n" => i + 1, "length" => format::length(a.distance(b)));
         let mut drag = None;
         row(ui, &label, |ui| {
@@ -1435,7 +2858,7 @@ fn roof_edge_rows(ui: &mut Ui, state: &mut AppState, id: ElementId, r: &cc_core:
                 },
             );
             if current == 2 {
-                drag = Some(ui.add(DragValue::new(&mut pct).speed(0.5).range(0.1..=200.0).suffix(" %")));
+                drag = Some(ui.add(slope_drag(&mut ratio).range(0.001..=2.0)));
             }
         });
         if choice != current {
@@ -1453,7 +2876,7 @@ fn roof_edge_rows(ui: &mut Ui, state: &mut AppState, id: ElementId, r: &cc_core:
                             r.edge_slopes.resize(i + 1, None);
                         }
                         if let Some(s) = r.edge_slopes.get_mut(i) {
-                            *s = Some((pct / 100.0).max(0.001));
+                            *s = Some(ratio.max(0.001));
                         }
                     }
                 });
@@ -1485,32 +2908,86 @@ fn view_props(ui: &mut Ui, state: &mut AppState, id: ViewId) {
         let category_name = tr(view.category().key());
         header_block(ui, crate::browser::category_icon(view.category()), &view.name, &category_name);
     });
+    crate::callout_ui::view_rows(ui, state, id);
+    view_sections(ui, state, id);
+}
 
+/// The sections of a view's properties (also shown for a view placed on a
+/// sheet, so it can be changed there).
+fn view_sections(ui: &mut Ui, state: &mut AppState, id: ViewId) {
+    let Some(view) = state.project().view(id).cloned() else { return };
     let graphical = !matches!(view.kind, ViewKind::Schedule { .. } | ViewKind::Sheet { .. });
     if graphical {
         section(ui, "graphics", t!("section-graphics"), |ui| {
             crate::graphics_dialog::view_rows(ui, state, id);
             let mut scale = view.scale;
+            let system = state.project().measurement_system();
             if crate::graphics_dialog::controlled(state, id, "scale") {
-                readonly_row(ui, &t!("prop-scale"), format!("1:{scale}"));
+                readonly_row(ui, &t!("prop-scale"), cc_core::scale::label(system, scale));
             } else {
                 row(ui, &t!("prop-scale"), |ui| {
-                    egui::ComboBox::from_id_salt(("scale", id.0)).selected_text(format!("1:{scale}")).show_ui(
-                        ui,
-                        |ui| {
-                            for s in SCALES {
-                                ui.selectable_value(&mut scale, s, format!("1:{s}"));
+                    egui::ComboBox::from_id_salt(("scale", id.0))
+                        .selected_text(cc_core::scale::label(system, scale))
+                        .show_ui(ui, |ui| {
+                            for &s in cc_core::scale::choices(system) {
+                                ui.selectable_value(&mut scale, s, cc_core::scale::label(system, s));
                             }
-                        },
-                    );
+                        });
                 });
             }
             if scale != view.scale {
                 crate::engine_edit::view(state, id, None, |v| v.scale = scale);
             }
+            // Views of the model draw it at a detail level; drafting views
+            // keep one for what is drawn in them.
+            let model_view = cc_core::ViewTemplate::applies_to(&view.kind);
+            if model_view || view.is_drafting() {
+                let mut detail = view.detail;
+                if crate::graphics_dialog::controlled(state, id, "detail") {
+                    readonly_row(ui, &t!("prop-detail-level"), tr(detail.key()));
+                } else {
+                    row(ui, &t!("prop-detail-level"), |ui| {
+                        egui::ComboBox::from_id_salt(("detail", id.0)).selected_text(tr(detail.key())).show_ui(
+                            ui,
+                            |ui| {
+                                for level in cc_core::DetailLevel::ALL {
+                                    ui.selectable_value(&mut detail, level, tr(level.key()));
+                                }
+                            },
+                        );
+                    });
+                }
+                if detail != view.detail {
+                    crate::engine_edit::view(state, id, None, |v| v.detail = detail);
+                }
+            }
+            if model_view {
+                // And in a visual style.
+                let current = view.style();
+                let mut style = current;
+                if crate::graphics_dialog::controlled(state, id, "visual_style") {
+                    readonly_row(ui, &t!("prop-visual-style"), tr(style.key()));
+                } else {
+                    row(ui, &t!("prop-visual-style"), |ui| {
+                        egui::ComboBox::from_id_salt(("visual-style", id.0)).selected_text(tr(style.key())).show_ui(
+                            ui,
+                            |ui| {
+                                for s in cc_core::VisualStyle::ALL {
+                                    ui.selectable_value(&mut style, s, tr(s.key()));
+                                }
+                            },
+                        );
+                    });
+                }
+                if style != current {
+                    crate::engine_edit::view(state, id, None, |v| v.visual_style = Some(style));
+                }
+            }
+            // The sun of plans, 3D views, elevations and sections.
+            crate::sun_ui::view_rows(ui, state, id);
             if let ViewKind::ThreeD { analytical, .. } = view.kind {
                 let mut on = analytical;
-                if row(ui, &t!("prop-analytical"), |ui| ui.checkbox(&mut on, "")).changed() {
+                if row(ui, &t!("prop-analytical"), |ui| crate::table::checkbox(ui, &mut on)).changed() {
                     crate::engine_edit::view(state, id, None, |v| {
                         if let ViewKind::ThreeD { analytical, .. } = &mut v.kind {
                             *analytical = on;
@@ -1526,17 +3003,17 @@ fn view_props(ui: &mut Ui, state: &mut AppState, id: ViewId) {
     }
 
     match &view.kind {
-        ViewKind::FloorPlan { level, cut_height, .. } | ViewKind::CeilingPlan { level, cut_height } => {
+        ViewKind::FloorPlan { level, cut_height, .. } | ViewKind::CeilingPlan { level, cut_height, .. } => {
             if let ViewKind::FloorPlan { structural, structure_tags, .. } = view.kind {
                 let locked = crate::graphics_dialog::controlled(state, id, "structural");
                 section(ui, "structure-display", t!("section-structural"), |ui| {
                     let (mut s, mut tags) = (structural, structure_tags);
                     let a = row(ui, &t!("prop-structural-plan"), |ui| {
-                        ui.add_enabled(!locked, egui::Checkbox::without_text(&mut s))
+                        ui.add_enabled(!locked, crate::table::boxed(egui::Checkbox::without_text(&mut s)))
                     })
                     .changed();
                     let b = row(ui, &t!("prop-structure-tags"), |ui| {
-                        ui.add_enabled(!locked, egui::Checkbox::without_text(&mut tags))
+                        ui.add_enabled(!locked, crate::table::boxed(egui::Checkbox::without_text(&mut tags)))
                     })
                     .changed();
                     if a || b {
@@ -1566,8 +3043,25 @@ fn view_props(ui: &mut Ui, state: &mut AppState, id: ViewId) {
                 }
                 finish(state, &r);
             });
+            // Other levels' plans under this one.
+            if let Some(u) = view.kind.underlay() {
+                let (old, mut u) = (*u, *u);
+                let locked = crate::graphics_dialog::controlled(state, id, "underlay");
+                let level = *level;
+                section(ui, "underlay", t!("section-underlay"), |ui| {
+                    if underlay_rows(ui, state, id.0, Some(level), !locked, &mut u) {
+                        let command = cc_engine::commands::views::ViewSet {
+                            view: cc_engine::Ref::Id(id.0),
+                            params: Some(serde_json::json!({ "underlay": underlay_patch(&old, &u) })),
+                            ..Default::default()
+                        };
+                        crate::actions::run_command(state, command);
+                    }
+                });
+            }
         }
-        ViewKind::Section { depth, .. } => {
+        ViewKind::Section { depth, start, end, segments } => {
+            let (length, segments) = (start.distance(*end), *segments);
             section(ui, "extents", t!("section-extents"), |ui| {
                 let mut d = *depth;
                 let r = row(ui, &t!("prop-depth"), |ui| {
@@ -1581,11 +3075,33 @@ fn view_props(ui: &mut Ui, state: &mut AppState, id: ViewId) {
                     });
                 }
                 finish(state, &r);
-                if row(ui, "", |ui| ui.button(t!("prop-flip-section")).clicked()) {
-                    crate::engine_edit::view(state, id, None, |x| {
-                        if let ViewKind::Section { start, end, .. } = &mut x.kind {
-                            std::mem::swap(start, end);
+                let mut split = segments.is_some();
+                if row(ui, &t!("prop-split-line"), |ui| crate::table::checkbox(ui, &mut split)).changed() {
+                    crate::section_mark::set_split(state, id, split);
+                }
+                if let Some(pieces) = segments {
+                    for (i, label) in [t!("prop-segment-start"), t!("prop-segment-end")].iter().enumerate() {
+                        let mut v = pieces[i];
+                        let max = (length - pieces[1 - i]).clamp(0.0, cc_core::MAX_SECTION_SEGMENT);
+                        let r = row(ui, label, |ui| {
+                            ui.add(crate::properties::length_drag(&mut v).speed(0.05).range(0.0..=max))
+                        });
+                        if r.changed() {
+                            crate::engine_edit::view(state, id, Some(key((id, "segment", i))), |x| {
+                                if let ViewKind::Section { segments: Some(s), .. } = &mut x.kind
+                                    && let Some(slot) = s.get_mut(i)
+                                {
+                                    *slot = v;
+                                }
+                            });
                         }
+                        finish(state, &r);
+                    }
+                }
+                let flip = row(ui, "", |ui| ui.button(t!("prop-flip-section")).on_hover_text(t!("tip-flip-section")));
+                if flip.clicked() {
+                    crate::engine_edit::view(state, id, None, |x| {
+                        x.kind.flip_section();
                     });
                 }
             });
@@ -1594,37 +3110,19 @@ fn view_props(ui: &mut Ui, state: &mut AppState, id: ViewId) {
             section(ui, "graphics", t!("section-graphics"), |ui| {
                 readonly_row(ui, &t!("prop-category"), actions::t_category(*category));
             });
+            section(ui, "schedule", t!("schedule-section"), |ui| crate::schedule_ui::props(ui, state, id));
         }
-        ViewKind::Sheet { number, size, .. } => {
-            section(ui, "sheet", t!("section-graphics"), |ui| {
-                view_text_row(ui, state, id, &t!("prop-sheet-number"), "number", number.clone(), |v, s| {
-                    if let ViewKind::Sheet { number, .. } = &mut v.kind {
-                        *number = s;
-                    }
-                });
-                let mut sz = *size;
-                row(ui, &t!("prop-sheet-size"), |ui| {
-                    egui::ComboBox::from_id_salt(("size", id.0)).selected_text(sz.label()).show_ui(ui, |ui| {
-                        for s in SheetSize::ALL {
-                            ui.selectable_value(&mut sz, s, s.label());
-                        }
-                    });
-                });
-                if sz != *size {
-                    crate::engine_edit::view(state, id, None, |x| {
-                        if let ViewKind::Sheet { size, .. } = &mut x.kind {
-                            *size = sz;
-                        }
-                    });
-                    if let Some(st) = state.view2d.get_mut(&id) {
-                        st.fitted = false;
-                    }
-                }
-            });
+        ViewKind::Sheet { .. } => {
+            section(ui, "sheet", t!("section-graphics"), |ui| crate::sheet_props::rows(ui, state, id));
         }
-        ViewKind::ThreeD { .. } | ViewKind::Legend { .. } | ViewKind::Elevation { .. } | ViewKind::Diagram { .. } => {}
+        ViewKind::ThreeD { .. }
+        | ViewKind::Legend { .. }
+        | ViewKind::Drafting { .. }
+        | ViewKind::Elevation { .. }
+        | ViewKind::Diagram { .. } => {}
     }
     crate::phases_dialog::view_section(ui, state, id);
+    crate::design_options_ui::view_section(ui, state, id);
 
     section(ui, "identity", t!("section-identity"), |ui| {
         view_text_row(ui, state, id, &t!("prop-name"), "name", view.name.clone(), |v, s| v.name = s);
@@ -1635,6 +3133,7 @@ fn view_props(ui: &mut Ui, state: &mut AppState, id: ViewId) {
             section(ui, "legend-types", t!("prop-legend-types"), |ui| legend_types(ui, state, id, types));
         }
         ViewKind::Sheet { viewports, .. } => {
+            crate::sheet_props::fields_section(ui, state, id);
             section(ui, "sheet-views", t!("prop-sheet-views"), |ui| sheet_views(ui, state, id, viewports));
         }
         _ => {}
@@ -1645,7 +3144,7 @@ fn legend_types(ui: &mut Ui, state: &mut AppState, id: ViewId, current: &[cc_cor
     let all: Vec<_> = state.project().types.values().map(|t| (t.id, t.name.clone())).collect();
     for (tid, name) in all {
         let mut on = current.contains(&tid);
-        if row(ui, &name, |ui| ui.checkbox(&mut on, "")).changed() {
+        if row(ui, &name, |ui| crate::table::checkbox(ui, &mut on)).changed() {
             crate::engine_edit::view(state, id, None, |x| {
                 if let ViewKind::Legend { types } = &mut x.kind {
                     if on {
@@ -1698,7 +3197,7 @@ fn viewport_props(ui: &mut Ui, state: &mut AppState, sheet: ViewId, index: usize
     section(ui, "position", t!("section-position"), |ui| {
         for (label, axis) in [(t!("prop-center-x"), 0), (t!("prop-center-y"), 1)] {
             let mut v = vp.center[axis];
-            let r = row(ui, &label, |ui| ui.add(DragValue::new(&mut v).speed(1.0).fixed_decimals(1).suffix(" mm")));
+            let r = row(ui, &label, |ui| ui.add(paper_drag(&mut v).speed(1.0).fixed_decimals(1)));
             if r.changed() {
                 crate::engine_edit::view(state, sheet, Some(key((sheet, index, axis))), |x| {
                     if let ViewKind::Sheet { viewports, .. } = &mut x.kind
@@ -1721,4 +3220,15 @@ fn viewport_props(ui: &mut Ui, state: &mut AppState, sheet: ViewId, index: usize
             }
         });
     });
+    // The placed view's own properties: its scale, graphics, crop and phase
+    // change here, and the sheet follows.
+    view_sections(ui, state, vp.view);
+}
+
+/// A stair side's name, walking up.
+fn side_name(side: cc_core::StairSide) -> String {
+    match side {
+        cc_core::StairSide::Left => t!("stair-turn-left"),
+        cc_core::StairSide::Right => t!("stair-turn-right"),
+    }
 }

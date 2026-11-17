@@ -3,9 +3,52 @@
 use crate::state::{AppState, PendingAction};
 use crate::t;
 use crate::tools::Tool;
-use cc_core::{Category, Document, LevelId, Project, ViewCategory, ViewId, ViewKind};
+use cc_core::{Category, Document, ElementId, LevelId, Project, ViewCategory, ViewId, ViewKind};
 use cc_engine::Ref;
 use cc_engine::commands::{io, levels, project, views};
+
+/// The type of `category` in the Structure tab's material (made when the
+/// project has none, as an undo step).
+pub fn material_type_ref(state: &mut AppState, category: Category) -> Option<cc_engine::Ref> {
+    let material = state.prefs.structure_material;
+    let command = cc_engine::commands::structure_material::StructuralTypeFor {
+        category: if category == Category::Column { "column" } else { "beam" }.into(),
+        material: material.code().into(),
+    };
+    run_command(state, command).and_then(|o| o["id"].as_u64()).map(cc_engine::Ref::Id)
+}
+
+/// Make the material's type, then run the command built from it; when the type cannot be
+/// made the error is shown and nothing runs, and when the command fails the type's undo
+/// step is taken back.
+fn run_with_type<C: cc_engine::Command + serde::Serialize>(
+    state: &mut AppState,
+    category: Category,
+    build: impl FnOnce(&mut AppState, cc_engine::Ref) -> C,
+) -> Option<serde_json::Value> {
+    let depth = state.session.doc.undo_depth();
+    let type_ref = material_type_ref(state, category)?;
+    let command = build(state, type_ref);
+    let out = run(state, command);
+    if out.is_none() {
+        state.session.undo_to(depth);
+    }
+    out
+}
+
+/// Start the column or beam tool of the Structure tab on a type of `material`.
+pub fn structure_place(state: &mut AppState, category: Category, material: cc_core::StructuralMaterial) {
+    state.prefs.structure_material = material;
+    let Some(cc_engine::Ref::Id(id)) = material_type_ref(state, category) else { return };
+    let type_id = cc_core::ElementTypeId(id);
+    let material = Some(material);
+    let tool = if category == Category::Column {
+        Tool::Column { type_id, material }
+    } else {
+        Tool::Beam { type_id, material }
+    };
+    state.set_tool(tool);
+}
 
 /// Run an engine command; failures go to the status bar.
 pub fn run_command<C: cc_engine::Command + serde::Serialize>(
@@ -59,6 +102,10 @@ pub fn new_legend(state: &mut AppState) -> Option<ViewId> {
     new_view(state, "legend", None, None)
 }
 
+pub fn new_drafting_view(state: &mut AppState) -> Option<ViewId> {
+    new_view(state, "drafting", None, None)
+}
+
 pub fn new_schedule(state: &mut AppState, category: Category) -> Option<ViewId> {
     new_view(state, "schedule", None, Some(category))
 }
@@ -71,8 +118,9 @@ pub fn t_category(category: Category) -> String {
     crate::i18n::tr(category.key())
 }
 
-pub fn duplicate_view(state: &mut AppState, id: ViewId) {
-    if let Some(new) = run(state, views::ViewDuplicate { view: Ref::Id(id.0) }).as_ref().and_then(view_id) {
+/// Copy a view and open the copy; with `detailing`, what is drawn in it too.
+pub fn duplicate_view(state: &mut AppState, id: ViewId, detailing: bool) {
+    if let Some(new) = run(state, views::ViewDuplicate { view: Ref::Id(id.0), detailing }).as_ref().and_then(view_id) {
         state.open_view(new);
     }
 }
@@ -96,7 +144,8 @@ pub fn rename_view(state: &mut AppState, id: ViewId, name: String) {
             scale: None,
             params: None,
             phase: None,
-            phase_filter: None,
+            detail: None,
+            ..Default::default()
         },
     );
 }
@@ -110,6 +159,21 @@ pub fn place_on_sheet(state: &mut AppState, sheet: ViewId, view: ViewId) {
     run(state, views::SheetPlaceView { sheet: Ref::Id(sheet.0), view: Ref::Id(view.0), center: None });
 }
 
+/// Place `view` on `sheet` centered at `center` (paper millimeters) and
+/// select the new viewport; errors (already on a sheet…) go to the status bar.
+pub fn place_on_sheet_at(state: &mut AppState, sheet: ViewId, view: ViewId, center: glam::DVec2) {
+    let command =
+        views::SheetPlaceView { sheet: Ref::Id(sheet.0), view: Ref::Id(view.0), center: Some([center.x, center.y]) };
+    if run(state, command).is_some() {
+        let index = match state.project().view(sheet).map(|v| &v.kind) {
+            Some(ViewKind::Sheet { viewports, .. }) => viewports.iter().position(|vp| vp.view == view),
+            _ => None,
+        };
+        state.sheet_selection = index.map(|i| (sheet, i));
+        state.selection.clear();
+    }
+}
+
 pub fn remove_viewport(state: &mut AppState, sheet: ViewId, index: usize) {
     let view = match state.project().view(sheet).map(|v| &v.kind) {
         Some(ViewKind::Sheet { viewports, .. }) => viewports.get(index).map(|vp| vp.view),
@@ -121,9 +185,12 @@ pub fn remove_viewport(state: &mut AppState, sheet: ViewId, index: usize) {
     state.sheet_selection = None;
 }
 
-/// Add a level above the highest one, with its floor and ceiling plans.
-pub fn add_level(state: &mut AppState) {
-    run(state, levels::LevelCreate { name: None, elevation: None, plans: None });
+/// Add a level as a new storey above (or below) `level`, with its plans; the
+/// levels beyond it move away, so the order of the levels stays.
+pub fn add_level_beside(state: &mut AppState, level: LevelId, above: bool) -> Option<LevelId> {
+    let beside = Some(Ref::Id(level.0));
+    let (above, below) = if above { (beside, None) } else { (None, beside) };
+    run(state, levels::LevelCreate { above, below, ..Default::default() })?["id"].as_u64().map(LevelId)
 }
 
 /// Delete a level and its plan views; refused while elements use it.
@@ -144,6 +211,36 @@ pub fn activate_category_tool(state: &mut AppState, category: Category) {
     if category == Category::Ramp && state.project().default_type(Category::Ramp).is_none() {
         run_command(state, cc_engine::commands::ramp::RampTypeCreate::default());
     }
+    if category == Category::Mass && state.project().default_type(Category::Mass).is_none() {
+        run_command(state, cc_engine::commands::mass::MassTypeCreate::default());
+    }
+    if category == Category::Shaft && state.project().default_type(Category::Shaft).is_none() {
+        run_command(state, cc_engine::commands::shaft::ShaftTypeCreate::default());
+    }
+    if category == Category::Topography && state.project().default_type(Category::Topography).is_none() {
+        run_command(state, cc_engine::commands::topography::TopographyTypeCreate::default());
+    }
+    if category == Category::Pad && state.project().default_type(Category::Pad).is_none() {
+        run_command(state, cc_engine::commands::pad::PadTypeCreate::default());
+    }
+    if category == Category::LightningConductor && state.project().default_type(Category::LightningConductor).is_none()
+    {
+        run_command(state, cc_engine::commands::lightning::LpsConductorTypeCreate::default());
+    }
+    if category == Category::CableTray && state.project().default_type(Category::CableTray).is_none() {
+        run_command(state, cc_engine::commands::cable_tray::CableTrayTypeCreate::default());
+    }
+    if category == Category::Valve && state.project().default_type(Category::Valve).is_none() {
+        let kinds = cc_core::ValveKind::ALL.iter().map(|k| k.name().to_string()).collect();
+        run_command(state, cc_engine::commands::valve::ValveTypeCreate { kinds, ..Default::default() });
+    }
+    // A project without a niche type gets one.
+    if category == Category::Niche && state.project().default_type(Category::Niche).is_none() {
+        run_command(state, cc_engine::commands::niche::NicheTypeCreate::default());
+    }
+    if category == Category::Sweep && state.project().default_type(Category::Sweep).is_none() {
+        run_command(state, cc_engine::commands::sweep::SweepTypeCreate::default());
+    }
     match Tool::for_category(state.project(), category) {
         Some(tool) => {
             // Doors and windows also go on walls clicked in a 3D view.
@@ -154,6 +251,13 @@ pub fn activate_category_tool(state: &mut AppState, category: Category) {
                     .is_some_and(|v| matches!(v.kind, cc_core::ViewKind::ThreeD { .. }));
             state.set_tool(tool);
             let in_plan = state.active_level().is_some();
+            // Pipes and conduits show only in the plans of their discipline:
+            // drawn in another plan they would vanish once created (#66).
+            if in_plan && let Some((discipline, message)) = services_plan_needed(state, category) {
+                open_mep_plan(state, discipline);
+                state.message = message;
+                return;
+            }
             state.message = match () {
                 _ if in_plan => String::new(),
                 _ if in_3d => t!("hint-hosted"),
@@ -162,6 +266,23 @@ pub fn activate_category_tool(state: &mut AppState, category: Category) {
         }
         None => state.message = t!("msg-no-type"),
     }
+}
+
+/// The services plan to draw `category` in (with the message telling so),
+/// when it is a pipe, conduit, cable tray, valve or lightning conductor and
+/// the active plan does not show it.
+fn services_plan_needed(state: &AppState, category: Category) -> Option<(cc_core::MepDiscipline, String)> {
+    let (discipline, message) = match category {
+        Category::Pipe => (cc_core::MepDiscipline::Plumbing, t!("msg-pipes-in-plumbing-plan")),
+        Category::Conduit => (cc_core::MepDiscipline::Electrical, t!("msg-conduits-in-electrical-plan")),
+        Category::CableTray => (cc_core::MepDiscipline::Electrical, t!("msg-trays-in-electrical-plan")),
+        Category::Valve => (cc_core::MepDiscipline::Plumbing, t!("msg-valves-in-plumbing-plan")),
+        Category::LightningConductor => (cc_core::MepDiscipline::Lightning, t!("msg-conductors-in-lightning-plan")),
+        _ => return None,
+    };
+    let view = state.active_view.and_then(|v| state.project().view(v))?;
+    let shown = matches!(view.kind, ViewKind::FloorPlan { mep: Some(d), .. } if d == discipline);
+    (!shown).then_some((discipline, message))
 }
 
 /// A new project from the template, named in the active UI language.
@@ -179,19 +300,15 @@ pub fn set_language(state: &mut AppState, lang: crate::i18n::Language) {
     state.message = t!("msg-language-changed");
 }
 
-/// Show the interface in `theme` (saved with the other preferences).
-pub fn set_theme(ctx: &egui::Context, state: &mut AppState, theme: crate::theme::ThemeChoice) {
-    if state.theme == theme {
-        return;
-    }
-    state.theme = theme;
-    crate::theme::set_theme(ctx, theme);
-}
-
 // --- Files ---
 
-fn file_dialog() -> rfd::FileDialog {
-    rfd::FileDialog::new().add_filter(t!("file-filter"), &["ccad"])
+/// The project file dialog, starting in the default projects folder when one is set.
+fn file_dialog(state: &AppState) -> rfd::FileDialog {
+    let dialog = rfd::FileDialog::new().add_filter(t!("file-filter"), &["ccad"]);
+    match state.prefs.projects_dir() {
+        Some(dir) => dialog.set_directory(dir),
+        None => dialog,
+    }
 }
 
 /// Run `action` now, or ask for confirmation first if there are unsaved changes.
@@ -205,8 +322,10 @@ pub fn guarded(state: &mut AppState, action: PendingAction) {
 
 pub fn run_pending(state: &mut AppState, action: PendingAction) {
     match action {
-        PendingAction::New => {
-            state.replace_document(Document::new(new_project()));
+        PendingAction::New(system) => {
+            state.replace_document(Document::new(cc_engine::new_project_with(system)));
+            // The New Project dialog picks it first next time.
+            state.prefs.new_project_system = system;
             state.message = t!("msg-new-project");
         }
         PendingAction::Open => open(state),
@@ -233,22 +352,35 @@ fn close_project(state: &mut AppState) {
 }
 
 pub fn open(state: &mut AppState) {
-    let Some(path) = file_dialog().pick_file() else { return };
+    let Some(path) = file_dialog(state).pick_file() else { return };
     open_path(state, path);
 }
 
+/// Open the project at `path`, read on a worker thread behind the progress dialog.
 pub fn open_path(state: &mut AppState, path: std::path::PathBuf) {
-    let mut session = cc_engine::Session::default();
-    match session.run(project::ProjectOpen { path: path.clone() }) {
+    let (file, shown) = (path.clone(), path.clone());
+    let run = move |s: &mut cc_engine::Session| s.run(project::ProjectOpen { path: file });
+    let finish: crate::jobs::Finish = Box::new(move |state, result, doc| opened(state, path, result, doc));
+    crate::jobs::start(state, t!("job-opening"), shown, crate::jobs::Base::Fresh, run, finish);
+}
+
+fn opened(
+    state: &mut AppState,
+    path: std::path::PathBuf,
+    result: cc_engine::Result<serde_json::Value>,
+    doc: Option<Document>,
+) {
+    match result {
         Ok(out) => {
+            let Some(doc) = doc else { return };
             let repairs = out["repairs"].as_u64().unwrap_or(0);
-            state.replace_document(session.doc);
+            state.replace_document(doc);
             state.message = if repairs > 0 {
                 t!("msg-opened-repaired", "path" => path.display(), "count" => repairs)
             } else {
                 t!("msg-opened", "path" => path.display())
             };
-            crate::home::push_recent(&mut state.recent, &path);
+            crate::home::push_recent(&mut state.recent, &path, state.prefs.recent_count);
             if crate::thumbnails::project_file(&path).is_some_and(|f| !f.exists()) {
                 state.thumbnail_jobs.push(crate::thumbnails::Job::Project(path));
             }
@@ -275,22 +407,42 @@ pub fn save_component(state: &mut AppState, name: &str) {
 /// Load a `.ccomp` file: its types (and missing materials) join the project
 /// in one undo step, and the component tool picks the first type.
 pub fn load_component(state: &mut AppState) {
-    let dialog = rfd::FileDialog::new().add_filter(t!("file-filter-component"), &["ccomp"]);
+    let dialog = rfd::FileDialog::new()
+        .add_filter(t!("file-filter-component"), &["ccomp"])
+        .add_filter(t!("file-filter-skp"), &["skp"]);
     let Some(path) = dialog.pick_file() else { return };
     load_component_path(state, path);
 }
 
 /// Load the component file at `path` (see [`load_component`]).
 pub fn load_component_path(state: &mut AppState, path: std::path::PathBuf) {
-    match state.session.run(io::ComponentLoad { path }) {
+    let skp = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("skp"));
+    let file = path.clone();
+    let run = move |s: &mut cc_engine::Session| {
+        if skp { s.run(io::SkpComponentLoad { path: file }) } else { s.run(io::ComponentLoad { path: file }) }
+    };
+    let finish: crate::jobs::Finish = Box::new(|state, result, _| component_loaded(state, result));
+    crate::jobs::start(state, t!("job-loading-component"), path, crate::jobs::Base::Current, run, finish);
+}
+
+fn component_loaded(state: &mut AppState, result: cc_engine::Result<serde_json::Value>) {
+    match result {
         Ok(out) => {
             if let Some(first) = out["types"].get(0).and_then(serde_json::Value::as_u64) {
                 // Doors and windows are placed in walls.
                 let type_id = cc_core::ElementTypeId(first);
+                // Title blocks are not placed: they open in the editor.
+                if state.project().element_type(type_id).map(|t| t.category()) == Some(cc_core::Category::TitleBlock) {
+                    // From the library, it previews sample values, not the active sheet.
+                    crate::component_env::open_on(state, type_id, None);
+                    let name = out["component"].as_str().unwrap_or_default().to_string();
+                    state.message = t!("msg-component-loaded", "name" => name);
+                    return;
+                }
                 state.set_tool(match state.project().element_type(type_id).map(|t| t.category()) {
-                    Some(category @ (cc_core::Category::Door | cc_core::Category::Window)) => {
-                        crate::tools::Tool::Hosted { category, type_id }
-                    }
+                    Some(
+                        category @ (cc_core::Category::Door | cc_core::Category::Window | cc_core::Category::Niche),
+                    ) => crate::tools::Tool::Hosted { category, type_id },
                     _ => crate::tools::Tool::Component { type_id },
                 });
             }
@@ -301,15 +453,51 @@ pub fn load_component_path(state: &mut AppState, path: std::path::PathBuf) {
     }
 }
 
+/// Insert a SketchUp model into the project, on the active view's level.
+pub fn import_skp(state: &mut AppState) {
+    let mut dialog = rfd::FileDialog::new().add_filter(t!("file-filter-skp"), &["skp"]);
+    if let Some(dir) = state.prefs.projects_dir() {
+        dialog = dialog.set_directory(dir);
+    }
+    let Some(path) = dialog.pick_file() else { return };
+    let level = state.active_level().map(|l| cc_engine::Ref::Id(l.0));
+    let command = io::SkpImport { path: path.clone(), level, position: None, rotation: None };
+    let shown = path.clone();
+    let finish: crate::jobs::Finish = Box::new(move |state, result, _| match result {
+        Ok(out) => {
+            let count = out["elements"].as_array().map_or(0, Vec::len);
+            state.message = t!("msg-skp-imported", "path" => path.display(), "count" => count);
+        }
+        Err(e) => state.dialogs.error = Some(t!("msg-import-failed", "error" => e.message)),
+    });
+    let run = move |s: &mut cc_engine::Session| s.run(command);
+    crate::jobs::start(state, t!("job-importing-skp"), shown, crate::jobs::Base::Current, run, finish);
+}
+
 /// Replace the document with a project imported from an IFC file. The
 /// result has no file path: saving asks where to write the `.ccad`.
 fn import_ifc(state: &mut AppState) {
-    let dialog = rfd::FileDialog::new().add_filter(t!("file-filter-ifc"), &["ifc"]);
+    let mut dialog = rfd::FileDialog::new().add_filter(t!("file-filter-ifc"), &["ifc"]);
+    if let Some(dir) = state.prefs.projects_dir() {
+        dialog = dialog.set_directory(dir);
+    }
     let Some(path) = dialog.pick_file() else { return };
-    let mut session = cc_engine::Session::default();
-    match session.run(io::IfcImport { path: path.clone() }) {
+    let (file, shown) = (path.clone(), path.clone());
+    let run = move |s: &mut cc_engine::Session| s.run(io::IfcImport { path: file });
+    let finish: crate::jobs::Finish = Box::new(move |state, result, doc| ifc_imported(state, path, result, doc));
+    crate::jobs::start(state, t!("job-importing-ifc"), shown, crate::jobs::Base::Fresh, run, finish);
+}
+
+fn ifc_imported(
+    state: &mut AppState,
+    path: std::path::PathBuf,
+    result: cc_engine::Result<serde_json::Value>,
+    doc: Option<Document>,
+) {
+    match result {
         Ok(report) => {
-            state.replace_document(session.doc);
+            let Some(doc) = doc else { return };
+            state.replace_document(doc);
             let count =
                 |v: &serde_json::Value| v.as_object().map_or(0, |o| o.values().filter_map(|n| n.as_u64()).sum());
             let (imported, skipped, generic) =
@@ -384,12 +572,11 @@ pub fn export_sheet(state: &mut AppState, format: SheetFormat) {
 /// Resolution of exported images, dots per inch.
 pub const IMAGE_DPI: f64 = 150.0;
 
-/// The active view when it has a drawing to export as an image (any view
-/// but a schedule).
+/// The active view, to export as an image or DXF: every view has a drawing
+/// (a schedule draws as its table).
 pub fn image_view(state: &AppState) -> Option<ViewId> {
     let id = state.active_view?;
-    let kind = &state.project().view(id)?.kind;
-    (!matches!(kind, ViewKind::Schedule { .. })).then_some(id)
+    state.project().view(id).map(|v| v.id)
 }
 
 /// Export the active view as a PNG image, as printed (no temporary hiding).
@@ -413,16 +600,43 @@ pub fn export_image(state: &mut AppState) {
     }
 }
 
+/// Export the active view as DXF, for other CAD programs: at full size in
+/// millimeters (a sheet in paper millimeters), as printed.
+pub fn export_dxf(state: &mut AppState) {
+    let Some(id) = image_view(state) else { return };
+    let Some(view) = state.project().view(id) else { return };
+    let name = match &view.kind {
+        ViewKind::Sheet { number, .. } => format!("{number} - {}.dxf", view.name),
+        _ => format!("{}.dxf", view.name),
+    };
+    let dialog = rfd::FileDialog::new().add_filter(t!("file-filter-dxf"), &["dxf"]).set_file_name(name);
+    let Some(mut path) = dialog.save_file() else { return };
+    if path.extension().is_none() {
+        path.set_extension("dxf");
+    }
+    let command = io::ViewExport { view: Ref::Id(id.0), path: path.clone(), format: Some("dxf".into()), dpi: None };
+    match state.session.run(command) {
+        Ok(_) => state.message = t!("msg-exported", "path" => path.display()),
+        Err(e) => state.dialogs.error = Some(t!("msg-export-failed", "error" => e.message)),
+    }
+}
+
 // --- Macros ---
 
-fn macro_dialog() -> rfd::FileDialog {
-    rfd::FileDialog::new().add_filter(t!("file-filter-macro"), &["ccmacro", "jsonl", "json"])
+/// The macro file dialog, starting in the macros folder when one is set.
+fn macro_dialog(state: &AppState) -> rfd::FileDialog {
+    let dialog = rfd::FileDialog::new().add_filter(t!("file-filter-macro"), &["ccmacro", "jsonl", "json"]);
+    match state.prefs.macro_dir() {
+        Some(dir) => dialog.set_directory(dir),
+        None => dialog,
+    }
 }
 
 /// Start recording a macro, or stop and save it as a script of commands
 /// (the format `ccad script` runs).
 pub fn toggle_macro_recording(state: &mut AppState) {
     if !state.session.is_recording() {
+        state.session.set_active_level(state.active_level());
         state.session.start_recording();
         state.message = t!("msg-macro-recording");
         return;
@@ -432,7 +646,7 @@ pub fn toggle_macro_recording(state: &mut AppState) {
         state.message = t!("msg-macro-empty");
         return;
     }
-    let Some(mut path) = macro_dialog().set_file_name("macro.ccmacro").save_file() else { return };
+    let Some(mut path) = macro_dialog(state).set_file_name("macro.ccmacro").save_file() else { return };
     if path.extension().is_none() {
         path.set_extension("ccmacro");
     }
@@ -444,13 +658,16 @@ pub fn toggle_macro_recording(state: &mut AppState) {
 
 /// Run a macro (a script of commands) on the open project; each step is one undo step.
 pub fn run_macro(state: &mut AppState) {
-    let Some(path) = macro_dialog().pick_file() else { return };
+    let Some(path) = macro_dialog(state).pick_file() else { return };
     run_macro_file(state, &path);
 }
 
+/// Largest macro file read (macros are lists of commands).
+const MAX_MACRO_BYTES: u64 = 32 << 20;
+
 /// Run the macro at `path` (see [`run_macro`]).
 pub fn run_macro_file(state: &mut AppState, path: &std::path::Path) {
-    let text = match std::fs::read_to_string(path) {
+    let text = match cc_core::read_to_string_limited(path, MAX_MACRO_BYTES) {
         Ok(t) => t,
         Err(e) => {
             state.dialogs.error = Some(t!("msg-macro-failed", "step" => 0, "error" => t!("err-io", "detail" => e)));
@@ -464,6 +681,8 @@ pub fn run_macro_file(state: &mut AppState, path: &std::path::Path) {
             return;
         }
     };
+    // Steps recorded on the active level play on the level active now.
+    state.session.set_active_level(state.active_level());
     match cc_engine::script::run(&mut state.session, &steps) {
         Ok(done) => state.message = t!("msg-macro-done", "count" => done.len()),
         Err((_, failed)) => {
@@ -478,7 +697,12 @@ pub fn save(state: &mut AppState, save_as: bool) -> bool {
         (Some(p), false) => p.clone(),
         _ => {
             let name = format!("{}.ccad", state.project().info.name);
-            let Some(mut p) = file_dialog().set_file_name(name).save_file() else { return false };
+            // A saved project is saved again next to itself; a new one in the projects folder.
+            let mut dialog = file_dialog(state).set_file_name(name);
+            if let Some(dir) = state.session.doc.path.as_deref().and_then(std::path::Path::parent) {
+                dialog = dialog.set_directory(dir);
+            }
+            let Some(mut p) = dialog.save_file() else { return false };
             if p.extension().is_none() {
                 p.set_extension("ccad");
             }
@@ -488,7 +712,7 @@ pub fn save(state: &mut AppState, save_as: bool) -> bool {
     match state.session.run(project::ProjectSave { path: Some(path.clone()) }) {
         Ok(_) => {
             state.message = t!("msg-saved", "path" => path.display());
-            crate::home::push_recent(&mut state.recent, &path);
+            crate::home::push_recent(&mut state.recent, &path, state.prefs.recent_count);
             state.thumbnail_jobs.push(crate::thumbnails::Job::Project(path.clone()));
             true
         }
@@ -639,23 +863,24 @@ fn placed(state: &mut AppState, out: Option<serde_json::Value>, what: Placed) {
 
 /// Columns at the intersections of the selected grids (the engine's `columns_at_grids`).
 pub fn columns_at_grids(state: &mut AppState) {
-    let command = cc_engine::commands::structure::ColumnsAtGrids {
-        grids: grids_for(state),
-        level: structure_level(state),
-        ..Default::default()
-    };
-    let out = run(state, command);
+    let out =
+        run_with_type(state, Category::Column, |state, type_ref| cc_engine::commands::structure::ColumnsAtGrids {
+            grids: grids_for(state),
+            level: structure_level(state),
+            type_ref: Some(type_ref),
+            ..Default::default()
+        });
     placed(state, out, Placed::Columns);
 }
 
 /// Beams between the columns along the selected grids (the engine's `beams_on_grids`).
 pub fn beams_on_grids(state: &mut AppState) {
-    let command = cc_engine::commands::structure::BeamsOnGrids {
+    let out = run_with_type(state, Category::Beam, |state, type_ref| cc_engine::commands::structure::BeamsOnGrids {
         grids: grids_for(state),
         level: structure_level(state),
+        type_ref: Some(type_ref),
         ..Default::default()
-    };
-    let out = run(state, command);
+    });
     placed(state, out, Placed::Beams);
 }
 
@@ -730,16 +955,6 @@ pub fn export_analytical(state: &mut AppState) {
 }
 
 /// X bracing between the two selected columns.
-pub fn braces_x(state: &mut AppState) {
-    let columns = selected_columns(state);
-    let command =
-        cc_engine::commands::framing::BracesBetweenColumns { columns, pattern: Some("x".into()), type_ref: None };
-    if let Some(out) = run(state, command) {
-        let ids = out["created"].as_array().into_iter().flatten().filter_map(|v| v.as_u64());
-        state.selection = ids.map(cc_core::ElementId).collect();
-    }
-}
-
 /// Typical reinforcement for the selected beams and columns, or all of the active level.
 pub fn typical_rebar(state: &mut AppState) {
     let project = state.project();
@@ -825,7 +1040,7 @@ pub fn open_panel_diagram(state: &mut AppState) {
     }
 }
 
-/// Open the plumbing or electrical plan of the active level (or the lowest), creating it the first time.
+/// Open the plumbing, electrical, communications or lightning protection plan of the active level (or the lowest), creating it the first time.
 pub fn open_mep_plan(state: &mut AppState, discipline: cc_core::MepDiscipline) {
     let Some(level) = state.active_level().or_else(|| state.project().levels.first().map(|l| l.id)) else { return };
     let existing = state
@@ -840,6 +1055,8 @@ pub fn open_mep_plan(state: &mut AppState, discipline: cc_core::MepDiscipline) {
             let kind = match discipline {
                 cc_core::MepDiscipline::Plumbing => "plumbing_plan",
                 cc_core::MepDiscipline::Electrical => "electrical_plan",
+                cc_core::MepDiscipline::Communications => "communications_plan",
+                cc_core::MepDiscipline::Lightning => "lightning_plan",
             };
             new_view(state, kind, Some(level), None);
         }
@@ -879,9 +1096,12 @@ pub fn toggle_structure_tags(state: &mut AppState) {
 
 /// Beams through the selected columns (the engine's `beams_between_columns`).
 pub fn beams_between_columns(state: &mut AppState) {
-    let command =
-        cc_engine::commands::structure::BeamsBetweenColumns { columns: selected_columns(state), ..Default::default() };
-    let out = run(state, command);
+    let out =
+        run_with_type(state, Category::Beam, |state, type_ref| cc_engine::commands::structure::BeamsBetweenColumns {
+            columns: selected_columns(state),
+            type_ref: Some(type_ref),
+            ..Default::default()
+        });
     placed(state, out, Placed::Beams);
 }
 
@@ -916,6 +1136,45 @@ pub fn temporary_permanent(state: &mut AppState) {
     run(state, cc_engine::commands::graphics::ViewTemporaryApply { view: Ref::Id(view.0) });
 }
 
+/// The masses in the selection.
+pub fn selected_masses(state: &AppState) -> Vec<ElementId> {
+    let project = state.project();
+    state
+        .selection
+        .iter()
+        .copied()
+        .filter(|id| project.element(*id).is_some_and(|e| e.category() == Category::Mass))
+        .collect()
+}
+
+/// Walls (`walls`), floors (`slabs`) or roofs (`roof`) from each selected
+/// mass; what they make is selected.
+pub fn from_masses(state: &mut AppState, what: &str) {
+    use cc_engine::commands::mass::{MassRoofCreate, MassSlabsCreate, MassWallsCreate};
+    let mut made = Vec::new();
+    for id in selected_masses(state) {
+        let out = match what {
+            "walls" => run_command(state, MassWallsCreate { id: id.0, type_ref: None, sides: None }),
+            "slabs" => run_command(state, MassSlabsCreate { id: id.0, type_ref: None, levels: None }),
+            _ => run_command(state, MassRoofCreate { id: id.0, type_ref: None, overhang: None }),
+        };
+        let Some(out) = out else { continue };
+        match out["created"].as_array() {
+            Some(list) => made.extend(list.iter().filter_map(serde_json::Value::as_u64).map(ElementId)),
+            None => made.extend(out["id"].as_u64().map(ElementId)),
+        }
+    }
+    if !made.is_empty() {
+        state.message = t!("msg-mass-made", "count" => made.len());
+        state.selection = made.into_iter().collect();
+    }
+}
+
+/// Whether the active plan's level has a terrain (for building pads to grade).
+pub fn terrain_on_level(state: &AppState) -> bool {
+    state.active_level().is_some_and(|l| state.project().elements_of(Category::Topography).any(|e| e.level == l))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -925,7 +1184,7 @@ mod tests {
         let mut state = AppState::new(Document::new(new_project()));
         let levels = state.project().levels.len();
         state.session.start_recording();
-        add_level(&mut state);
+        run_command(&mut state, levels::LevelCreate::default());
         let wall = run_command(
             &mut state,
             cc_engine::commands::create::WallCreate { start: [0.0, 0.0], end: [5.0, 0.0], ..Default::default() },
@@ -953,6 +1212,56 @@ mod tests {
         assert!((w.height - 3.4).abs() < 1e-12);
     }
 
+    /// Issue #275: a macro recorded in one level's plan plays in the plan
+    /// active when it runs, hosting its openings in the walls it draws.
+    #[test]
+    fn a_macro_plays_on_the_active_plans_level() {
+        let mut state = AppState::new(Document::new(new_project()));
+        let plan_of = |state: &AppState, level| {
+            state
+                .project()
+                .views
+                .values()
+                .find(|v| matches!(v.kind, ViewKind::FloorPlan { level: l, mep: None, .. } if l == level))
+                .map(|v| v.id)
+                .unwrap()
+        };
+        let (ground, upper) = (state.project().levels[0].id, state.project().levels[1].id);
+        state.active_view = Some(plan_of(&state, ground));
+        state.sync();
+        state.session.start_recording();
+        let level = Some(cc_engine::Ref::Id(ground.0));
+        let wall = run_command(
+            &mut state,
+            cc_engine::commands::create::WallCreate { level, start: [0.0, 0.0], end: [5.0, 0.0], ..Default::default() },
+        )
+        .and_then(|o| o["id"].as_u64())
+        .unwrap();
+        let args =
+            cc_engine::commands::create::HostedArgs { wall: Some(wall), offset: Some(2.0), ..Default::default() };
+        run_command(&mut state, cc_engine::commands::create::DoorCreate { args }).unwrap();
+        let steps = state.session.stop_recording();
+        let path = std::env::temp_dir().join(format!("ccad-macro-level-{}.ccmacro", std::process::id()));
+        std::fs::write(&path, cc_engine::script::to_text(&steps)).unwrap();
+
+        state.active_view = Some(plan_of(&state, upper));
+        state.sync();
+        run_macro_file(&mut state, &path);
+        assert!(state.dialogs.error.is_none(), "{:?}", state.dialogs.error);
+        let p = state.project();
+        let upper_walls: Vec<_> = p.walls().filter(|(e, _)| e.level == upper).map(|(e, _)| e.id).collect();
+        assert_eq!(upper_walls.len(), 1);
+        let hosts: Vec<_> = p
+            .elements
+            .values()
+            .filter_map(|e| match &e.kind {
+                cc_core::ElementKind::Door(h) => Some(h.host),
+                _ => None,
+            })
+            .collect();
+        assert!(hosts.contains(&upper_walls[0]), "{hosts:?}");
+    }
+
     #[test]
     fn closing_returns_home_and_opening_leaves_it() {
         let mut state = AppState::new(Document::new(new_project()));
@@ -965,7 +1274,7 @@ mod tests {
         assert_eq!(state.project().info.name, crate::home::sample_project("casa_simples").unwrap().info.name);
 
         run_pending(&mut state, PendingAction::Close);
-        run_pending(&mut state, PendingAction::New);
+        run_pending(&mut state, PendingAction::New(cc_core::MeasurementSystem::Metric));
         assert!(!state.show_home && state.project_open);
     }
 
@@ -985,5 +1294,63 @@ mod tests {
         assert_eq!(w.top, cc_core::WallTop::Unconnected);
         assert!((state.project().wall_height(e, w) - height).abs() < 1e-9);
         assert!(state.project().level(upper).is_none());
+    }
+
+    /// Issue #66: a pipe drawn from the ground floor plan of a new project
+    /// vanished once created, since architectural plans leave pipes out.
+    #[test]
+    fn the_pipe_tool_draws_in_a_plan_that_shows_pipes() {
+        use cc_core::MepDiscipline;
+        let mut state = AppState::new(Document::new(new_project()));
+        let level = state.project().levels[0].id;
+        let plan = state
+            .project()
+            .views
+            .values()
+            .find(|v| matches!(v.kind, ViewKind::FloorPlan { level: l, mep: None, .. } if l == level))
+            .map(|v| v.id)
+            .unwrap();
+        state.active_view = Some(plan);
+        // The app's dock makes the last view asked for the active one.
+        let follow = |state: &mut AppState| {
+            if let Some(id) = std::mem::take(&mut state.open_requests).pop() {
+                state.active_view = Some(id);
+            }
+        };
+
+        activate_category_tool(&mut state, Category::Pipe);
+        follow(&mut state);
+        assert!(matches!(state.tool, Tool::Pipe { .. }));
+        let view = state.active_view.and_then(|v| state.project().view(v)).unwrap();
+        assert!(
+            matches!(view.kind, ViewKind::FloorPlan { level: l, mep: Some(MepDiscipline::Plumbing), .. } if l == level)
+        );
+        let plumbing = view.id;
+
+        // The pipe the tool creates shows in the plan it is drawn in.
+        let pipe = run_command(
+            &mut state,
+            cc_engine::commands::mep::PipeCreate {
+                start: [0.0, 0.0],
+                end: Some([3.0, 0.0]),
+                level: Some(Ref::Id(level.0)),
+                ..Default::default()
+            },
+        )
+        .and_then(|o| o["id"].as_u64())
+        .map(cc_core::ElementId)
+        .unwrap();
+        let drawing = state.session.drawing(plumbing).unwrap();
+        assert!(drawing.prims.iter().any(|p| p.element() == Some(pipe)));
+
+        // Already in the plumbing plan, the tool stays there; conduits go to the electrical plan.
+        let views = state.project().views.len();
+        activate_category_tool(&mut state, Category::Pipe);
+        assert!(state.open_requests.is_empty() && state.project().views.len() == views);
+        activate_category_tool(&mut state, Category::Conduit);
+        follow(&mut state);
+        let view = state.active_view.and_then(|v| state.project().view(v)).unwrap();
+        assert!(matches!(view.kind, ViewKind::FloorPlan { mep: Some(MepDiscipline::Electrical), .. }));
+        assert!(matches!(state.tool, Tool::Conduit { .. }));
     }
 }

@@ -51,6 +51,7 @@ pub fn works_in_3d(tool: &Tool) -> bool {
             | Tool::Rotate
             | Tool::Mirror { .. }
             | Tool::Align
+            | Tool::PushPull
             | Tool::JoinGeometry { .. }
     )
 }
@@ -95,6 +96,33 @@ impl Frame {
         }
         let r = self.rect;
         Some(Pos2::new(r.left() + (x + 1.0) * 0.5 * r.width(), r.top() + (1.0 - y) * 0.5 * r.height()))
+    }
+
+    /// The part of the segment `a`–`b` in front of the camera's near plane,
+    /// on screen: an end behind it moves to where the segment crosses it
+    /// (`None` when the whole segment is behind), so a line passing by the
+    /// eye is not flung across the screen.
+    pub fn segment(&self, a: DVec3, b: DVec3) -> Option<(Pos2, Pos2)> {
+        let clip = |p: DVec3| self.view_proj * Vec4::new(p.x as f32, p.y as f32, p.z as f32, 1.0);
+        let (mut ca, mut cb) = (clip(a), clip(b));
+        if !(ca.is_finite() && cb.is_finite()) || (ca.z < 0.0 && cb.z < 0.0) {
+            return None;
+        }
+        // Clip space depth is 0 on the near plane (and w is the near distance there).
+        if ca.z < 0.0 {
+            ca = ca + (cb - ca) * (ca.z / (ca.z - cb.z));
+        } else if cb.z < 0.0 {
+            cb = cb + (ca - cb) * (cb.z / (cb.z - ca.z));
+        }
+        let r = self.rect;
+        let to_screen = |c: Vec4| {
+            (c.w > 1e-6).then(|| {
+                let (x, y) = (c.x / c.w, c.y / c.w);
+                Pos2::new(r.left() + (x + 1.0) * 0.5 * r.width(), r.top() + (1.0 - y) * 0.5 * r.height())
+            })
+        };
+        let (pa, pb) = (to_screen(ca)?, to_screen(cb)?);
+        (pa.x.is_finite() && pa.y.is_finite() && pb.x.is_finite() && pb.y.is_finite()).then_some((pa, pb))
     }
 }
 
@@ -330,6 +358,7 @@ pub fn handle(ui: &Ui, resp: &Response, painter: &Painter, state: &mut AppState,
     let tool = state.tool.clone();
     match tool {
         Tool::Align => align(&ctx, state),
+        Tool::PushPull => push_pull(&ctx, state),
         Tool::JoinGeometry { unjoin } => join(&ctx, state, unjoin),
         Tool::Move | Tool::Copy | Tool::Array | Tool::Rotate | Tool::Mirror { .. } => {
             let targets: BTreeSet<ElementId> = state.interaction.targets.iter().copied().collect();
@@ -473,13 +502,107 @@ fn mirror(ctx: &Ctx, state: &mut AppState, draw: bool, targets: &BTreeSet<Elemen
     }
 }
 
-/// The plan line an element aligns by when picked at `at`: its location
-/// line, or the edge of its outline nearest to the pick.
-fn align_line(state: &AppState, view_id: ViewId, id: ElementId, at: DVec2) -> Option<(DVec2, DVec2)> {
-    match state.project().element(id).and_then(cc_core::wall_ops::path_of) {
-        Some(cc_core::wall_ops::Path::Line(a, b)) => Some((a, b)),
-        Some(cc_core::wall_ops::Path::Arc(_)) => None,
-        None => state.session.geom_for(view_id).nearest_plan_edge(id, at),
+fn align_line(state: &AppState, _view_id: ViewId, id: ElementId, at: DVec2) -> Option<(DVec2, DVec2)> {
+    crate::modify::align_edge(state, id, at)
+}
+
+/// The mass face under `cursor`: the mass, the face, the point hit and the
+/// face's outline and outward normal.
+type FaceHit = (ElementId, cc_core::mass::MassFace, DVec3, Vec<DVec3>, DVec3);
+
+fn mass_face_under(state: &AppState, view_id: ViewId, ray: Ray) -> Option<FaceHit> {
+    let (id, hit) = pick_element(state, view_id, ray)?;
+    let ElementKind::Mass(m) = &state.project().element(id)?.kind else { return None };
+    let g = state.session.geom_for(view_id).masses.get(&id)?;
+    let face = cc_geom::mass::face_at(m, g, hit)?;
+    let (outline, normal) = cc_geom::mass::face_outline(m, g, face)?;
+    Some((id, face, hit, outline, normal))
+}
+
+/// How far along `normal` from `origin` the cursor's ray passes closest
+/// (`None` when the ray runs along the normal).
+fn along_normal(ray: Ray, origin: DVec3, normal: DVec3) -> Option<f64> {
+    let b = normal.dot(ray.dir);
+    let den = 1.0 - b * b;
+    if den < 1e-6 {
+        return None;
+    }
+    let w = origin - ray.origin;
+    let s = (b * ray.dir.dot(w) - normal.dot(w)) / den;
+    s.is_finite().then_some(s)
+}
+
+/// Push/pull: click a face of a mass (its top, bottom or a side of an
+/// extrusion), move the pointer along the face's normal (or type the
+/// distance), then click (or Enter) to move it there.
+fn push_pull(ctx: &Ctx, state: &mut AppState) {
+    use cc_core::mass::MassFace;
+    let Some(cursor) = ctx.resp.hover_pos() else { return };
+    let ray = ctx.frame.ray(cursor);
+    let Some((id, face, origin, normal)) = state.interaction.push else {
+        // Nothing picked: show the face a click takes, with its arrow.
+        let hit = mass_face_under(state, ctx.view_id, ray);
+        if let Some((_, _, p, outline, normal)) = &hit {
+            for (a, b) in outline.iter().zip(outline.iter().cycle().skip(1)) {
+                ctx.line(*a, *b, 2.5);
+            }
+            ctx.line(*p, *p + *normal * 1.0, 2.0);
+        }
+        if ctx.resp.clicked() {
+            match hit {
+                Some((id, face, p, _, normal)) => {
+                    state.interaction.push = Some((id, face, p, normal));
+                    // Typed distances apply from here.
+                    state.interaction.anchor = Some(p.truncate());
+                    state.message = t!("hint-push-pull-drag");
+                }
+                None => state.message = t!("hint-push-pull"),
+            }
+        }
+        return;
+    };
+    let pointed = along_normal(ray, origin, normal).unwrap_or(0.0);
+    let distance = match state.typed.length_value() {
+        // A typed length, outward or inward as the pointer goes.
+        Some(v) => {
+            if pointed < 0.0 {
+                -v
+            } else {
+                v
+            }
+        }
+        None => pointed,
+    };
+    // The face where it would go.
+    if let Some(ElementKind::Mass(m)) = state.project().element(id).map(|e| &e.kind)
+        && let Some(g) = state.session.geom_for(ctx.view_id).masses.get(&id)
+        && let Some((outline, _)) = cc_geom::mass::face_outline(m, g, face)
+    {
+        let shift = normal * distance;
+        for (a, b) in outline.iter().zip(outline.iter().cycle().skip(1)) {
+            ctx.line(*a + shift, *b + shift, 1.5);
+        }
+    }
+    let end = origin + normal * distance;
+    ctx.dashed(origin, end);
+    if let (Some(s), Some(e)) = (ctx.frame.screen(origin), ctx.frame.screen(end)) {
+        crate::tools::label(ctx.painter, s + (e - s) * 0.5, format::length(distance));
+    }
+    let enter = ctx.ui.input(|i| i.key_pressed(egui::Key::Enter)) && !state.typed.is_empty();
+    if (ctx.resp.clicked() || enter) && distance.abs() > 1e-6 {
+        let (name, side) = match face {
+            MassFace::Top => ("top", None),
+            MassFace::Bottom => ("bottom", None),
+            MassFace::Side(i) => ("side", Some(i)),
+        };
+        let command = cc_engine::commands::mass::MassFaceMove { id: id.0, face: name.into(), side, distance };
+        crate::actions::run_command(state, command);
+        state.interaction.push = None;
+        state.interaction.anchor = None;
+        state.typed.clear();
+        if state.message.is_empty() {
+            state.message = t!("hint-push-pull");
+        }
     }
 }
 
@@ -626,5 +749,41 @@ mod tests {
             assert!(points.iter().any(|p| p.distance(DVec3::new(lo.x, lo.y, z)) < 1e-9), "corner at {z}");
         }
         assert!(snap_points(project, geom, &mut |_| false).is_empty());
+    }
+
+    /// The pointer's ray gives the distance along a face's normal; a ray
+    /// along the normal gives none.
+    #[test]
+    fn rays_are_measured_along_normals() {
+        let origin = DVec3::new(0.0, 0.0, 3.0);
+        // Looking along -Y at a height of 5: 2 m above a top face at 3.
+        let ray = Ray { origin: DVec3::new(0.0, 10.0, 5.0), dir: DVec3::new(0.0, -1.0, 0.0) };
+        assert!((along_normal(ray, origin, DVec3::Z).unwrap() - 2.0).abs() < 1e-9);
+        let down = Ray { origin: DVec3::new(0.0, 0.0, 10.0), dir: -DVec3::Z };
+        assert_eq!(along_normal(down, origin, DVec3::Z), None);
+    }
+
+    /// Points on a mass tell its faces apart: top, bottom, and the side
+    /// over the nearest edge, with outward normals.
+    #[test]
+    fn mass_faces_are_found_from_points() {
+        use cc_core::mass::{Mass, MassFace};
+        let mut session = cc_engine::Session::default();
+        let out = session
+            .execute("mass_create", serde_json::json!({"outline": [[0, 0], [10, 0], [10, 6], [0, 6]], "height": 4.0}))
+            .unwrap();
+        let id = ElementId(out["id"].as_u64().unwrap());
+        let Some(ElementKind::Mass(m)) = session.doc.project.element(id).map(|e| e.kind.clone()) else { panic!() };
+        let m: Mass = m;
+        let g = session.geometry().masses.get(&id).cloned().unwrap();
+        let (base, top) = g.z_range;
+        let at = |x: f64, y: f64, z: f64| cc_geom::mass::face_at(&m, &g, DVec3::new(x, y, z));
+        assert_eq!(at(5.0, 3.0, top), Some(MassFace::Top));
+        assert_eq!(at(5.0, 3.0, base), Some(MassFace::Bottom));
+        assert_eq!(at(10.0, 3.0, base + 2.0), Some(MassFace::Side(1)));
+        let (outline, normal) = cc_geom::mass::face_outline(&m, &g, MassFace::Side(1)).unwrap();
+        assert_eq!(outline.len(), 4);
+        assert!((normal - DVec3::X).length() < 1e-9, "east side faces +X: {normal}");
+        assert_eq!(cc_geom::mass::face_outline(&m, &g, MassFace::Bottom).unwrap().1, -DVec3::Z);
     }
 }

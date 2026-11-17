@@ -1,13 +1,22 @@
-//! View generation for ConstructCAD.
+//! View generation for ConstructCraft.
 //!
 //! Each [`cc_core::View`] is a query over the model. [`generate`] produces a
 //! resolution-independent [`Drawing2D`] for graphical views; [`schedule`]
 //! computes tables.
 
 mod annotate;
+pub mod bar_tags;
+pub mod bending;
+pub mod cad;
+pub mod callout;
+pub mod component_view;
 mod cut;
+pub mod detail;
+pub mod detail_component;
 mod diagram;
 mod drawing;
+mod drawing_index;
+pub mod dxf;
 pub mod export;
 pub mod fonts;
 pub mod format;
@@ -15,22 +24,32 @@ pub mod graphics;
 pub mod hatch;
 mod joins;
 mod legend;
+pub mod level_marks;
 mod mep;
+pub use mep::discipline_of;
 pub mod notes;
 mod pdf_fonts;
 mod plan;
 mod projected;
+pub mod raster;
+pub mod region;
 mod schedule;
 mod shaping;
 mod sheet;
+pub mod sheet_fields;
+pub mod sun_path;
+mod topography;
 
-pub use annotate::{DimensionLayout, HIGHLIGHT_ONLY, dimension_layout};
-pub use drawing::{Anchor, Drawing2D, LineStyle, Pen, Prim, ResolvedPen, halftone};
+pub use annotate::{DimensionLayout, HIGHLIGHT_ONLY, dimension_layout, dimension_type, draw_dimension, draw_marks};
+pub use component_view::{ComponentView, ComponentViewKind, ViewConnector, component_view};
+pub use drawing::{Anchor, Drawing2D, LineStyle, Pen, Prim, ResolvedPen, SectionHandle, TagHandle, halftone};
+pub use drawing_index::DrawingIndex;
 pub use legend::legend;
-pub use plan::{is_structural, plan, plan_of};
-pub use projected::{Frame, axonometric, elevation, section};
-pub use schedule::{Cell, Row, Table, field_value, schedule, schedule_where, to_csv};
-pub use sheet::{MARGIN, PlacedViewport, Sheet, TITLE_H, TITLE_W, TitleLabels, compose as compose_sheet};
+pub use plan::{is_structural, plan, plan_of, section_pieces};
+pub use projected::{Frame, Look, axonometric, elevation, section, view_frame};
+pub use schedule::{Cell, Row, Table, field_value, schedule, schedule_where, to_csv, totaled_by_default};
+pub use sheet::{MARGIN, PlacedViewport, Sheet, SheetEnv, compose as compose_sheet, title_block_drawing};
+pub use sun_path::{SunDiagram, SunLabel, SunLabelKind, SunLine, SunLineKind, SunText, diagram as sun_diagram};
 
 use cc_core::{Project, View, ViewKind};
 use cc_geom::ModelGeometry;
@@ -62,7 +81,7 @@ pub fn generate_temporary(
     temporary: Option<&cc_core::TemporaryVisibility>,
 ) -> Option<Drawing2D> {
     let mut d = match &view.kind {
-        ViewKind::FloorPlan { level, cut_height, .. } | ViewKind::CeilingPlan { level, cut_height } => {
+        ViewKind::FloorPlan { level, cut_height, .. } | ViewKind::CeilingPlan { level, cut_height, .. } => {
             let ceiling = matches!(view.kind, ViewKind::CeilingPlan { .. });
             let (structural, tags, services) = match view.kind {
                 ViewKind::FloorPlan { structural, structure_tags, mep, .. } => {
@@ -70,36 +89,145 @@ pub fn generate_temporary(
                 }
                 _ => (false, false, None),
             };
-            let mut d = plan_of(project, geom, *level, *cut_height, ceiling, structural, view.scale);
+            let mut d = plan_of(project, geom, *level, *cut_height, (ceiling, structural), view.scale, view.detail);
             joins::merge(project, &mut d);
+            let style = view.style();
+            if !style.fills() {
+                plan::strip_fills(&mut d);
+            } else if style.colored() {
+                let cut_z = project.level_elevation(*level) + cut_height;
+                let under = plan::style_underlay(geom, cut_z, ceiling, Look::of(project, view), &project.fill_patterns);
+                d.prims.splice(0..0, under);
+            }
             if let Some(discipline) = services {
                 // The architecture stays in the background of a services plan.
                 fade(&mut d);
                 mep::services(&mut d, project, geom, *level, *cut_height, discipline, view.scale);
             }
-            annotate::plan_annotations(&mut d, project, geom, *level, ceiling, structural, view.scale);
+            // Regions over the model, under the plan's marks, tags and grids.
+            region::regions(&mut d, project, view.id, view.scale);
+            detail_component::components(&mut d, project, view.id, view.scale);
+            if !ceiling {
+                plan::section_marks(&mut d, project, view.scale);
+            }
+            annotate::plan_annotations(&mut d, project, geom, *level, ceiling, structural, view);
             if tags {
-                annotate::structure_tags(&mut d, project, geom, *level, view.scale);
+                annotate::structure_tags(&mut d, project, geom, *level, view.scale, &view.tag_offsets);
             }
             d
         }
-        ViewKind::Elevation { direction } => elevation(project, geom, *direction),
-        ViewKind::Section { start, end, depth } => {
-            let mut d = section(project, geom, *start, *end, *depth, view.scale);
+        ViewKind::Elevation { direction } => {
+            let mut d = elevation(project, geom, *direction, Look::of(project, view));
+            if let Some(frame) = projected::view_frame(view) {
+                annotate::projected_grids(&mut d, project, &frame, view.scale);
+            }
+            d
+        }
+        ViewKind::Section { start, end, depth, .. } => {
+            let mut d = section(project, geom, (*start, *end), *depth, view.scale, Look::of(project, view));
             joins::merge(project, &mut d);
+            if let Some(frame) = projected::view_frame(view) {
+                annotate::projected_grids(&mut d, project, &frame, view.scale);
+            }
             d
         }
         ViewKind::ThreeD { camera, analytical: true, .. } => projected::analytical(project, geom, camera),
         ViewKind::ThreeD { camera, rebar: true, .. } => projected::rebar(geom, camera),
-        ViewKind::ThreeD { camera, .. } => axonometric(project, geom, camera),
+        ViewKind::ThreeD { camera, .. } => axonometric(project, geom, camera, Look::of(project, view)),
         ViewKind::Legend { types } => legend(project, types, view.scale),
+        // No model geometry: only what the view owns, added below.
+        ViewKind::Drafting { .. } => Drawing2D::default(),
         ViewKind::Diagram { panel } => diagram::panel_diagram(project, geom, *panel, view.scale, label),
-        ViewKind::Schedule { .. } | ViewKind::Sheet { .. } => return None,
+        // A schedule draws as a table, for sheets: the elements its phase shows.
+        ViewKind::Schedule { category, def } => {
+            let phase = graphics::PhaseView::of(project, view);
+            let options = project.shown_options(Some(view));
+            let table = schedule::schedule_where(project, geom, *category, def, &mut |e| {
+                project.option_shows(e, &options) && phase.as_ref().is_none_or(|ph| ph.shows(project, e))
+            });
+            schedule::drawing(&table, &view.name, view.scale, label)
+        }
+        ViewKind::Sheet { .. } => return None,
     };
+    // Imported CAD drawings, under everything (not in 3D views or diagrams).
+    if hosts_cad(&view.kind) {
+        cad::underlays(&mut d, project, view.id, view.scale);
+        // Regions over the model (plans drew theirs under their annotations).
+        if view.level().is_none() {
+            region::regions(&mut d, project, view.id, view.scale);
+            detail_component::components(&mut d, project, view.id, view.scale);
+        }
+        // Detail lines, on top of the model and the regions.
+        detail::lines(&mut d, project, view.id);
+    }
     annotate::dimensions(&mut d, project, view.id, view.scale);
     notes::notes(&mut d, project, view.id, view.scale);
+    level_marks::level_marks(&mut d, project, view);
+    bar_tags::bar_tags(&mut d, project, geom, view);
+    callout::marks(&mut d, project, view);
     graphics::apply(&mut d, &mut graphics::Resolver::new(project, geom, view, temporary), view.scale);
+    underlay(&mut d, project, geom, view);
+    if let Some(rect) = view.crop.filter(|r| r.is_valid() && view.kind.croppable()) {
+        callout::crop(&mut d, project, view.id, rect);
+    }
+    // The sun path last, over everything: neither cropped nor overridden.
+    sun_path::draw(&mut d, project, geom, view, label);
     Some(d)
+}
+
+/// The plans of the levels a floor or ceiling plan shows under itself
+/// ([`cc_core::Underlay`]), first in `d` and counted in `d.underlay`: the
+/// model only (no annotations or texts), with the view's category
+/// visibility, every line in the faint pen and fills faded, belonging to no
+/// element.
+fn underlay(d: &mut Drawing2D, project: &Project, geom: &ModelGeometry, view: &View) {
+    let (Some(level), Some(u)) = (view.level(), view.kind.underlay()) else { return };
+    let cut_height = match view.kind {
+        ViewKind::FloorPlan { cut_height, .. } | ViewKind::CeilingPlan { cut_height, .. } => cut_height,
+        _ => return,
+    };
+    let mut under = Vec::new();
+    for (other, looking) in u.plans(&project.levels, level) {
+        let ceiling = looking == cc_core::Looking::Up;
+        let mut p = plan_of(project, geom, other, cut_height, (ceiling, false), view.scale, view.detail);
+        joins::merge(project, &mut p);
+        graphics::apply(&mut p, &mut graphics::Resolver::new(project, geom, view, None), view.scale);
+        under.extend(p.prims.into_iter().filter_map(underlay_prim));
+    }
+    d.underlay = under.len();
+    d.prims.splice(0..0, under);
+}
+
+/// A primitive of an underlay: the model's lines in the faint pen, its
+/// fills faded to white (invisible ones, texts, pictures and the markers of
+/// sections and elevations left out), none of them belonging to an element.
+fn underlay_prim(prim: Prim) -> Option<Prim> {
+    prim.element()?;
+    match prim {
+        Prim::Line { a, b, .. } => Some(Prim::Line { a, b, style: LineStyle::Faint, element: None, pen: None }),
+        Prim::Fill { pts, color, .. } if color[3] >= 8 => {
+            let mut color = color;
+            for c in color.iter_mut().take(3) {
+                *c = (f64::from(*c) + (255.0 - f64::from(*c)) * 0.75).round() as u8;
+            }
+            Some(Prim::Fill { pts, color, element: None, cut: false })
+        }
+        _ => None,
+    }
+}
+
+/// Whether a view can hold imported CAD drawings: plans, ceiling plans,
+/// elevations, sections, legends and drafting views (2D views with a drawing plane).
+pub fn hosts_cad(kind: &ViewKind) -> bool {
+    matches!(
+        kind,
+        ViewKind::FloorPlan { .. }
+            | ViewKind::CeilingPlan { .. }
+            | ViewKind::Elevation { .. }
+            | ViewKind::Section { .. }
+            | ViewKind::Legend { .. }
+            | ViewKind::Drafting { .. }
+    )
 }
 
 /// Draw everything so far faint: lines in the faint pen (dashes kept),
@@ -112,6 +240,7 @@ fn fade(d: &mut Drawing2D) {
             {
                 *style = LineStyle::Faint;
             }
+            Prim::Image { faded, .. } => *faded = true,
             Prim::Fill { color, .. } => {
                 for c in color.iter_mut().take(3) {
                     *c = (f64::from(*c) + (255.0 - f64::from(*c)) * 0.66).round() as u8;
@@ -132,6 +261,130 @@ mod tests {
         let project = cc_core::from_ron(include_str!("../../../examples/casa_simples.ccad")).unwrap();
         let geom = ModelGeometry::build(&project);
         (project, geom)
+    }
+
+    /// The names of the grids `d` draws, with where each line stands (x) when vertical.
+    fn grids_drawn(project: &Project, d: &Drawing2D) -> Vec<(String, f64)> {
+        let mut found: Vec<(String, f64)> = d
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Line { a, b, style: LineStyle::Center, element: Some(id), .. } => {
+                    let cc_core::ElementKind::Grid(g) = &project.element(*id)?.kind else { return None };
+                    assert!((a.x - b.x).abs() < 1e-9 && b.y > a.y, "a vertical line, bubble on top");
+                    Some((g.name.clone(), a.x))
+                }
+                _ => None,
+            })
+            .collect();
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        found
+    }
+
+    /// Issue #332: elevations and sections draw the grids square to them,
+    /// where they stand; the view's graphics hide them.
+    #[test]
+    fn elevations_and_sections_draw_the_grids_square_to_them() {
+        let (mut project, geom) = sample();
+        let names = |found: &[(String, f64)]| found.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+        let elevation = |project: &Project, direction| {
+            let view = project
+                .views
+                .values()
+                .find(|v| matches!(v.kind, ViewKind::Elevation { direction: d } if d == direction))
+                .unwrap();
+            grids_drawn(project, &generate(project, &geom, view).unwrap())
+        };
+        // Looking north (from the south): the grids along Y, at their x.
+        let south = elevation(&project, cc_core::Direction::South);
+        assert_eq!(names(&south), ["1", "2", "3"]);
+        for ((_, x), expected) in south.iter().zip([0.0, 5.0, 9.0]) {
+            assert!((x - expected).abs() < 1e-9, "{x} is not {expected}");
+        }
+        assert_eq!(names(&elevation(&project, cc_core::Direction::East)), ["A", "B"]);
+
+        // A section along X from -1 to 6 looking south: grid 3 stands past its end.
+        let id = project.views.values().find(|v| matches!(v.kind, ViewKind::Section { .. })).unwrap().id;
+        let section = |project: &mut Project, depth| {
+            let view = project.views.get_mut(&id).unwrap();
+            view.kind =
+                ViewKind::Section { start: DVec2::new(-1.0, 3.0), end: DVec2::new(6.0, 3.0), depth, segments: None };
+            let view = view.clone();
+            let d = generate(project, &geom, &view).unwrap();
+            // The bubbles stand over everything else the view draws.
+            let top = d.prims.iter().filter(|p| p.element().is_none()).filter_map(|p| match p {
+                Prim::Line { a, b, .. } => Some(a.y.max(b.y)),
+                _ => None,
+            });
+            let top = top.fold(f64::MIN, f64::max);
+            for p in &d.prims {
+                if let Prim::Line { b, style: LineStyle::Center, .. } = p {
+                    assert!(b.y > top, "the grid ends above the level lines");
+                }
+            }
+            grids_drawn(project, &d)
+        };
+        let cut = section(&mut project, 2.0);
+        assert_eq!(names(&cut), ["1", "2"]);
+        assert!((cut[0].1 + 1.0).abs() < 1e-9 && (cut[1].1 + 6.0).abs() < 1e-9, "{cut:?}");
+        // Grids that end before the cut and lie behind it are not seen.
+        for e in project.elements.values_mut() {
+            if let cc_core::ElementKind::Grid(g) = &mut e.kind
+                && g.name == "2"
+            {
+                (g.start.y, g.end.y) = (4.0, 7.5);
+            }
+        }
+        assert_eq!(names(&section(&mut project, 2.0)), ["1"]);
+
+        // Hidden with their category, in that view only.
+        let view = project.views.get_mut(&id).unwrap();
+        let mut hidden = view.graphics.category(Category::Grid);
+        hidden.visible = false;
+        view.graphics.set_category(Category::Grid, hidden);
+        assert!(section(&mut project, 2.0).is_empty());
+        assert_eq!(names(&elevation(&project, cc_core::Direction::South)), ["1", "2", "3"]);
+    }
+
+    /// Issue #154: the plan of the level below drawn halftone under a plan,
+    /// belonging to no element; none under the lowest level.
+    #[test]
+    fn plans_show_the_level_below_halftone() {
+        let (mut project, _) = sample();
+        let (ground, first) = (project.levels[0].id, project.levels[1].id);
+        let below = cc_core::Underlay {
+            below: Some(cc_core::UnderlayPlan { level: cc_core::UnderlayLevel::Next, looking: cc_core::Looking::Down }),
+            ..Default::default()
+        };
+        for v in project.views.values_mut() {
+            if let Some(u) = v.kind.underlay_mut() {
+                *u = below;
+            }
+        }
+        let geom = ModelGeometry::build(&project);
+        let plan = |level| project.views_of(ViewCategory::FloorPlan).find(|v| v.level() == Some(level)).unwrap();
+        let upper = generate(&project, &geom, plan(first)).unwrap();
+        assert!(upper.underlay > 20, "the ground floor's walls: {}", upper.underlay);
+        for prim in &upper.prims[..upper.underlay] {
+            assert_eq!(prim.element(), None);
+            if let Prim::Line { style, .. } = prim {
+                assert_eq!(*style, LineStyle::Faint);
+            }
+        }
+        assert!(upper.own_prims().iter().any(|p| p.element().is_some()), "its own model over it");
+        assert_eq!(upper.without_underlay().prims.len(), upper.prims.len() - upper.underlay);
+        // Nothing is below the ground floor.
+        assert_eq!(generate(&project, &geom, plan(ground)).unwrap().underlay, 0);
+        // A level of its own: looking up, as a ceiling plan.
+        let up = cc_core::Underlay {
+            above: Some(cc_core::UnderlayPlan {
+                level: cc_core::UnderlayLevel::Level(first),
+                looking: cc_core::Looking::Up,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(up.plans(&project.levels, ground), vec![(first, cc_core::Looking::Up)]);
+        assert!(up.plans(&project.levels, first).is_empty(), "not itself");
     }
 
     #[test]
@@ -200,8 +453,12 @@ mod tests {
         let sheet = project.views_of(ViewCategory::Sheet).next().unwrap().clone();
         let ViewKind::Sheet { viewports, .. } = &sheet.kind else { panic!("not a sheet") };
         assert!(!viewports.is_empty());
-        let labels = TitleLabels { project: "Projeto".into(), ..Default::default() };
-        let composed = compose_sheet(&project, &sheet, &labels, |id| {
+        let env = SheetEnv {
+            today: (2026, 1, 1),
+            format_date: |y, m, d| format!("{y}-{m}-{d}"),
+            as_indicated: String::new(),
+        };
+        let composed = compose_sheet(&project, &sheet, &env, |id| {
             project.view(id).and_then(|v| generate(&project, &geom, v)).map(std::rc::Rc::new)
         })
         .unwrap();
@@ -223,7 +480,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(texts.contains(&"Projeto"));
+        assert!(texts.contains(&"PROJETO"), "the standard title block's caption: {texts:?}");
         assert!(texts.contains(&project.info.name.as_str()));
         // Everything lies on the paper.
         let (lo, hi) = composed.drawing.bounds().unwrap();
@@ -251,6 +508,7 @@ mod tests {
             overrides: Default::default(),
             properties: Vec::new(),
             system: None,
+            ..Default::default()
         };
         project.elements.insert(
             id,
@@ -264,6 +522,8 @@ mod tests {
                 uid: Default::default(),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             },
         );
         assert_eq!(project.repair(), 0);

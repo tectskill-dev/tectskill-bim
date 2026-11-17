@@ -24,19 +24,26 @@ pub enum CommandKind {
 pub trait Command: DeserializeOwned + JsonSchema {
     const NAME: &'static str;
     const KIND: CommandKind;
+    /// Whether it may read a file named by one of its parameters (an import
+    /// of an edit or query command); it then refuses the path when the run
+    /// may not work with files ([`Session::require_files`]).
+    const READS_FILES: bool = false;
     fn run(self, session: &mut Session) -> Result<Value>;
 }
 
 /// A command as listed by the catalog.
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandInfo {
-    pub name: &'static str,
+    pub name: String,
     pub kind: CommandKind,
     /// Area of the catalog (project, queries, elements…).
-    pub group: &'static str,
+    pub group: String,
     pub description: String,
-    /// JSON Schema (draft 7, no references) of the parameters object.
+    /// JSON Schema of the parameters object: no references, valid under draft 7 and 2020-12.
     pub input_schema: Value,
+    /// May read a file named by a parameter (besides `File` commands, which
+    /// all work with files).
+    pub reads_files: bool,
 }
 
 fn info<C: Command>(group: &'static str) -> CommandInfo {
@@ -48,6 +55,7 @@ fn info<C: Command>(group: &'static str) -> CommandInfo {
         .into_generator();
     let schema = generator.into_root_schema_for::<C>();
     let mut input_schema = serde_json::to_value(schema).unwrap_or_else(|_| serde_json::json!({"type": "object"}));
+    portable_tuples(&mut input_schema, 0);
     let description = input_schema
         .get("description")
         .and_then(Value::as_str)
@@ -58,7 +66,53 @@ fn info<C: Command>(group: &'static str) -> CommandInfo {
         o.remove("description");
         o.entry("properties").or_insert_with(|| serde_json::json!({}));
     }
-    CommandInfo { name: C::NAME, kind: C::KIND, group, description, input_schema }
+    CommandInfo {
+        name: C::NAME.to_string(),
+        kind: C::KIND,
+        group: group.to_string(),
+        description,
+        input_schema,
+        reads_files: C::READS_FILES,
+    }
+}
+
+/// Rewrites draft 7 tuples (`items` as an array, which JSON Schema 2020-12 rejects, and with it MCP
+/// clients and model APIs) as `prefixItems` for 2020-12 plus `items` holding any of the positions'
+/// schemas for draft 7, which ignores `prefixItems`; the tuple's `minItems`/`maxItems` stay.
+fn portable_tuples(v: &mut Value, depth: usize) {
+    // Schemas of parameter structs are shallow; the bound only guards the recursion.
+    if depth > 64 {
+        return;
+    }
+    match v {
+        Value::Object(o) => {
+            if let Some(Value::Array(positions)) = o.get("items") {
+                let positions = positions.clone();
+                let mut distinct: Vec<Value> = Vec::new();
+                for p in &positions {
+                    if !distinct.contains(p) {
+                        distinct.push(p.clone());
+                    }
+                }
+                let items = match distinct.len() {
+                    1 => distinct.remove(0),
+                    _ => serde_json::json!({ "anyOf": distinct }),
+                };
+                o.insert("items".into(), items);
+                o.insert("prefixItems".into(), Value::Array(positions));
+                o.remove("additionalItems");
+            }
+            for child in o.values_mut() {
+                portable_tuples(child, depth + 1);
+            }
+        }
+        Value::Array(a) => {
+            for child in a {
+                portable_tuples(child, depth + 1);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn run<C: Command>(session: &mut Session, args: Value) -> Result<Value> {
@@ -82,6 +136,16 @@ macro_rules! registry {
             )*)*
             Err(EngineError::new(ErrorCode::UnknownCommand, format!("unknown command: {name}")))
         }
+
+        /// The kind of a built-in command, without building the catalog.
+        pub fn command_kind(name: &str) -> Option<CommandKind> {
+            $($(
+                if name == <$c as Command>::NAME {
+                    return Some(<$c as Command>::KIND);
+                }
+            )*)*
+            None
+        }
     };
 }
 
@@ -97,19 +161,32 @@ registry![
         project::ProjectSave,
         project::ProjectInfoGet,
         project::ProjectInfoSet,
+        site::SiteGet,
+        site::SiteSet,
+        site::SiteContextImport,
         project::Undo,
         project::Redo,
         project::UnitsGet,
         project::UnitsSet,
         project::LanguageSet,
         io::IfcImport,
+        io::SkpImport,
+        io::SkpComponentLoad,
+        io::ObjImport,
+        io::GltfImport,
         io::IfcExport,
         io::SheetExport,
         io::ViewExport,
+        render::ViewRender,
         io::ScheduleExportCsv,
         io::ComponentLoad,
         io::ComponentLibraryList,
         io::ComponentSave,
+        cad::CadImportFile,
+        cad::ImageImport,
+        cad::CadLayers,
+        cad::CadLayersSet,
+        cad_explode::CadExplode,
     ],
     "Queries" => [
         query::CategoriesList,
@@ -128,8 +205,15 @@ registry![
     ],
     "Creating elements" => [
         create::WallCreate,
+        curtain::CurtainTypeCreate,
+        curtain::CurtainGet,
+        curtain::CurtainGridSet,
+        curtain::CurtainPanelSet,
         create::DoorCreate,
+        doors::DoorTypeCreate,
         create::WindowCreate,
+        niche::NicheTypeCreate,
+        niche::NicheCreate,
         create::FloorCreate,
         create::FloorOpeningAdd,
         create::FloorOpeningRemove,
@@ -144,13 +228,27 @@ registry![
         structure::ColumnsAtGrids,
         structure::BeamsOnGrids,
         structure::BeamsBetweenColumns,
+        grid_frame::GridFrameCreate,
         structure::SlabJoinSupports,
         structure::StructureNumber,
         framing::BraceCreate,
         framing::BracesBetweenColumns,
         framing::TrussCreate,
+        bracing::BracingCreate,
         rebar::RebarCreate,
         rebar::RebarTypical,
+        rebar::RebarCopy,
+        wall_rebar::WallRebarCreate,
+        slab_rebar::SlabRebarCreate,
+        strip_rebar::StripRebarCreate,
+        bar_marks::BarMarksList,
+        bar_marks::BarMarksUpdate,
+        bar_marks::BarMarksRenumber,
+        bar_marks::BarMarkingSet,
+        bar_marks::BarLengthCheck,
+        bar_marks::BendingScheduleCreate,
+        bar_marks::BarTagCreate,
+        connection::ConnectionsCreate,
         analytical::AnalyticalModelGet,
         analytical::AnalyticalExport,
         foundation::FootingCreate,
@@ -158,11 +256,39 @@ registry![
         foundation::FoundationSlabCreate,
         foundation::FootingsUnderColumns,
         foundation::StripFootingsUnderWalls,
+        piles::PileTypeCreate,
+        piles::PileCreate,
+        piles::PileCapTypeCreate,
+        piles::PileCapCreate,
+        piles::PileCapsUnderColumns,
+        piles::TieBeamsCreate,
         stair::StairCreate,
         stair::StairCheck,
         stair::StairRailingsAdd,
+        stair::RailingHostSet,
         ramp::RampCreate,
         ramp::RampCheck,
+        roofing::RoofCheck,
+        mass::MassCreate,
+        sketch::SketchGet,
+        sketch::SketchSet,
+        mass::MassFloorsSet,
+        mass::MassFloors,
+        mass::MassTypeCreate,
+        sweep::SweepCreate,
+        sweep::SweepTypeCreate,
+        sweep::SweepProfileSet,
+        shaft::ShaftCreate,
+        shaft::ShaftTypeCreate,
+        topography::TopographyCreate,
+        topography::TopographyPointsSet,
+        topography::TopographyTypeCreate,
+        pad::PadCreate,
+        pad::PadTypeCreate,
+        mass::MassFaceMove,
+        mass::MassWallsCreate,
+        mass::MassSlabsCreate,
+        mass::MassRoofCreate,
         ramp::RampTypeCreate,
         create::RailingCreate,
         create::ComponentPlace,
@@ -170,6 +296,20 @@ registry![
     "Building services" => [
         mep::PipeCreate,
         mep::ConduitCreate,
+        cable_tray::CableTrayCreate,
+        cable_tray::CableTrayTypeCreate,
+        valve::ValvePlace,
+        valve::ValveTypeCreate,
+        devices::DeviceTypeCreate,
+        lightning::LpsConductorCreate,
+        lightning::LpsConductorTypeCreate,
+        lightning::EarthRingCreate,
+        lightning::AirTerminalPlace,
+        lightning::EarthElectrodePlace,
+        lightning::LpsCheck,
+        cabling::RackPlace,
+        cabling::DataOutletPlace,
+        cabling::CablingList,
         mep::SystemsList,
         mep::SystemCreate,
         mep::SystemSet,
@@ -193,6 +333,7 @@ registry![
         modify::ElementsExport,
         modify::ElementsPaste,
         modify::WallJoin,
+        modify::WallAttach,
         modify::GeometryJoin,
         modify::GeometryUnjoin,
         modify::GroupCreate,
@@ -205,13 +346,34 @@ registry![
         modify::ElementMoveEnd,
         modify::GridsAlignEnds,
         edit::ElementSet,
+        edit::ElementsSet,
         edit::ElementsSetType,
     ],
     "Dimensions and text" => [
         annotate::DimensionCreate,
+        annotate::TagMove,
         annotate::DimensionChainCreate,
+        annotate::DimensionOrdinateCreate,
         annotate::DimensionSetValue,
         annotate::TextCreate,
+        detail::DetailLineCreate,
+        detail_component::DetailComponentCreate,
+        detail_component::DetailComponentPlace,
+        browser::BrowserSchemesList,
+        browser::BrowserSchemeCreate,
+        browser::BrowserSchemeSet,
+        browser::BrowserSchemeDelete,
+        browser::BrowserSchemeUse,
+        browser::BrowserTree,
+        line_style::LineStylesList,
+        line_style::LineStyleCreate,
+        line_style::LineStyleSet,
+        line_style::LineStyleDelete,
+        region::FilledRegionCreate,
+        region::MaskingRegionCreate,
+        region::FilledRegionTypeCreate,
+        level_mark::LevelMarkCreate,
+        level_mark::LevelMarkTypeCreate,
         annotate::TextAddLeader,
         annotate::TextRemoveLeader,
     ],
@@ -220,11 +382,60 @@ registry![
         types::TypeDuplicate,
         types::TypeDelete,
         types::ComponentCreate,
+        component::ComponentGet,
+        component::ComponentParamAdd,
+        component::ComponentParamSet,
+        component::ComponentParamDelete,
+        component::ComponentRefPlaneAdd,
+        component::ComponentRefPlaneSet,
+        component::ComponentRefPlaneDelete,
+        component::ComponentRefLineAdd,
+        component::ComponentRefLineDelete,
+        component::ComponentDimensionAdd,
+        component::ComponentDimensionSet,
+        component::ComponentDimensionDelete,
+        component::ComponentEqualAdd,
+        component::ComponentEqualDelete,
+        component_piece::ComponentPieceAdd,
+        component_piece::ComponentPieceSet,
+        component_piece::ComponentPieceDelete,
+        component_connector::ComponentConnectorAdd,
+        component_connector::ComponentConnectorSet,
+        component_connector::ComponentConnectorDelete,
+        component_script::ComponentScriptSet,
+        component_script::ComponentParamsGet,
+        component_script::ComponentParamsSet,
+        component_script::ComponentHotspotMove,
         materials::MaterialCreate,
         materials::MaterialDuplicate,
         materials::MaterialRename,
         materials::MaterialSet,
         materials::MaterialDelete,
+        materials::MaterialTextureSet,
+        materials::MaterialTextureClear,
+        fill_patterns::FillPatternsList,
+        fill_patterns::FillPatternGet,
+        fill_patterns::FillPatternCreate,
+        fill_patterns::FillPatternSet,
+        fill_patterns::FillPatternDuplicate,
+        fill_patterns::FillPatternDelete,
+        fill_patterns::FillPatternImport,
+        fill_patterns::FillPatternExport,
+        profiles::ProfilesList,
+        profiles::ProfileGet,
+        profiles::ProfileCreate,
+        profiles::ProfileSet,
+        profiles::ProfileDuplicate,
+        profiles::ProfileDelete,
+        profiles::ProfileCatalog,
+        profiles::ProfileImport,
+        profiles::ProfileTypeCreate,
+        structure_material::StructuralTypeFor,
+        steel_building::SteelBuildingCreate,
+        wall_framing::WallFramingCreate,
+        paint::Paint,
+        paint::PaintRemove,
+        paint::PaintsList,
     ],
     "Levels and views" => [
         levels::LevelCreate,
@@ -232,10 +443,27 @@ registry![
         levels::LevelDelete,
         views::ViewCreate,
         views::ViewSet,
+        schedule::ScheduleGet,
+        schedule::ScheduleSet,
         views::ViewDuplicate,
         views::ViewDelete,
+        callout::CalloutCreate,
+        callout::CalloutRemove,
+        callout::CalloutsList,
+        sun::SunPosition,
+        sun::SunFrames,
+        sun::SunPresetsList,
+        sun::SunPresetSave,
+        sun::SunPresetRename,
+        sun::SunPresetDelete,
         views::SheetPlaceView,
         views::SheetRemoveViewport,
+        sheets::SheetSet,
+        sheets::SheetFields,
+        sheets::TitleBlockCreate,
+        sheets::ComponentSheetPieceAdd,
+        sheets::ComponentSheetPieceSet,
+        sheets::ComponentSheetPieceDelete,
     ],
     "View graphics" => [
         graphics::ViewGraphicsGet,
@@ -274,5 +502,25 @@ registry![
         phases::PhaseFilterDelete,
         phases::PhaseGraphicsGet,
         phases::PhaseGraphicsSet,
+    ],
+    "Design options" => [
+        design_options::OptionsList,
+        design_options::OptionSetCreate,
+        design_options::OptionSetRename,
+        design_options::OptionSetDelete,
+        design_options::OptionCreate,
+        design_options::OptionSetProps,
+        design_options::OptionDelete,
+        design_options::OptionAcceptPrimary,
+        design_options::ElementsOptionSet,
+        design_options::ViewOptionsSet,
+        design_options::OptionActiveSet,
+    ],
+    "Visual programming" => [
+        graph::GraphRun,
+        graph::GraphCheck,
+        graph::GraphNodes,
+        graph::GraphElements,
+        graph::GraphRelease,
     ],
 ];

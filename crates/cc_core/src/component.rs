@@ -15,6 +15,9 @@
 //! Pieces brought in from other tools (IFC import) may be fixed polyhedral
 //! meshes instead, and the definition then remembers the IFC class the
 //! object had, so it is written back as the same class.
+//!
+//! A script piece ([`ComponentShape::Script`]) is Lua source that returns
+//! other pieces; see [`crate::component_script`].
 
 use crate::MepData;
 use crate::expr::{self, ExprError};
@@ -38,10 +41,17 @@ pub enum ComponentKind {
     Door,
     /// Windows: with a [`HostOpening`], their types are of the window category.
     Window,
+    /// Niches: with a [`HostOpening`] that has a `depth`, their types are of
+    /// the niche category and recess one face of their wall (see [`crate::openings`]).
+    Niche,
+    /// A sheet layout (border, title block): 2D pieces in paper millimeters, see [`crate::title_block`].
+    TitleBlock,
+    /// A detail component: 2D pieces in meters placed in one view, see [`crate::detail_component`].
+    Detail,
 }
 
 impl ComponentKind {
-    pub const ALL: [ComponentKind; 8] = [
+    pub const ALL: [ComponentKind; 11] = [
         ComponentKind::Furniture,
         ComponentKind::Casework,
         ComponentKind::Plumbing,
@@ -50,6 +60,9 @@ impl ComponentKind {
         ComponentKind::Generic,
         ComponentKind::Door,
         ComponentKind::Window,
+        ComponentKind::Niche,
+        ComponentKind::TitleBlock,
+        ComponentKind::Detail,
     ];
 
     pub fn key(self) -> &'static str {
@@ -62,11 +75,19 @@ impl ComponentKind {
             ComponentKind::Generic => "comp-kind-generic",
             ComponentKind::Door => "comp-kind-door",
             ComponentKind::Window => "comp-kind-window",
+            ComponentKind::Niche => "comp-kind-niche",
+            ComponentKind::TitleBlock => "comp-kind-title-block",
+            ComponentKind::Detail => "comp-kind-detail",
         }
+    }
+
+    /// Kinds whose definitions hold only 2D pieces ([`ComponentDef::sheet`]).
+    pub fn is_2d(self) -> bool {
+        matches!(self, ComponentKind::TitleBlock | ComponentKind::Detail)
     }
 }
 
-/// Unit of a parameter value.
+/// Unit or kind of a parameter value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum ParamKind {
     /// Meters.
@@ -75,31 +96,108 @@ pub enum ParamKind {
     /// Degrees.
     Angle,
     Number,
+    /// Text (in [`ComponentParam::text`]).
+    Text,
+    /// Yes or no: `value` 1 or 0, so expressions can read it.
+    Boolean,
+    /// One of [`ComponentParam::choices`], by key (in `text`).
+    Choice,
+    /// A project material, by name (in `text`).
+    Material,
 }
 
 impl ParamKind {
+    /// The numeric kinds, the ones a hand-made parameter can take.
     pub const ALL: [ParamKind; 3] = [ParamKind::Length, ParamKind::Angle, ParamKind::Number];
+    /// Every kind.
+    pub const EVERY: [ParamKind; 7] = [
+        ParamKind::Length,
+        ParamKind::Angle,
+        ParamKind::Number,
+        ParamKind::Text,
+        ParamKind::Boolean,
+        ParamKind::Choice,
+        ParamKind::Material,
+    ];
 
     pub fn key(self) -> &'static str {
         match self {
             ParamKind::Length => "param-kind-length",
             ParamKind::Angle => "param-kind-angle",
             ParamKind::Number => "param-kind-number",
+            ParamKind::Text => "param-kind-text",
+            ParamKind::Boolean => "param-kind-boolean",
+            ParamKind::Choice => "param-kind-choice",
+            ParamKind::Material => "param-kind-material",
         }
+    }
+
+    /// The value is text (`ComponentParam::text`), not a number.
+    pub fn is_text(self) -> bool {
+        matches!(self, ParamKind::Text | ParamKind::Choice | ParamKind::Material)
+    }
+
+    /// The name used by commands and scripts.
+    pub fn name(self) -> &'static str {
+        match self {
+            ParamKind::Length => "length",
+            ParamKind::Angle => "angle",
+            ParamKind::Number => "number",
+            ParamKind::Text => "text",
+            ParamKind::Boolean => "boolean",
+            ParamKind::Choice => "choice",
+            ParamKind::Material => "material",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<ParamKind> {
+        ParamKind::EVERY.into_iter().find(|k| k.name() == name)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ComponentParam {
     /// Name used in expressions (see [`expr::is_valid_name`]).
     pub name: String,
-    /// Value of this type.
+    /// Value of this type (1 or 0 for booleans; unused by text kinds).
     pub value: f64,
     #[serde(default)]
     pub kind: ParamKind,
     /// Elements may override the value.
     #[serde(default)]
     pub instance: bool,
+    /// Shown instead of the name when set.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    /// Value of this type for text, choice (the key) and material (the name) parameters.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// The options of a choice parameter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<crate::component_script::ParamChoice>,
+    /// Declared by a script piece: kept in step with it, not renamed by hand.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub from_script: bool,
+}
+
+impl ComponentParam {
+    /// A numeric parameter of this type.
+    pub fn number(name: impl Into<String>, value: f64, kind: ParamKind) -> ComponentParam {
+        ComponentParam { name: name.into(), value, kind, ..Default::default() }
+    }
+
+    /// The label shown: the label, or the name.
+    pub fn display(&self) -> &str {
+        if self.label.is_empty() { &self.name } else { &self.label }
+    }
+
+    /// Whether `text` is a value this parameter can take (a choice's key).
+    pub fn accepts_text(&self, text: &str) -> bool {
+        match self.kind {
+            ParamKind::Choice => self.choices.iter().any(|c| c.key == text),
+            k => k.is_text(),
+        }
+    }
 }
 
 /// Geometry of a piece; every field is an expression.
@@ -118,9 +216,20 @@ pub enum ComponentShape {
     /// `angle` degrees about the line `u = axis` of the plane (vertical in
     /// the front and side planes).
     Revolution { plane: SketchPlane, points: Vec<ProfilePoint>, offset: String, axis: String, angle: String },
+    /// Closed `profile` (u to the left of the path, v along the plane's
+    /// normal) carried along the open `path` drawn on `plane`, which stands
+    /// at `offset` on its normal axis; mitered at the path's corners.
+    Sweep { plane: SketchPlane, path: Vec<ProfilePoint>, offset: String, profile: Vec<ProfilePoint> },
+    /// The solid joining the closed `bottom` outline on `plane` at `offset`
+    /// to the closed `top` outline `depth` farther along its normal.
+    Blend { plane: SketchPlane, bottom: Vec<ProfilePoint>, top: Vec<ProfilePoint>, offset: String, depth: String },
     /// Fixed polyhedral surface (not parametric): vertices in the component
     /// frame and faces as counter-clockwise (seen from outside) index loops.
-    Mesh { vertices: Vec<[f64; 3]>, faces: Vec<Vec<u32>> },
+    Mesh { vertices: std::sync::Arc<Vec<[f64; 3]>>, faces: std::sync::Arc<Vec<Vec<u32>>> },
+    /// Lua source whose `geometry` function returns the pieces (see
+    /// [`crate::component_script`]); they take this piece's material and
+    /// flags where they set none.
+    Script { source: String },
 }
 
 impl ComponentShape {
@@ -153,7 +262,20 @@ impl ComponentShape {
                 out.push(("angle", angle));
                 out
             }
-            ComponentShape::Mesh { .. } => Vec::new(),
+            ComponentShape::Sweep { path, offset, profile, .. } => {
+                let mut out = profile_expressions(path);
+                out.extend(profile_expressions(profile));
+                out.push(("offset", offset));
+                out
+            }
+            ComponentShape::Blend { bottom, top, offset, depth, .. } => {
+                let mut out = profile_expressions(bottom);
+                out.extend(profile_expressions(top));
+                out.push(("offset", offset));
+                out.push(("depth", depth));
+                out
+            }
+            ComponentShape::Mesh { .. } | ComponentShape::Script { .. } => Vec::new(),
         }
     }
 
@@ -178,7 +300,19 @@ impl ComponentShape {
                 out.extend([offset, axis, angle]);
                 out
             }
-            ComponentShape::Mesh { .. } => Vec::new(),
+            ComponentShape::Sweep { path, offset, profile, .. } => {
+                let mut out = profile_expressions_mut(path);
+                out.extend(profile_expressions_mut(profile));
+                out.push(offset);
+                out
+            }
+            ComponentShape::Blend { bottom, top, offset, depth, .. } => {
+                let mut out = profile_expressions_mut(bottom);
+                out.extend(profile_expressions_mut(top));
+                out.extend([offset, depth]);
+                out
+            }
+            ComponentShape::Mesh { .. } | ComponentShape::Script { .. } => Vec::new(),
         }
     }
 
@@ -187,6 +321,8 @@ impl ComponentShape {
         match self {
             ComponentShape::Extrusion { points, .. } => points.len(),
             ComponentShape::Profile { points, .. } | ComponentShape::Revolution { points, .. } => points.len(),
+            ComponentShape::Sweep { path, profile, .. } => path.len() + profile.len(),
+            ComponentShape::Blend { bottom, top, .. } => bottom.len() + top.len(),
             _ => 0,
         }
     }
@@ -194,19 +330,11 @@ impl ComponentShape {
 
 /// The expressions of a profile's points (an arc's radius only when set).
 fn profile_expressions(points: &[ProfilePoint]) -> Vec<(&'static str, &String)> {
-    let mut out = Vec::with_capacity(points.len() * 2);
-    for p in points {
-        out.push(("u", &p.u));
-        out.push(("v", &p.v));
-        if !p.radius.trim().is_empty() {
-            out.push(("radius", &p.radius));
-        }
-    }
-    out
+    points.iter().flat_map(ProfilePoint::expressions).collect()
 }
 
 fn profile_expressions_mut(points: &mut [ProfilePoint]) -> Vec<&mut String> {
-    points.iter_mut().flat_map(|p| [&mut p.u, &mut p.v, &mut p.radius]).collect()
+    points.iter_mut().flat_map(ProfilePoint::expressions_mut).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -225,6 +353,49 @@ pub struct ComponentItem {
     /// A plan symbol only (a door's swing): drawn in plans, not a solid.
     #[serde(default, skip_serializing_if = "is_false")]
     pub plan_only: bool,
+    /// The detail levels of the views that show the piece (all by default).
+    #[serde(default, skip_serializing_if = "DetailLevels::is_all")]
+    pub detail: DetailLevels,
+}
+
+/// The detail levels of the views a piece shows in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DetailLevels {
+    pub coarse: bool,
+    pub medium: bool,
+    pub fine: bool,
+}
+
+impl Default for DetailLevels {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+impl DetailLevels {
+    pub const ALL: Self = Self { coarse: true, medium: true, fine: true };
+
+    pub fn is_all(&self) -> bool {
+        *self == Self::ALL
+    }
+
+    /// Whether a view at `level` shows the piece.
+    pub fn shows(&self, level: crate::DetailLevel) -> bool {
+        match level {
+            crate::DetailLevel::Coarse => self.coarse,
+            crate::DetailLevel::Medium => self.medium,
+            crate::DetailLevel::Fine => self.fine,
+        }
+    }
+
+    pub fn set(&mut self, level: crate::DetailLevel, on: bool) {
+        match level {
+            crate::DetailLevel::Coarse => self.coarse = on,
+            crate::DetailLevel::Medium => self.medium = on,
+            crate::DetailLevel::Fine => self.fine = on,
+        }
+    }
 }
 
 fn yes() -> bool {
@@ -344,6 +515,266 @@ pub struct HostOpening {
     /// symbol (a door's swing, a window's sash lines).
     #[serde(default, skip_serializing_if = "is_false")]
     pub own_symbol: bool,
+    /// How a window's panels open (doors ignore it): the plan symbol and
+    /// the IFC panel properties.
+    #[serde(default, skip_serializing_if = "WindowOperation::is_fixed")]
+    pub operation: WindowOperation,
+    /// How a door's leaves swing (windows ignore it): the plan swings,
+    /// the elevation symbol and the IFC operation type.
+    #[serde(default, skip_serializing_if = "DoorOperation::is_single_left")]
+    pub door_operation: DoorOperation,
+    /// Niches: how far the opening goes into the wall from the face it is
+    /// on, an expression of the parameters; empty for an opening through
+    /// the wall (doors and windows).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub depth: String,
+}
+
+/// How the leaves of a swing door open, after IFC's door operation types:
+/// each leaf swings about a vertical hinge towards the side the door opens
+/// to, with the hand of [`WindowOperation`] (left is the start of the
+/// opening along the wall, swapped by the element's hand flip).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum DoorOperation {
+    /// One leaf hinged on the left.
+    #[default]
+    SingleSwingLeft,
+    /// One leaf hinged on the right.
+    SingleSwingRight,
+    /// Two leaves hinged on either jamb, meeting in the middle (a double door).
+    DoubleDoor,
+}
+
+impl DoorOperation {
+    pub const ALL: [Self; 3] = [Self::SingleSwingLeft, Self::SingleSwingRight, Self::DoubleDoor];
+
+    pub fn is_single_left(&self) -> bool {
+        *self == Self::SingleSwingLeft
+    }
+
+    /// The interface key of its name.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::SingleSwingLeft => "door-op-left",
+            Self::SingleSwingRight => "door-op-right",
+            Self::DoubleDoor => "door-op-double",
+        }
+    }
+
+    /// How many leaves the door has.
+    pub fn leaves(self) -> usize {
+        match self {
+            Self::DoubleDoor => 2,
+            _ => 1,
+        }
+    }
+
+    /// The window panels that open the same way (plan swings and elevation symbols are alike).
+    fn as_window(self) -> WindowOperation {
+        match self {
+            Self::SingleSwingLeft => WindowOperation::SideHungLeft,
+            Self::SingleSwingRight => WindowOperation::SideHungRight,
+            Self::DoubleDoor => WindowOperation::DoubleSideHung,
+        }
+    }
+
+    /// The same door with its hand swapped (a flipped element).
+    pub fn mirrored(self) -> Self {
+        match self {
+            Self::SingleSwingLeft => Self::SingleSwingRight,
+            Self::SingleSwingRight => Self::SingleSwingLeft,
+            Self::DoubleDoor => Self::DoubleDoor,
+        }
+    }
+
+    /// Its `IfcDoorTypeOperationEnum` value.
+    pub fn ifc_operation(self) -> &'static str {
+        match self {
+            Self::SingleSwingLeft => "SINGLE_SWING_LEFT",
+            Self::SingleSwingRight => "SINGLE_SWING_RIGHT",
+            Self::DoubleDoor => "DOUBLE_DOOR_SINGLE_SWING",
+        }
+    }
+
+    /// The operation of an IFC door operation type; `None` for those it has no value for.
+    pub fn from_ifc(operation: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|op| op.ifc_operation() == operation)
+    }
+
+    /// The leaves from the start of the opening: each one's IFC panel
+    /// position (`IfcDoorPanelPositionEnum`) and share of the width.
+    pub fn ifc_panels(self) -> &'static [(&'static str, f64)] {
+        match self {
+            Self::DoubleDoor => &[("LEFT", 0.5), ("RIGHT", 0.5)],
+            _ => &[("MIDDLE", 1.0)],
+        }
+    }
+
+    /// The hinges in plan, as [`WindowOperation::hinges`].
+    pub fn hinges(self) -> &'static [(f64, f64)] {
+        self.as_window().hinges()
+    }
+
+    /// The lines of its elevation symbol, as [`WindowOperation::elevation_lines`].
+    pub fn elevation_lines(self, width: f64, height: f64) -> Vec<SymbolSegment> {
+        self.as_window().elevation_lines(width, height)
+    }
+}
+
+/// How the panels of a window open, after IFC's window panel operations:
+/// side-hung panels swing about a vertical hinge towards the side the
+/// window opens to (`y` of its frame). The hand is the hinge's side seen
+/// looking that way (a door's convention): left is the start of the
+/// opening along the wall (`-x`), swapped by the element's hand flip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum WindowOperation {
+    /// One panel that does not open.
+    #[default]
+    Fixed,
+    /// One panel hinged on the left.
+    SideHungLeft,
+    /// One panel hinged on the right.
+    SideHungRight,
+    /// Two panels hinged on either jamb, meeting in the middle.
+    DoubleSideHung,
+    /// One panel hinged at its head, projecting out at the bottom.
+    TopHung,
+    /// One panel turning about a horizontal axis at mid height.
+    PivotHorizontal,
+    /// One panel turning about a vertical axis in the middle.
+    PivotVertical,
+    /// Two panels sliding past each other along the wall.
+    Sliding,
+}
+
+/// A line of a window's elevation symbol: its ends `(x, z)` and how it is drawn.
+pub type SymbolSegment = ((f64, f64), (f64, f64), SymbolLine);
+
+/// How a line of a window's elevation symbol is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolLine {
+    /// The opening direction (dashed).
+    Opening,
+    /// A pivot axis (dash-dot).
+    Axis,
+    /// A plain thin line (a sliding panel's arrow).
+    Plain,
+}
+
+impl WindowOperation {
+    pub const ALL: [Self; 8] = [
+        Self::Fixed,
+        Self::SideHungLeft,
+        Self::SideHungRight,
+        Self::DoubleSideHung,
+        Self::TopHung,
+        Self::PivotHorizontal,
+        Self::PivotVertical,
+        Self::Sliding,
+    ];
+
+    pub fn is_fixed(&self) -> bool {
+        *self == Self::Fixed
+    }
+
+    /// The interface key of its name.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Fixed => "window-op-fixed",
+            Self::SideHungLeft => "window-op-left",
+            Self::SideHungRight => "window-op-right",
+            Self::DoubleSideHung => "window-op-double",
+            Self::TopHung => "window-op-top-hung",
+            Self::PivotHorizontal => "window-op-pivot-h",
+            Self::PivotVertical => "window-op-pivot-v",
+            Self::Sliding => "window-op-sliding",
+        }
+    }
+
+    /// The panels from the start of the opening: each one's IFC operation
+    /// and position (`IfcWindowPanelOperationEnum`, `IfcWindowPanelPositionEnum`).
+    pub fn ifc_panels(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Fixed => &[("FIXEDCASEMENT", "MIDDLE")],
+            Self::SideHungLeft => &[("SIDEHUNGLEFTHAND", "MIDDLE")],
+            Self::SideHungRight => &[("SIDEHUNGRIGHTHAND", "MIDDLE")],
+            Self::DoubleSideHung => &[("SIDEHUNGLEFTHAND", "LEFT"), ("SIDEHUNGRIGHTHAND", "RIGHT")],
+            Self::TopHung => &[("TOPHUNG", "MIDDLE")],
+            Self::PivotHorizontal => &[("PIVOTHORIZONTAL", "MIDDLE")],
+            Self::PivotVertical => &[("PIVOTVERTICAL", "MIDDLE")],
+            Self::Sliding => &[("SLIDINGHORIZONTAL", "LEFT"), ("SLIDINGHORIZONTAL", "RIGHT")],
+        }
+    }
+
+    /// The IFC partitioning of a window type with these panels.
+    pub fn ifc_partitioning(self) -> &'static str {
+        match self.ifc_panels().len() {
+            2 => "DOUBLE_PANEL_VERTICAL",
+            _ => "SINGLE_PANEL",
+        }
+    }
+
+    /// The operation of IFC panels (operations in order along the window);
+    /// `None` for combinations it has no value for.
+    pub fn from_ifc_panels(panels: &[&str]) -> Option<Self> {
+        Self::ALL.into_iter().find(|op| op.ifc_panels().iter().map(|(o, _)| *o).eq(panels.iter().copied()))
+    }
+
+    /// The hinges in plan: for each side-hung panel, where its hinge stands
+    /// as a fraction of the opening's width from its start, and which way
+    /// along the wall the panel closes (+1 towards the end). Others: none.
+    pub fn hinges(self) -> &'static [(f64, f64)] {
+        match self {
+            Self::SideHungLeft => &[(0.0, 1.0)],
+            Self::SideHungRight => &[(1.0, -1.0)],
+            Self::DoubleSideHung => &[(0.0, 1.0), (1.0, -1.0)],
+            _ => &[],
+        }
+    }
+
+    /// The lines of its elevation symbol on an opening `width` wide and
+    /// `height` tall, as `(x, z)` from its bottom left (the start of the
+    /// opening along the wall): the opening direction as a triangle whose
+    /// apex points at the hinge or the axis, pivot axes running past the
+    /// frame, and a sliding window's arrows.
+    pub fn elevation_lines(self, width: f64, height: f64) -> Vec<SymbolSegment> {
+        use SymbolLine::{Axis, Opening, Plain};
+        let (w, h) = (width, height);
+        let past = (0.1 * w.min(h)).min(0.15);
+        let vee = |from: (f64, f64), apex: (f64, f64), to: (f64, f64)| [(from, apex, Opening), (apex, to, Opening)];
+        match self {
+            Self::Fixed => Vec::new(),
+            Self::SideHungLeft => vee((w, h), (0.0, h / 2.0), (w, 0.0)).to_vec(),
+            Self::SideHungRight => vee((0.0, h), (w, h / 2.0), (0.0, 0.0)).to_vec(),
+            Self::DoubleSideHung => {
+                let mut lines = vee((w / 2.0, h), (0.0, h / 2.0), (w / 2.0, 0.0)).to_vec();
+                lines.extend(vee((w / 2.0, h), (w, h / 2.0), (w / 2.0, 0.0)));
+                lines
+            }
+            Self::TopHung => vee((0.0, 0.0), (w / 2.0, h), (w, 0.0)).to_vec(),
+            Self::PivotHorizontal => vec![
+                ((0.0, 0.0), (w, h), Opening),
+                ((0.0, h), (w, 0.0), Opening),
+                ((-past, h / 2.0), (w + past, h / 2.0), Axis),
+            ],
+            Self::PivotVertical => {
+                let mut lines = vec![((w / 2.0, -past), (w / 2.0, h + past), Axis)];
+                lines.extend(vee((w, h), (w / 2.0, h / 2.0), (w, 0.0)));
+                lines
+            }
+            Self::Sliding => {
+                let (z, head) = (h / 2.0, (0.25 * past).max(0.01));
+                let mut lines = Vec::new();
+                for (from, to) in [(0.0, -past), (w, w + past)] {
+                    let back = if to > from { -head } else { head };
+                    lines.push(((from, z), (to, z), Plain));
+                    lines.push(((to, z), (to + back, z + head), Plain));
+                    lines.push(((to, z), (to + back, z - head), Plain));
+                }
+                lines
+            }
+        }
+    }
 }
 
 impl HostOpening {
@@ -372,6 +803,25 @@ pub struct ComponentDef {
     /// Where pipes and conduits connect to it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connectors: Vec<ComponentConnector>,
+    /// Named planes whose positions expressions read (see [`crate::component_ref`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ref_planes: Vec<crate::component_ref::RefPlane>,
+    /// Named lines on the sketch planes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ref_lines: Vec<crate::component_ref::RefLine>,
+    /// Dimensions between reference planes, labeled by the parameters that drive them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dimensions: Vec<crate::component_ref::RefDimension>,
+    /// Planes kept halfway between two others (EQ).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub equals: Vec<crate::component_ref::RefEqual>,
+    /// Points elements move with grips, declared by script pieces.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hotspots: Vec<crate::component_script::Hotspot>,
+    /// The 2D pieces of a title block (see [`crate::title_block`]) or of a
+    /// detail component (see [`crate::detail_component`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sheet: Vec<crate::title_block::SheetItem>,
 }
 
 /// An IFC entity class with its predefined and object types.
@@ -406,6 +856,8 @@ pub struct ComponentPart {
     pub void: bool,
     /// Drawn in plans only (see [`ComponentItem::plan_only`]).
     pub plan_only: bool,
+    /// The detail levels of the views that show it.
+    pub detail: DetailLevels,
     /// Faces of a piece that is not a vertical prism (empty for prisms).
     pub faces: Vec<Vec<DVec3>>,
 }
@@ -419,6 +871,8 @@ pub enum PartError {
     },
     /// A size is zero or negative, or a profile has fewer than 3 points.
     Degenerate,
+    /// A script piece failed (its last pieces that worked may still be shown).
+    Script(String),
 }
 
 impl std::fmt::Display for PartError {
@@ -426,6 +880,7 @@ impl std::fmt::Display for PartError {
         match self {
             PartError::Expr { field, error } => write!(f, "{field}: {error}"),
             PartError::Degenerate => write!(f, "zero or negative size"),
+            PartError::Script(message) => write!(f, "script: {message}"),
         }
     }
 }
@@ -438,11 +893,13 @@ impl ComponentDef {
         self.params.iter().find(|p| p.name == name)
     }
 
-    /// Parameter values with instance `overrides` applied (only to instance
-    /// parameters; non-finite overrides are ignored).
+    /// Numeric parameter values (booleans as 1 or 0) with instance
+    /// `overrides` applied (only to instance parameters; non-finite
+    /// overrides are ignored). Text parameters are left out.
     pub fn values(&self, overrides: &BTreeMap<String, f64>) -> BTreeMap<String, f64> {
         self.params
             .iter()
+            .filter(|p| !p.kind.is_text())
             .map(|p| {
                 let v = overrides.get(&p.name).copied().filter(|v| p.instance && v.is_finite()).unwrap_or(p.value);
                 (p.name.clone(), v)
@@ -450,20 +907,63 @@ impl ComponentDef {
             .collect()
     }
 
+    /// Text, choice and material values with instance `overrides` applied
+    /// (only to instance parameters, and only values the parameter accepts).
+    pub fn texts(&self, overrides: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        self.params
+            .iter()
+            .filter(|p| p.kind.is_text())
+            .map(|p| {
+                let v = overrides.get(&p.name).filter(|v| p.instance && p.accepts_text(v)).unwrap_or(&p.text);
+                (p.name.clone(), v.clone())
+            })
+            .collect()
+    }
+
+    /// Hotspot positions with the element's `moved` ones applied (finite only).
+    pub fn hotspot_positions(&self, moved: &BTreeMap<String, [f64; 3]>) -> BTreeMap<String, DVec3> {
+        self.hotspots
+            .iter()
+            .map(|h| {
+                let p = moved.get(&h.name).filter(|p| p.iter().all(|v| v.is_finite())).unwrap_or(&h.position);
+                (h.name.clone(), DVec3::from_array(*p))
+            })
+            .collect()
+    }
+
+    pub fn hotspot(&self, name: &str) -> Option<&crate::component_script::Hotspot> {
+        self.hotspots.iter().find(|h| h.name == name)
+    }
+
+    /// Whether any piece is a script.
+    pub fn has_script(&self) -> bool {
+        self.items.iter().any(|i| matches!(i.shape, ComponentShape::Script { .. }))
+    }
+
     /// Width and height of the opening a door or window cuts (`None` for
     /// other components, or when they do not evaluate to positive sizes).
     pub fn opening_size(&self) -> Option<(f64, f64)> {
         let o = self.opening.as_ref()?;
-        let values = self.values(&BTreeMap::new());
-        let lookup = |name: &str| values.get(name).copied();
+        let scope = self.scope(&BTreeMap::new(), &[]);
+        let lookup = |name: &str| scope.get(name);
         let (w, h) = (expr::eval(&o.width, &lookup).ok()?, expr::eval(&o.height, &lookup).ok()?);
         (w > 0.0 && h > 0.0).then_some((w, h))
     }
 
+    /// The depth of a niche's recess (see [`HostOpening::depth`]): `None`
+    /// for an opening through the wall, or a depth that does not evaluate
+    /// to a positive length.
+    pub fn opening_depth(&self) -> Option<f64> {
+        let o = self.opening.as_ref().filter(|o| !o.depth.trim().is_empty())?;
+        let scope = self.scope(&BTreeMap::new(), &[]);
+        let depth = expr::eval(&o.depth, &|name: &str| scope.get(name)).ok()?;
+        (depth.is_finite() && depth > 0.0).then_some(depth)
+    }
+
     /// The connectors whose expressions evaluate, in the component's frame.
     pub fn resolve_connectors(&self, overrides: &BTreeMap<String, f64>) -> Vec<ResolvedConnector> {
-        let values = self.values(overrides);
-        let lookup = |name: &str| values.get(name).copied();
+        let scope = self.scope(overrides, &[]);
+        let lookup = |name: &str| scope.get(name);
         self.connectors
             .iter()
             .enumerate()
@@ -486,16 +986,19 @@ impl ComponentDef {
     /// Sill height of new doors and windows of this definition (0 when unset or invalid).
     pub fn default_sill(&self) -> f64 {
         let Some(o) = self.opening.as_ref().filter(|o| !o.sill.trim().is_empty()) else { return 0.0 };
-        let values = self.values(&BTreeMap::new());
-        expr::eval(&o.sill, &|name: &str| values.get(name).copied()).map_or(0.0, |v| v.max(0.0))
+        let scope = self.scope(&BTreeMap::new(), &[]);
+        expr::eval(&o.sill, &|name: &str| scope.get(name)).map_or(0.0, |v| v.max(0.0))
     }
 
     /// The category of the types of this definition: doors and windows
     /// (with an opening) have their own.
     pub fn category(&self) -> crate::Category {
         match (self.kind, &self.opening) {
+            (ComponentKind::TitleBlock, _) => crate::Category::TitleBlock,
+            (ComponentKind::Detail, _) => crate::Category::DetailComponent,
             (ComponentKind::Door, Some(_)) => crate::Category::Door,
             (ComponentKind::Window, Some(_)) => crate::Category::Window,
+            (ComponentKind::Niche, Some(_)) => crate::Category::Niche,
             _ => crate::Category::Component,
         }
     }
@@ -506,37 +1009,48 @@ impl ComponentDef {
     }
 
     /// Resolve every piece with `extra` names defined too (a door's
-    /// [`WALL_THICKNESS`]); parameters of the same name win.
+    /// [`WALL_THICKNESS`]); parameters of the same name win. Pieces also
+    /// read the reference planes. Script pieces fail here: they need
+    /// [`ComponentDef::resolve_with`].
     pub fn resolve_in(
         &self,
         overrides: &BTreeMap<String, f64>,
         extra: &[(&str, f64)],
     ) -> (Vec<ComponentPart>, Vec<(usize, PartError)>) {
-        let values = self.values(overrides);
-        let lookup =
-            |name: &str| values.get(name).copied().or_else(|| extra.iter().find(|(n, _)| *n == name).map(|(_, v)| *v));
+        let ctx = ResolveCtx { overrides, extra, ..ResolveCtx::default() };
+        self.resolve_with(&ctx)
+    }
+
+    /// Resolve every piece, script pieces through `ctx.scripts`.
+    pub fn resolve_with(&self, ctx: &ResolveCtx) -> (Vec<ComponentPart>, Vec<(usize, PartError)>) {
+        let scope = self.scope(ctx.overrides, ctx.extra);
+        let lookup = |name: &str| scope.get(name);
         let mut parts = Vec::new();
         let mut errors = Vec::new();
+        let mut input = None;
         for (i, item) in self.items.iter().enumerate() {
-            let resolved = match &item.shape {
-                ComponentShape::Mesh { vertices, faces } => resolve_mesh(vertices, faces),
-                ComponentShape::Profile { .. } | ComponentShape::Revolution { .. } => {
-                    resolve_profile(&item.shape, &lookup)
+            if let ComponentShape::Script { source } = &item.shape {
+                let input = input.get_or_insert_with(|| crate::component_script::ScriptInput {
+                    numbers: scope.values.clone(),
+                    texts: self.texts(ctx.texts),
+                    hotspots: self.hotspot_positions(ctx.hotspots),
+                });
+                let owner = crate::component_script::ScriptOwner { piece: i, ..ctx.owner };
+                let result = ctx.scripts.eval(source, input, owner);
+                if let Some(error) = result.error {
+                    errors.push((i, PartError::Script(error)));
                 }
-                shape => resolve_shape(shape, &lookup).map(|(footprint, z0, z1)| (footprint, z0, z1, Vec::new())),
-            };
-            match resolved {
-                Ok((footprint, z0, z1, faces)) => parts.push(ComponentPart {
-                    item: i,
-                    footprint,
-                    z0,
-                    z1,
-                    material: item.material.clone(),
-                    in_plan: item.in_plan || item.plan_only,
-                    void: item.void && !item.plan_only,
-                    plan_only: item.plan_only,
-                    faces,
-                }),
+                for sub in result.items.iter().flat_map(|items| items.iter()) {
+                    let sub = merged_item(item, sub);
+                    match resolve_item(&sub, &|_: &str| None) {
+                        Ok(r) => parts.push(part(i, &sub, r)),
+                        Err(e) => errors.push((i, e)),
+                    }
+                }
+                continue;
+            }
+            match resolve_item(item, &lookup) {
+                Ok(r) => parts.push(part(i, item, r)),
                 Err(e) => errors.push((i, e)),
             }
         }
@@ -550,9 +1064,46 @@ impl ComponentDef {
 
     /// Rename a parameter and every reference to it in the pieces.
     pub fn rename_param(&mut self, old: &str, new: &str) {
+        self.rename(old, new);
+    }
+
+    /// Rename a parameter, reference plane or line and every expression,
+    /// dimension and label that reads it.
+    pub fn rename(&mut self, old: &str, new: &str) {
         for p in &mut self.params {
             if p.name == old {
                 p.name = new.to_string();
+            }
+        }
+        for p in &mut self.ref_planes {
+            if p.name == old {
+                p.name = new.to_string();
+            }
+            p.at = replace_name(&p.at, old, new);
+        }
+        for l in &mut self.ref_lines {
+            if l.name == old {
+                l.name = new.to_string();
+            }
+            for e in [&mut l.offset, &mut l.start.0, &mut l.start.1, &mut l.end.0, &mut l.end.1] {
+                *e = replace_name(e, old, new);
+            }
+        }
+        for d in &mut self.dimensions {
+            for name in [&mut d.from, &mut d.to] {
+                if name == old {
+                    *name = new.to_string();
+                }
+            }
+            if d.label.as_deref() == Some(old) {
+                d.label = Some(new.to_string());
+            }
+        }
+        for q in &mut self.equals {
+            for name in [&mut q.a, &mut q.middle, &mut q.b] {
+                if name == old {
+                    *name = new.to_string();
+                }
             }
         }
         for item in &mut self.items {
@@ -570,12 +1121,94 @@ impl ComponentDef {
                 *e = replace_name(e, old, new);
             }
         }
+        for item in &mut self.sheet {
+            for e in item.shape.expressions_mut() {
+                *e = replace_name(e, old, new);
+            }
+            if let crate::title_block::SheetShape::Text { text, .. } = &mut item.shape {
+                *text = crate::title_block::rename_field_param(text, old, new);
+            }
+        }
+    }
+}
+
+/// What resolving reads besides the definition.
+pub struct ResolveCtx<'a> {
+    /// Numeric (and boolean) instance values.
+    pub overrides: &'a BTreeMap<String, f64>,
+    /// Text, choice and material instance values.
+    pub texts: &'a BTreeMap<String, String>,
+    /// Moved hotspots.
+    pub hotspots: &'a BTreeMap<String, [f64; 3]>,
+    /// Names defined besides the parameters (a door's wall thickness).
+    pub extra: &'a [(&'a str, f64)],
+    pub scripts: &'a dyn crate::component_script::ScriptEval,
+    /// Whose pieces these are (for the last script result that worked).
+    pub owner: crate::component_script::ScriptOwner,
+}
+
+static EMPTY_NUMBERS: BTreeMap<String, f64> = BTreeMap::new();
+static EMPTY_TEXTS: BTreeMap<String, String> = BTreeMap::new();
+static EMPTY_POINTS: BTreeMap<String, [f64; 3]> = BTreeMap::new();
+
+impl Default for ResolveCtx<'_> {
+    fn default() -> Self {
+        ResolveCtx {
+            overrides: &EMPTY_NUMBERS,
+            texts: &EMPTY_TEXTS,
+            hotspots: &EMPTY_POINTS,
+            extra: &[],
+            scripts: &crate::component_script::NoScripts,
+            owner: Default::default(),
+        }
+    }
+}
+
+/// Resolve one piece that is not a script.
+fn resolve_item(item: &ComponentItem, lookup: &dyn Fn(&str) -> Option<f64>) -> Result<ResolvedMesh, PartError> {
+    match &item.shape {
+        ComponentShape::Mesh { vertices, faces } => resolve_mesh(vertices, faces),
+        ComponentShape::Profile { .. }
+        | ComponentShape::Revolution { .. }
+        | ComponentShape::Sweep { .. }
+        | ComponentShape::Blend { .. } => resolve_profile(&item.shape, lookup),
+        ComponentShape::Script { .. } => Err(PartError::Script("a script cannot return a script piece".into())),
+        shape => resolve_shape(shape, lookup).map(|(footprint, z0, z1)| (footprint, z0, z1, Vec::new())),
+    }
+}
+
+fn part(item_index: usize, item: &ComponentItem, (footprint, z0, z1, faces): ResolvedMesh) -> ComponentPart {
+    ComponentPart {
+        item: item_index,
+        footprint,
+        z0,
+        z1,
+        material: item.material.clone(),
+        in_plan: item.in_plan || item.plan_only,
+        void: item.void && !item.plan_only,
+        plan_only: item.plan_only,
+        detail: item.detail,
+        faces,
+    }
+}
+
+/// A piece a script returned, with the script piece's material and flags
+/// where it sets none.
+fn merged_item(script: &ComponentItem, sub: &ComponentItem) -> ComponentItem {
+    ComponentItem {
+        name: sub.name.clone(),
+        shape: sub.shape.clone(),
+        material: if sub.material.is_empty() { script.material.clone() } else { sub.material.clone() },
+        in_plan: sub.in_plan && script.in_plan,
+        void: sub.void || script.void,
+        plan_only: sub.plan_only || script.plan_only,
+        detail: if sub.detail.is_all() { script.detail } else { sub.detail },
     }
 }
 
 /// Replace whole-identifier occurrences of `old` in `text` (numbers such as
 /// `2e3` are left alone).
-fn replace_name(text: &str, old: &str, new: &str) -> String {
+pub fn replace_name(text: &str, old: &str, new: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -632,6 +1265,16 @@ fn resolve_profile(shape: &ComponentShape, lookup: &dyn Fn(&str) -> Option<f64>)
             let outline = profile::outline(points, lookup).map_err(from)?;
             let (offset, axis, angle) = (ev("offset", offset)?, ev("axis", axis)?, ev("angle", angle)?);
             profile::revolve(*plane, &outline, offset, axis, angle).map_err(from)?
+        }
+        ComponentShape::Sweep { plane, path, offset, profile } => {
+            let path = crate::sweep::path(path, lookup).map_err(from)?;
+            let section = profile::outline(profile, lookup).map_err(from)?;
+            crate::sweep::sweep(*plane, &path, ev("offset", offset)?, &section).map_err(from)?
+        }
+        ComponentShape::Blend { plane, bottom, top, offset, depth } => {
+            let (low, high) =
+                (profile::outline(bottom, lookup).map_err(from)?, profile::outline(top, lookup).map_err(from)?);
+            crate::sweep::blend(*plane, &low, &high, ev("offset", offset)?, ev("depth", depth)?).map_err(from)?
         }
         _ => return Err(PartError::Degenerate),
     };
@@ -729,9 +1372,12 @@ fn resolve_shape(
             }
             Ok((footprint, z, z + h))
         }
-        ComponentShape::Mesh { .. } | ComponentShape::Profile { .. } | ComponentShape::Revolution { .. } => {
-            Err(PartError::Degenerate)
-        }
+        ComponentShape::Mesh { .. }
+        | ComponentShape::Profile { .. }
+        | ComponentShape::Revolution { .. }
+        | ComponentShape::Sweep { .. }
+        | ComponentShape::Blend { .. }
+        | ComponentShape::Script { .. } => Err(PartError::Degenerate),
     }
 }
 
@@ -748,6 +1394,7 @@ pub fn library(n: &dyn Fn(&str) -> String) -> Vec<(String, String, ComponentDef)
         value,
         kind: ParamKind::Length,
         instance: false,
+        ..Default::default()
     };
     let bx = |name: &str,
               x: String,
@@ -765,6 +1412,7 @@ pub fn library(n: &dyn Fn(&str) -> String) -> Vec<(String, String, ComponentDef)
             in_plan: plan,
             void: false,
             plan_only: false,
+            detail: Default::default(),
         }
     };
     let s = |v: &str| v.to_string();
@@ -804,6 +1452,7 @@ pub fn library(n: &dyn Fn(&str) -> String) -> Vec<(String, String, ComponentDef)
         mep: None,
         params: vec![length(&w, 1.2), length(&d, 0.8), length(&h, 0.75)],
         items,
+        ..Default::default()
     };
     out.push((n("tpl-comp-table"), n("tpl-type-table"), table));
 
@@ -840,6 +1489,7 @@ pub fn library(n: &dyn Fn(&str) -> String) -> Vec<(String, String, ComponentDef)
         mep: None,
         params: vec![length(&w, 0.45), length(&d, 0.5), length(&h, 0.9), length(&seat, 0.45)],
         items,
+        ..Default::default()
     };
     out.push((n("tpl-comp-chair"), n("tpl-type-chair"), chair));
 
@@ -875,6 +1525,7 @@ pub fn library(n: &dyn Fn(&str) -> String) -> Vec<(String, String, ComponentDef)
                 true,
             ),
         ],
+        ..Default::default()
     };
     out.push((n("tpl-comp-bed"), n("tpl-type-bed"), bed));
 
@@ -933,6 +1584,7 @@ pub fn library(n: &dyn Fn(&str) -> String) -> Vec<(String, String, ComponentDef)
                 true,
             ),
         ],
+        ..Default::default()
     };
     out.push((n("tpl-comp-sofa"), n("tpl-type-sofa"), sofa));
 
@@ -981,6 +1633,7 @@ pub fn library(n: &dyn Fn(&str) -> String) -> Vec<(String, String, ComponentDef)
                 in_plan: true,
                 void: false,
                 plan_only: false,
+                detail: Default::default(),
             },
             bx(
                 &n("tpl-part-tank"),
@@ -994,6 +1647,7 @@ pub fn library(n: &dyn Fn(&str) -> String) -> Vec<(String, String, ComponentDef)
                 true,
             ),
         ],
+        ..Default::default()
     };
     out.push((n("tpl-comp-toilet"), n("tpl-type-toilet"), toilet));
 
@@ -1041,8 +1695,10 @@ pub fn library(n: &dyn Fn(&str) -> String) -> Vec<(String, String, ComponentDef)
                 in_plan: false,
                 void: false,
                 plan_only: false,
+                detail: Default::default(),
             },
         ],
+        ..Default::default()
     };
     out.push((n("tpl-comp-washbasin"), n("tpl-type-washbasin"), basin));
 
@@ -1065,6 +1721,7 @@ pub fn library(n: &dyn Fn(&str) -> String) -> Vec<(String, String, ComponentDef)
             &wood,
             true,
         )],
+        ..Default::default()
     };
     out.push((n("tpl-comp-wardrobe"), n("tpl-type-wardrobe"), wardrobe));
     out.extend(mep_library(n));
@@ -1086,6 +1743,7 @@ pub fn mep_library(n: &dyn Fn(&str) -> String) -> Vec<(String, String, Component
         value,
         kind: ParamKind::Length,
         instance: false,
+        ..Default::default()
     };
     let sizes = |width: f64, depth: f64, height: f64| vec![length(&w, width), length(&d, depth), length(&h, height)];
     let piece = |name: &str, shape: ComponentShape, material: &str| ComponentItem {
@@ -1095,6 +1753,7 @@ pub fn mep_library(n: &dyn Fn(&str) -> String) -> Vec<(String, String, Component
         in_plan: true,
         void: false,
         plan_only: false,
+        detail: Default::default(),
     };
     // A box W x D x H with its back on the X axis, standing out towards -Y.
     let wall_box = |z: &str| ComponentShape::Box {
@@ -1105,10 +1764,18 @@ pub fn mep_library(n: &dyn Fn(&str) -> String) -> Vec<(String, String, Component
         depth: d.clone(),
         height: h.clone(),
     };
-    let def = |kind: ComponentKind, params: Vec<ComponentParam>, items: Vec<ComponentItem>, mep: MepData| {
-        ComponentDef { kind, params, items, ifc: None, mep: Some(mep), opening: None, connectors: Vec::new() }
-    };
-    let device = |device: D, power: f64| MepData::Device { device, power };
+    let def =
+        |kind: ComponentKind, params: Vec<ComponentParam>, items: Vec<ComponentItem>, mep: MepData| ComponentDef {
+            kind,
+            params,
+            items,
+            ifc: None,
+            mep: Some(mep),
+            opening: None,
+            connectors: Vec::new(),
+            ..Default::default()
+        };
+    let device = MepData::device_of;
     let body = n("tpl-part-body");
     let mut out = Vec::new();
 
@@ -1217,6 +1884,103 @@ pub fn mep_library(n: &dyn Fn(&str) -> String) -> Vec<(String, String, Component
     out
 }
 
+/// The built-in definition of a communications or lightning protection
+/// device, which a project gets with the first one placed: (component,
+/// type name, definition). Data outlets and racks hang on walls like the
+/// electrical devices (their back on the insertion point); an air terminal
+/// is a rod standing `Height` (an instance parameter) on a base plate; an
+/// earth electrode a rod driven `Length` down from its top. `None` for the
+/// other device kinds (see [`mep_library`]).
+pub fn device_library(device: crate::DeviceKind, n: &dyn Fn(&str) -> String) -> Option<(String, String, ComponentDef)> {
+    use crate::DeviceKind as D;
+    let (w, d, h, l) = (n("tpl-param-width"), n("tpl-param-depth"), n("tpl-param-height"), n("tpl-param-length"));
+    let (steel, plastic, copper) = (n("tpl-mat-steel"), n("tpl-mat-pvc"), n("tpl-mat-copper"));
+    let param = |name: &str, value: f64, instance: bool| ComponentParam {
+        name: name.to_string(),
+        value,
+        kind: ParamKind::Length,
+        instance,
+        ..Default::default()
+    };
+    let piece = |name: String, shape: ComponentShape, material: &str| ComponentItem {
+        name,
+        shape,
+        material: material.to_string(),
+        in_plan: true,
+        void: false,
+        plan_only: false,
+        detail: Default::default(),
+    };
+    let cylinder = |z: String, radius: &str, height: String| ComponentShape::Cylinder {
+        x: "0".into(),
+        y: "0".into(),
+        z,
+        radius: radius.into(),
+        height,
+    };
+    let wall_box = ComponentShape::Box {
+        x: format!("-{w} / 2"),
+        y: format!("-{d}"),
+        z: "0".into(),
+        width: w.clone(),
+        depth: d.clone(),
+        height: h.clone(),
+    };
+    let def = |params: Vec<ComponentParam>, items: Vec<ComponentItem>, mep: MepData| ComponentDef {
+        kind: ComponentKind::Electrical,
+        params,
+        items,
+        mep: Some(mep),
+        ..Default::default()
+    };
+    let sizes = |width: f64, depth: f64, height: f64| {
+        vec![param(&w, width, false), param(&d, depth, false), param(&h, height, false)]
+    };
+    let (component, type_name, def) = match device {
+        D::DataOutlet => (
+            "tpl-comp-data-outlet",
+            "tpl-type-data-outlet",
+            def(
+                sizes(0.1, 0.03, 0.1),
+                vec![piece(n("tpl-part-body"), wall_box, &plastic)],
+                MepData::Device { device, power: 0.0, ports: 2 },
+            ),
+        ),
+        D::Rack => (
+            "tpl-comp-rack",
+            "tpl-type-rack",
+            def(
+                sizes(0.6, 0.45, 0.6),
+                vec![piece(n("tpl-part-body"), wall_box, &steel)],
+                MepData::device_of(device, 0.0),
+            ),
+        ),
+        D::AirTerminal => (
+            "tpl-comp-air-terminal",
+            "tpl-type-air-terminal",
+            def(
+                vec![param(&h, 1.0, true)],
+                vec![
+                    piece(n("tpl-part-base"), cylinder("0".into(), "0.06", "0.02".into()), &steel),
+                    piece(n("tpl-part-rod"), cylinder("0".into(), "0.008", h.clone()), &steel),
+                ],
+                MepData::device_of(device, 0.0),
+            ),
+        ),
+        D::EarthElectrode => (
+            "tpl-comp-earth-electrode",
+            "tpl-type-earth-electrode",
+            def(
+                vec![param(&l, 2.4, true)],
+                vec![piece(n("tpl-part-rod"), cylinder(format!("-{l}"), "0.008", l.clone()), &copper)],
+                MepData::device_of(device, 0.0),
+            ),
+        ),
+        _ => return None,
+    };
+    Some((n(component), n(type_name), def))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1298,14 +2062,16 @@ mod tests {
                     [0.0, 1.0, 0.0],
                     [0.0, 0.0, 2.0],
                     [f64::NAN, 0.0, 0.0],
-                ],
+                ]
+                .into(),
                 // The last face has a bad vertex and an index out of range: it drops to nothing.
-                faces: vec![vec![0, 2, 1], vec![0, 1, 3], vec![1, 2, 3], vec![2, 0, 3], vec![4, 9, 4]],
+                faces: vec![vec![0, 2, 1], vec![0, 1, 3], vec![1, 2, 3], vec![2, 0, 3], vec![4, 9, 4]].into(),
             },
             material: String::new(),
             in_plan: true,
             void: false,
             plan_only: false,
+            detail: Default::default(),
         };
         let def = ComponentDef { items: vec![item.clone()], ..Default::default() };
         let (parts, errors) = def.resolve(&BTreeMap::new());
@@ -1313,7 +2079,7 @@ mod tests {
         assert_eq!(parts[0].faces.len(), 4);
         assert_eq!(parts[0].footprint.len(), 3);
         assert_eq!((parts[0].z0, parts[0].z1), (0.0, 2.0));
-        let empty = ComponentShape::Mesh { vertices: vec![], faces: vec![vec![0, 1, 2]] };
+        let empty = ComponentShape::Mesh { vertices: Default::default(), faces: vec![vec![0, 1, 2]].into() };
         let def = ComponentDef { items: vec![ComponentItem { shape: empty, ..item }], ..Default::default() };
         assert_eq!(def.resolve(&BTreeMap::new()).1.len(), 1);
     }

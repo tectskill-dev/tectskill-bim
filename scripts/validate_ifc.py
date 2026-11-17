@@ -1,7 +1,7 @@
-"""Validate an IFC file exported by ConstructCAD with IfcOpenShell.
+"""Validate an IFC file exported by ConstructCraft with IfcOpenShell.
 
 Used in CI only: IfcOpenShell is an independent, open-source reference, never
-a build or runtime dependency of ConstructCAD.
+a build or runtime dependency of ConstructCraft.
 
 Checks:
   * schema and EXPRESS rule validation;
@@ -27,9 +27,10 @@ import ifcopenshell.validate
 ELEMENTS = (
     "IfcWall", "IfcDoor", "IfcWindow", "IfcSlab", "IfcCovering", "IfcRoof",
     "IfcColumn", "IfcBeam", "IfcStair", "IfcRailing",
-    "IfcFooting", "IfcReinforcingBar", "IfcFurniture", "IfcSanitaryTerminal", "IfcLightFixture", "IfcBuildingElementProxy",
+    "IfcFooting", "IfcPile", "IfcReinforcingBar", "IfcFurniture", "IfcSanitaryTerminal", "IfcLightFixture", "IfcBuildingElementProxy",
     "IfcPipeSegment", "IfcStairFlight", "IfcMember",
     "IfcCableCarrierSegment", "IfcPipeFitting", "IfcCableCarrierFitting", "IfcOutlet", "IfcSwitchingDevice", "IfcElectricDistributionBoard",
+    "IfcPlate", "IfcMechanicalFastener",
 )
 REL_TOL = 1e-3
 STATUSES = {"NEW", "EXISTING", "DEMOLISH", "TEMPORARY", "OTHER", "NOTKNOWN", "UNSET"}

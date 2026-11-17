@@ -45,7 +45,7 @@ impl Command for CategoriesList {
     const KIND: CommandKind = CommandKind::Query;
     fn run(self, s: &mut Session) -> Result<Value> {
         let p = s.project();
-        Ok(Category::ALL
+        Ok(Category::NAMED
             .into_iter()
             .map(|c| {
                 json!({
@@ -105,7 +105,21 @@ impl Command for TypesList {
 
 pub(crate) fn type_json(s: &Session, id: cc_core::ElementTypeId) -> Option<Value> {
     let t = s.project().element_type(id)?;
-    let (_, params) = variant(to_json(&t.data));
+    // A title block's pictures show as a summary, not their bytes.
+    let params = match &t.data {
+        cc_core::TypeData::Component { component, def } => {
+            json!({ "component": component, "def": super::sheets::def_json(def) })
+        }
+        data => variant(to_json(data)).1,
+    };
+    // A column or beam type shows its profile by name (null without one).
+    let mut params = params;
+    if let (cc_core::TypeData::Column { profile, .. } | cc_core::TypeData::Beam { profile, .. }, Some(o)) =
+        (&t.data, params.as_object_mut())
+    {
+        let name = profile.and_then(|id| s.project().profile(id)).map(|f| f.name.clone());
+        o.insert("profile".into(), json!(name));
+    }
     Some(json!({
         "id": t.id.0,
         "name": t.name,
@@ -116,6 +130,8 @@ pub(crate) fn type_json(s: &Session, id: cc_core::ElementTypeId) -> Option<Value
 }
 
 /// A type with all its parameters (`params`, editable with `type_set`) and identity data (`info`).
+/// A title block's pictures show as `format`, `width`, `height` (pixels) and `bytes`, not their
+/// bytes; `component_sheet_piece_set` replaces them.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TypeGet {
@@ -164,6 +180,10 @@ impl Command for ElementsList {
         let shown: Option<std::collections::BTreeSet<ElementId>> = match &self.view {
             Some(v) => {
                 let view = refs::view(p, v)?;
+                // A schedule draws as a table (for sheets) that shows no element: `schedule_table` lists them.
+                if matches!(p.view(view).map(|v| &v.kind), Some(cc_core::ViewKind::Schedule { .. })) {
+                    return Err(EngineError::invalid(t!("msg-view-not-graphical")));
+                }
                 let drawing = s.drawing(view).ok_or_else(|| EngineError::invalid(t!("msg-view-not-graphical")))?;
                 Some(drawing.prims.iter().filter_map(cc_views::Prim::element).collect())
             }
@@ -191,7 +211,20 @@ impl Command for ElementsList {
 /// Full description of an element: everything `element_set` can change, plus derived values.
 pub(crate) fn element_json(s: &mut Session, id: ElementId) -> Option<Value> {
     let e = s.project().element(id)?.clone();
-    let (_, params) = variant(to_json(&e.kind));
+    let params = super::cad::params(&e.kind);
+    // A bar tag's text, as its view writes it.
+    let tag_text = match &e.kind {
+        ElementKind::BarTag(t) => super::bar_marks::tag_text(s, t),
+        _ => None,
+    };
+    // The marks of a reinforcement set's bars, each once.
+    let bar_marks: Vec<String> = {
+        let (p, g) = s.project_and_geometry();
+        match g.rebar.contains_key(&id) {
+            true => cc_geom::bar_marks::resolve(p, &g.rebar).of_set(id).into_iter().map(|m| m.mark.clone()).collect(),
+            false => Vec::new(),
+        }
+    };
     let p = s.project();
     let mut derived = serde_json::Map::new();
     match &e.kind {
@@ -208,12 +241,44 @@ pub(crate) fn element_json(s: &mut Session, id: ElementId) -> Option<Value> {
         }
         ElementKind::Beam(b) => {
             derived.insert("length".into(), json!(b.length()));
-            if b.end_offset.is_some() {
+            if b.end_offset.is_some() || b.arc().is_some() {
                 derived.insert("true_length".into(), json!(b.true_length()));
+            }
+            if let Some(arc) = b.arc() {
+                // The location line's circle and the turn from start to end.
+                derived.insert("center".into(), json!(arc.center.to_array()));
+                derived.insert("radius".into(), json!(arc.radius));
+                derived.insert("sweep".into(), json!(arc.sweep.to_degrees()));
+            }
+        }
+        ElementKind::Foundation(f) if matches!(f.shape, cc_core::FoundationShape::Strip { .. }) => {
+            derived.insert("length".into(), json!(f.shape.strip_length()));
+            if let Some(arc) = f.shape.arc() {
+                // The centerline's circle and the turn from start to end.
+                derived.insert("center".into(), json!(arc.center.to_array()));
+                derived.insert("radius".into(), json!(arc.radius));
+                derived.insert("sweep".into(), json!(arc.sweep.to_degrees()));
             }
         }
         ElementKind::Railing(r) => {
             derived.insert("length".into(), json!(cc_geom::railing_length(p, &e, r)));
+        }
+        ElementKind::Sweep(sw) => {
+            derived.insert("length".into(), json!(sw.length()));
+        }
+        ElementKind::SteelBuilding(b) => super::steel_building::derived(p, b, &mut derived),
+        ElementKind::WallFraming(f) => super::wall_framing::derived(p, f, &mut derived),
+        ElementKind::Truss(t) => super::framing::derived(t, &mut derived),
+        ElementKind::Bracing(b) => super::bracing::derived(b, &mut derived),
+        ElementKind::Shaft(sh) => {
+            let (bottom, top) = p.shaft_span(&e, sh);
+            derived.insert("bottom".into(), json!(bottom));
+            derived.insert("top".into(), json!(top));
+            derived.insert("area".into(), json!(cc_geom::polygon::area(&sh.outline)));
+            // The floors, ceilings and roofs it cuts.
+            let cuts: Vec<u64> =
+                p.elements.values().filter(|o| o.shaft_cuts().contains(&sh.outline)).map(|o| o.id.0).collect();
+            derived.insert("cuts".into(), json!(cuts));
         }
         ElementKind::Stair(st) => {
             if let Some(g) = cc_geom::stair_geom(p, &e, st) {
@@ -227,7 +292,32 @@ pub(crate) fn element_json(s: &mut Session, id: ElementId) -> Option<Value> {
                 derived.insert("check".into(), json!(g.check));
             }
         }
-        ElementKind::Pipe(seg) | ElementKind::Conduit(seg) => {
+        ElementKind::BarTag(_) => {
+            if let Some(text) = &tag_text {
+                derived.insert("text".into(), json!(text));
+            }
+        }
+        ElementKind::LevelMark(m) => {
+            if let (Some(view), Some(ty)) = (p.view(m.view), p.element_type(e.type_id)) {
+                if let Some(levels) = cc_geom::level_mark::levels(p, view, m) {
+                    derived.insert("finished".into(), json!(levels.finished));
+                    derived.insert("raw".into(), json!(levels.raw));
+                }
+                if let Some(texts) = cc_views::level_marks::texts(p, view, m, &ty.data) {
+                    derived.insert("texts".into(), json!(texts));
+                }
+            }
+        }
+        ElementKind::Pipe(_)
+        | ElementKind::Conduit(_)
+        | ElementKind::CableTray(_)
+        | ElementKind::LightningConductor(_) => {
+            let seg = e.as_segment()?;
+            if let ElementKind::LightningConductor(c) = &e.kind {
+                derived.insert("role".into(), json!(c.role.name()));
+                let diameter = p.element_type(e.type_id).and_then(|t| t.diameter()).unwrap_or(0.0);
+                derived.insert("section_mm2".into(), json!(std::f64::consts::PI * (diameter * 500.0).powi(2)));
+            }
             derived.insert("length".into(), json!(seg.length()));
             derived.insert("slope".into(), json!(seg.slope()));
             let systems: Vec<Value> = seg
@@ -237,6 +327,18 @@ pub(crate) fn element_json(s: &mut Session, id: ElementId) -> Option<Value> {
                 .collect();
             derived.insert("systems".into(), json!(systems));
         }
+        ElementKind::CadImport(c) => super::cad::derived(c, &mut derived),
+        ElementKind::DetailLine(l) => {
+            let length: f64 = l.curve.points().windows(2).map(|w| w[0].distance(w[1])).sum();
+            derived.insert("length".into(), json!(length));
+            derived.insert("style_name".into(), json!(l.style.code(&p.line_styles)));
+        }
+        ElementKind::DetailComponent(_) => super::detail_component::derived(p, &e, &mut derived),
+        ElementKind::FilledRegion(r) | ElementKind::MaskingRegion(r) => {
+            derived.insert("area".into(), json!(r.area()));
+            derived.insert("perimeter".into(), json!(r.perimeter()));
+            derived.insert("boundary_name".into(), json!(r.boundary.map(|b| b.code(&p.line_styles))));
+        }
         ElementKind::Component(c) => {
             if let Some(mep) = p.mep_data(&e) {
                 derived.insert("mep".into(), to_json(&mep));
@@ -244,35 +346,141 @@ pub(crate) fn element_json(s: &mut Session, id: ElementId) -> Option<Value> {
             if let Some(sys) = c.system.and_then(|id| p.system(id)) {
                 derived.insert("system_name".into(), json!(sys.name));
             }
+            if let Some(cc_core::TypeData::Component { def, .. }) = p.element_type(e.type_id).map(|t| &t.data)
+                && def.has_script()
+            {
+                let errors = super::component_script::script_errors(p, e.type_id, def, Some(e.id));
+                derived.insert("script_errors".into(), json!(errors));
+            }
         }
         _ => {}
     }
+    // A column's or beam's section: its profile and properties (mass with its material's density).
+    if matches!(e.kind, ElementKind::Column(_) | ElementKind::Beam(_))
+        && let Some(sec) = p.element_type(e.type_id).and_then(|t| super::profiles::section(p, &t.data))
+    {
+        let props = &sec.properties;
+        derived.insert(
+            "section".into(),
+            json!({
+                "profile": sec.profile,
+                "area": props.area,
+                "linear_mass": sec.has_density.then_some(props.linear_mass),
+                "ix": props.ix,
+                "iy": props.iy,
+                "wx": props.wx,
+                "wy": props.wy,
+            }),
+        );
+    }
+    // A column's faces, in the order `rebar_create` takes bars face by face.
+    if matches!(e.kind, ElementKind::Column(_))
+        && let Some(ty) = p.element_type(e.type_id)
+    {
+        let faces: Vec<Value> = cc_geom::rebar::column_faces(p, &ty.data, 0.0)
+            .iter()
+            .map(|f| json!({"curved": f.is_curved(), "length": f.length()}))
+            .collect();
+        if !faces.is_empty() {
+            derived.insert("faces".into(), json!(faces));
+        }
+    }
     let pinned = p.is_pinned(id);
     let (phase_created, phase_demolished) = super::phases::element_phases_json(p, &e);
+    let design_option = super::design_options::option_ref_json(p, e.design_option);
     let joined_with: Vec<u64> = p.joined_with(id).map(|j| j.0).collect();
     let group = p.group_of(id).map(|g| g.0);
     let level = json!({"id": e.level.0, "name": p.level_name(e.level)});
     let type_ = json!({"id": e.type_id.0, "name": p.type_name(e.type_id)});
-    let geom = s.geometry();
+    let roof_type = match &e.kind {
+        ElementKind::Roof(_) => s.project().element_type(e.type_id).map(|t| t.data.clone()),
+        _ => None,
+    };
+    let pad_ids: Vec<ElementId> = p.pads_of(id).map(|(e, _)| e.id).collect();
+    if let Some((cables, length)) = p.outlet_cable(&e) {
+        // A data outlet: its cables to the rack and the estimated length of each.
+        derived.insert("cables".into(), json!(cables));
+        derived.insert("cable_length".into(), json!(length));
+    }
+    super::piles::derived(p, &e, &mut derived);
+    // The pile caps a beam may be framed into.
+    let caps: std::collections::BTreeSet<ElementId> = match &e.kind {
+        ElementKind::Beam(_) => p.elements.values().filter(|x| p.pile_cap(x).is_some()).map(|x| x.id).collect(),
+        _ => Default::default(),
+    };
+    let geom = s.element_geometry(id);
     if geom.solids_of(id).next().is_some() {
         derived.insert("volume".into(), json!(geom.volume(id)));
+    }
+    // A niche: its recess as the wall cut it (none when it overlaps another opening).
+    if let ElementKind::Niche(h) = &e.kind
+        && let Some((wall, r)) = geom.walls.get(&h.host).and_then(|w| w.recess_of(id).map(|r| (w, r)))
+    {
+        derived.insert("width".into(), json!(r.u1 - r.u0));
+        derived.insert("height".into(), json!(r.z1 - r.z0));
+        derived.insert("depth".into(), json!(r.depth));
+        derived.insert("face".into(), json!(if r.side > 0.0 { "left" } else { "right" }));
+        derived.insert("volume".into(), json!(wall.recess_volume(r)));
+    }
+    // A foundation's plan area, exact for arc strips and slabs drawn with curves.
+    if let Some(f) = geom.foundations.get(&id) {
+        derived.entry("area").or_insert_with(|| json!(f.area()));
+    }
+    if let Some(g) = geom.topographies.get(&id) {
+        super::topography::derived(g, &mut derived);
+        // The earthworks of its pads.
+        let pads: Vec<&cc_geom::pad::PadGeom> = pad_ids.iter().filter_map(|p| geom.pads.get(p)).collect();
+        if let (false, Some(Value::Object(t))) = (pads.is_empty(), derived.get_mut("topography")) {
+            t.insert("cut".into(), json!(pads.iter().map(|g| g.cut).sum::<f64>()));
+            t.insert("fill".into(), json!(pads.iter().map(|g| g.fill).sum::<f64>()));
+        }
+    }
+    if let Some(g) = geom.pads.get(&id) {
+        super::pad::derived(g, &mut derived);
     }
     if let Some(beam) = geom.beams.get(&id) {
         // Where each end is framed: a column's face, other beams, or free.
         let framing = |end: cc_geom::BeamEnd| match end {
             cc_geom::BeamEnd::Free => json!("free"),
             cc_geom::BeamEnd::Beam => json!("beam"),
+            // A tie beam framed into a pile cap's face.
+            cc_geom::BeamEnd::Column(c) if caps.contains(&c) => json!({"pile_cap": c.0}),
             cc_geom::BeamEnd::Column(c) => json!({"column": c.0}),
         };
         derived.insert("cut_length".into(), json!(beam.cut_length()));
         derived.insert("start_join".into(), framing(beam.start));
         derived.insert("end_join".into(), framing(beam.end));
     }
+    if let Some(v) = geom.valves.get(&id) {
+        // Where the valve sits, its kind and its pipe's diameter.
+        derived.insert("point".into(), json!(v.point.to_array()));
+        derived.insert("kind".into(), json!(v.kind.name()));
+        derived.insert("diameter".into(), json!(v.diameter));
+    }
+    if let Some(c) = geom.connections.get(&id) {
+        super::connection::derived(c, &mut derived);
+    }
+    if let Some(t) = geom.segments.get(&id).and_then(|g| g.tray) {
+        derived.insert("width".into(), json!(t.width));
+        derived.insert("height".into(), json!(t.height));
+        derived.insert("style".into(), json!(t.style.name()));
+    }
     if let Some(set) = geom.rebar.get(&id) {
         derived.insert("count".into(), json!(set.count()));
         derived.insert("bar_length".into(), json!(set.bar_length()));
         derived.insert("total_length".into(), json!(set.total_length()));
         derived.insert("weight".into(), json!(set.weight()));
+        // The bars by length (to the millimeter), longest first: a slab's bars each have their own.
+        let mut lengths: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+        for bar in &set.bars {
+            *lengths.entry((bar.length() * 1000.0).round() as i64).or_default() += 1;
+        }
+        let bars: Vec<Value> =
+            lengths.iter().rev().map(|(mm, count)| json!({"length": *mm as f64 / 1000.0, "count": count})).collect();
+        derived.insert("bars".into(), json!(bars));
+        // The marks of its bars, in the order they first have them, and what a meter of bar weighs.
+        derived.insert("marks".into(), json!(bar_marks));
+        derived.insert("mass_per_meter".into(), json!(set.mass_per_meter()));
     }
     if let Some(lines) = geom.roof_ridges.get(&id) {
         // Ridges, hips and valleys in plan.
@@ -280,11 +488,22 @@ pub(crate) fn element_json(s: &mut Session, id: ElementId) -> Option<Value> {
     }
     if let ElementKind::Roof(r) = &e.kind {
         derived.insert("plan_area".into(), json!(cc_geom::roofs::plan_area(r)));
+        if let (Some(cc_core::TypeData::Roof { covering, framing, .. }), Some(g)) =
+            (&roof_type, geom.roof_framing.get(&id))
+        {
+            let (covering, framing, g) = (*covering, framing, g);
+            derived.insert("roofing".into(), super::roofing::roof_json(covering, framing.system, g));
+        }
     }
     if let Some(boundary) = geom.rooms.get(&id) {
         derived.insert("area".into(), json!(polygon::area(boundary)));
         derived.insert("perimeter".into(), json!(polygon::perimeter(boundary)));
         derived.insert("boundary".into(), json!(boundary.iter().map(|q| [q.x, q.y]).collect::<Vec<_>>()));
+    }
+    if let Some(g) = geom.masses.get(&id).cloned() {
+        derived.insert("volume".into(), json!(g.volume));
+        derived.insert("floor_area".into(), json!(g.floor_area()));
+        derived.insert("floors".into(), json!(super::mass::floors_json(s.project(), &g)));
     }
     Some(json!({
         "id": id.0,
@@ -296,6 +515,7 @@ pub(crate) fn element_json(s: &mut Session, id: ElementId) -> Option<Value> {
         "pinned": pinned,
         "phase_created": phase_created,
         "phase_demolished": phase_demolished,
+        "design_option": design_option,
         "joined_with": joined_with,
         "group": group,
         "params": params,
@@ -305,7 +525,8 @@ pub(crate) fn element_json(s: &mut Session, id: ElementId) -> Option<Value> {
 
 /// An element with all its parameters (`params`, editable with `element_set`) and derived values
 /// (length, height, thickness, volume, room area and perimeter; for beams the length after joins
-/// and what each end is framed into).
+/// and what each end is framed into; for columns and beams the `section`: profile name, area,
+/// mass per length with the material's density (null without one), `ix`, `iy`, `wx`, `wy`).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ElementGet {
@@ -326,24 +547,34 @@ pub(crate) fn view_json(s: &Session, id: ViewId) -> Option<Value> {
     let v = s.project().view(id)?;
     let (_, params) = variant(to_json(&v.kind));
     let (phase, phase_filter) = super::phases::view_phase_json(s.project(), v);
+    let (crop, callout) = super::callout::view_callout_json(s.project(), v);
     Some(json!({
         "id": v.id.0,
         "name": v.name,
         "category": snake(&format!("{:?}", v.category())),
         "scale": v.scale,
+        "scale_text": cc_core::scale::label(s.project().measurement_system(), v.scale),
+        "detail": v.detail.name(),
+        "visual_style": v.style().name(),
         "params": params,
         "template": v.template.map(|t| t.0),
         "phase": phase,
         "phase_filter": phase_filter,
+        "design_options": super::design_options::view_options_json(s.project(), v),
+        "crop": crop,
+        "callout": callout,
+        "sun": super::sun::view_sun_json(s.project(), v),
+        "render": serde_json::to_value(&v.render).unwrap_or(Value::Null),
     }))
 }
 
-/// Views (plans, ceiling plans, elevations, sections, 3D, legends, schedules, sheets),
+/// Views (plans, ceiling plans, elevations, sections, 3D, legends, drafting views, schedules, sheets),
 /// optionally of one category.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ViewsList {
-    /// `floor_plan`, `ceiling_plan`, `three_d`, `elevation`, `section`, `legend`, `schedule` or `sheet`.
+    /// `floor_plan`, `ceiling_plan`, `three_d`, `elevation`, `section`, `legend`, `drafting`, `schedule`,
+    /// `diagram` or `sheet`.
     #[serde(default)]
     pub category: Option<String>,
 }
@@ -362,7 +593,12 @@ impl Command for ViewsList {
     }
 }
 
-/// A view with all its parameters (`params`, editable with `view_set`).
+/// A view with all its parameters (`params`, editable with `view_set`), its
+/// `scale` denominator and `scale_text`, the scale as the project writes it
+/// (`1:50`, or `1/4" = 1'-0"` in imperial projects), and its `sun`: null,
+/// or the settings `view_set` takes plus `derived` (azimuth and altitude,
+/// `above_horizon`, the current frame's `date` and `time`, `sunrise` and
+/// `sunset`, the number of `frames` and `site_known`).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ViewGet {
@@ -417,10 +653,43 @@ impl Command for MaterialGet {
     const KIND: CommandKind = CommandKind::Query;
     fn run(self, s: &mut Session) -> Result<Value> {
         let name = refs::material(s.project(), &self.material)?;
-        s.project().material(&name).map(to_json).ok_or_else(|| EngineError::not_found("material"))
+        s.project()
+            .material(&name)
+            .map(super::materials::material_json)
+            .ok_or_else(|| EngineError::not_found("material"))
     }
 }
 
+/// A schedule table as JSON: translated headers, rows (with their element;
+/// group headings marked `heading`), totals and any table under it (`summary`, with its `caption`).
+fn table_json(table: &cc_views::Table, cell: &dyn Fn(&cc_views::Cell) -> String) -> Value {
+    let rows: Vec<Value> = table
+        .rows
+        .iter()
+        .map(|r| {
+            let mut row = json!({"element": r.element.0, "cells": r.cells.iter().map(cell).collect::<Vec<_>>()});
+            if r.heading {
+                row["heading"] = json!(true);
+            }
+            if r.footer {
+                row["footer"] = json!(true);
+            }
+            row
+        })
+        .collect();
+    let mut out = json!({
+        "headers": table.header_texts(&|key| crate::i18n::tr(key)),
+        "rows": rows,
+        "totals": table.totals,
+    });
+    if let Some(caption) = table.caption {
+        out["caption"] = json!(crate::i18n::tr(caption));
+    }
+    if let Some(summary) = &table.summary {
+        out["summary"] = table_json(summary, cell);
+    }
+    out
+}
 /// The table of a schedule view: headers, one row per element (with its id) and totals,
 /// formatted with the project units.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -440,11 +709,7 @@ impl Command for ScheduleTable {
             cc_views::Cell::Text(t) => t.clone(),
             cc_views::Cell::Key(k) => crate::i18n::tr(k),
         };
-        Ok(json!({
-            "headers": table.headers.iter().map(|h| crate::i18n::tr(h)).collect::<Vec<_>>(),
-            "rows": table.rows.iter().map(|r| json!({"element": r.element.0, "cells": r.cells.iter().map(cell).collect::<Vec<_>>()})).collect::<Vec<_>>(),
-            "totals": table.totals,
-        }))
+        Ok(table_json(&table, &cell))
     }
 }
 

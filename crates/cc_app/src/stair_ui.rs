@@ -7,7 +7,8 @@ use crate::t;
 use crate::table::{readonly_row, row};
 use crate::theme::PALETTE;
 use cc_core::{
-    StairBuild, StairConstruction, StairLayout, StairRules, StairShape, Stringers, TreadRule, Turn, stair::MAX_WINDERS,
+    LandingBeams, StairBuild, StairConstruction, StairLayout, StairRules, StairShape, Stringers, TreadRule, Turn,
+    stair::{MAX_RISERS, MAX_STEP_NUMBER, MAX_WINDERS},
 };
 use egui::{DragValue, Response, RichText, Ui};
 
@@ -62,7 +63,21 @@ fn length(ui: &mut Ui, value: &mut f64, max: f64) -> Response {
     ui.add(crate::properties::length_drag(value).speed(0.005).range(0.0..=max))
 }
 
-/// Shape, turn and the sizes the shape uses.
+/// A small size (a waist, a stringer, a gap): inches in imperial projects.
+fn size(ui: &mut Ui, value: &mut f64, max: f64) -> Response {
+    ui.add(crate::properties::size_drag(value).range(0.0..=max))
+}
+
+/// A riser count, 0 shown as automatic.
+fn count(ui: &mut Ui, value: &mut u32) -> Response {
+    ui.add(
+        DragValue::new(value)
+            .range(0..=MAX_RISERS)
+            .custom_formatter(|n, _| if n < 0.5 { t!("stair-auto") } else { format!("{n:.0}") }),
+    )
+}
+
+/// Shape, turn, riser count, tread and the sizes the shape uses.
 pub fn layout_controls(ui: &mut Ui, salt: u64, layout: &mut StairLayout, table: bool) -> Edited {
     let mut e = Edited::default();
     let shape = field(ui, table, &t!("prop-stair-shape"), |ui| {
@@ -75,14 +90,27 @@ pub fn layout_controls(ui: &mut Ui, salt: u64, layout: &mut StairLayout, table: 
         });
         e.choice(turn);
     }
+    let r = field(ui, table, &t!("col-risers"), |ui| count(ui, &mut layout.risers));
+    e.add(&r);
+    let r = field(ui, table, &t!("col-tread"), |ui| {
+        ui.add(
+            DragValue::new(&mut layout.tread)
+                .speed(0.005)
+                .range(0.0..=2.0)
+                .custom_formatter(|n, _| {
+                    use cc_views::format::{MetricSize, size};
+                    if n < 1e-9 { t!("stair-auto") } else { size(n, MetricSize::Length) }
+                })
+                .custom_parser(cc_views::format::parse_size),
+        )
+    });
+    e.add(&r);
     if layout.shape.has_split() {
-        let r = field(ui, table, &t!("prop-stair-split"), |ui| {
-            ui.add(
-                DragValue::new(&mut layout.split)
-                    .range(0..=200)
-                    .custom_formatter(|n, _| if n < 0.5 { t!("stair-auto") } else { format!("{n:.0}") }),
-            )
-        });
+        let r = field(ui, table, &t!("prop-stair-split"), |ui| count(ui, &mut layout.split));
+        e.add(&r);
+    }
+    if layout.shape == StairShape::ThreeFlight {
+        let r = field(ui, table, &t!("prop-stair-split2"), |ui| count(ui, &mut layout.split2));
         e.add(&r);
     }
     if matches!(layout.shape, StairShape::StraightLanding | StairShape::UShaped) {
@@ -90,7 +118,7 @@ pub fn layout_controls(ui: &mut Ui, salt: u64, layout: &mut StairLayout, table: 
         e.add(&r);
     }
     if layout.shape == StairShape::UShaped {
-        let r = field(ui, table, &t!("prop-stair-gap"), |ui| length(ui, &mut layout.gap, 10.0));
+        let r = field(ui, table, &t!("prop-stair-gap"), |ui| size(ui, &mut layout.gap, 10.0));
         e.add(&r);
     }
     if layout.shape == StairShape::LShaped {
@@ -112,6 +140,14 @@ pub fn layout_controls(ui: &mut Ui, salt: u64, layout: &mut StairLayout, table: 
         let r = field(ui, table, &t!("prop-stair-inner-radius"), |ui| length(ui, &mut layout.inner_radius, 10.0));
         e.add(&r);
     }
+    let r = field(ui, table, &t!("prop-stair-numbers"), |ui| crate::table::checkbox(ui, &mut layout.numbers));
+    e.choice(r.changed());
+    if layout.numbers {
+        let r = field(ui, table, &t!("prop-stair-number-start"), |ui| {
+            ui.add(DragValue::new(&mut layout.number_start).range(-MAX_STEP_NUMBER..=MAX_STEP_NUMBER))
+        });
+        e.add(&r);
+    }
     e
 }
 
@@ -126,7 +162,7 @@ pub fn build_rows(ui: &mut Ui, salt: u64, build: &mut StairBuild) -> Edited {
     match build.construction {
         StairConstruction::Solid => {}
         StairConstruction::CastInPlace => {
-            let r = row(ui, &t!("prop-stair-waist"), |ui| length(ui, &mut build.waist, 1.0));
+            let r = row(ui, &t!("prop-stair-waist"), |ui| size(ui, &mut build.waist, 1.0));
             e.add(&r);
         }
         StairConstruction::Assembled => {
@@ -134,17 +170,46 @@ pub fn build_rows(ui: &mut Ui, salt: u64, build: &mut StairBuild) -> Edited {
                 combo(ui, ("stair-stringers", salt), &mut build.stringers, &Stringers::ALL, Stringers::key)
             });
             e.choice(s);
+            if build.stringers == Stringers::Center {
+                let b = row(ui, &t!("prop-stair-landing-beams"), |ui| {
+                    let all = &LandingBeams::ALL;
+                    combo(ui, ("stair-landing-beams", salt), &mut build.landing_beams, all, LandingBeams::key)
+                });
+                e.choice(b);
+            }
             for (label, value) in [
                 (t!("prop-stair-stringer-width"), &mut build.stringer_width),
                 (t!("prop-stair-stringer-depth"), &mut build.stringer_depth),
                 (t!("prop-stair-tread-thickness"), &mut build.tread_thickness),
+                (t!("prop-stair-post-width"), &mut build.post_width),
             ] {
-                let r = row(ui, &label, |ui| length(ui, value, 1.0));
+                let r = row(ui, &label, |ui| size(ui, value, 1.0));
                 e.add(&r);
             }
-            let r = row(ui, &t!("prop-stair-closed-risers"), |ui| ui.checkbox(&mut build.closed_risers, ""));
+            let r = row(ui, &t!("prop-stair-closed-risers"), |ui| crate::table::checkbox(ui, &mut build.closed_risers));
             e.choice(r.changed());
         }
+    }
+    e
+}
+
+/// The posts under each landing of an assembled stair: a checkbox for each
+/// place round its edge its beams reach.
+pub fn posts_rows(ui: &mut Ui, layout: &mut StairLayout, g: &cc_geom::StairGeom, build: &StairBuild) -> Edited {
+    let mut e = Edited::default();
+    for (i, (landing, posts)) in g.landings.iter().zip(layout.posts.iter_mut()).enumerate() {
+        let label = t!("prop-stair-landing-posts", "n" => (i + 1).to_string());
+        row(ui, &label, |ui| {
+            ui.vertical(|ui| {
+                for (at, _) in landing.post_spots(build.stringers, build.landing_beams) {
+                    let mut on = posts.get(at);
+                    if crate::table::labeled_checkbox(ui, &mut on, tr(at.key())).changed() {
+                        posts.set(at, on);
+                        e.choice(true);
+                    }
+                }
+            });
+        });
     }
     e
 }
@@ -162,12 +227,14 @@ pub fn rules_rows(ui: &mut Ui, salt: u64, rules: &mut StairRules, max_riser: f64
         (t!("prop-stair-blondel-min"), &mut rules.blondel_min),
         (t!("prop-stair-blondel-max"), &mut rules.blondel_max),
     ] {
-        let r = row(ui, &label, |ui| length(ui, value, 2.0));
+        // Inches in imperial projects.
+        let r = row(ui, &label, |ui| ui.add(crate::properties::size_drag(value).range(0.0..=2.0)));
         e.add(&r);
     }
     // Blondel's step at the highest riser, as a hint of what the type gives.
     let g = rules.tread_for(max_riser, tread);
-    readonly_row(ui, &t!("prop-stair-blondel"), cc_views::format::length(2.0 * max_riser + g));
+    let step = cc_views::format::size(2.0 * max_riser + g, cc_views::format::MetricSize::Length);
+    readonly_row(ui, &t!("prop-stair-blondel"), step);
     e
 }
 
@@ -175,10 +242,12 @@ pub fn rules_rows(ui: &mut Ui, salt: u64, rules: &mut StairRules, max_riser: f64
 pub fn check_rows(ui: &mut Ui, g: &cc_geom::StairGeom) {
     use cc_views::format;
     readonly_row(ui, &t!("col-risers"), g.risers.to_string());
-    readonly_row(ui, &t!("col-riser-height"), format::length(g.riser));
-    readonly_row(ui, &t!("col-tread"), format::length(g.tread));
+    // Riser, tread and step in inches in imperial projects.
+    let size = |v: f64| format::size(v, format::MetricSize::Length);
+    readonly_row(ui, &t!("col-riser-height"), size(g.riser));
+    readonly_row(ui, &t!("col-tread"), size(g.tread));
     readonly_row(ui, &t!("col-run"), format::length(g.run()));
-    readonly_row(ui, &t!("prop-stair-blondel"), format::length(g.check.blondel));
+    readonly_row(ui, &t!("prop-stair-blondel"), size(g.check.blondel));
     if g.check.ok() {
         ui.label(RichText::new(t!("stair-check-ok")).color(PALETTE.success));
     }
@@ -208,11 +277,16 @@ pub fn create_command(
         type_ref: Some(Ref::Id(type_id.0)),
         shape,
         turn: Some(turn.into()),
+        risers: (layout.risers > 0).then_some(layout.risers),
+        tread: (layout.tread > 1e-3).then_some(layout.tread),
         split: Some(layout.split),
+        split2: Some(layout.split2),
         landing: (layout.landing > 1e-3).then_some(layout.landing),
         gap: Some(layout.gap),
         winders: Some(layout.winders),
         inner_radius: Some(layout.inner_radius),
+        numbers: Some(layout.numbers),
+        number_start: Some(layout.number_start),
         ..Default::default()
     }
 }
@@ -226,15 +300,17 @@ pub fn tool_options(ui: &mut Ui, state: &mut AppState) {
     ui.label(crate::theme::muted(t!("hint-stair")));
 }
 
-/// A slope as a percentage drag (stored as rise over run); `zero` names 0.
+/// A slope drag (stored as rise over run) in the project's slope unit;
+/// `zero` names 0.
 fn percent(ui: &mut Ui, value: &mut f64, zero: Option<String>) -> Response {
-    let mut pct = *value * 100.0;
-    let r = ui.add(DragValue::new(&mut pct).speed(0.05).range(0.0..=100.0).custom_formatter(move |n, _| match &zero {
+    let mut v = *value;
+    let (units, comma) = cc_views::format::current();
+    let r = ui.add(crate::properties::slope_drag(&mut v).range(0.0..=1.0).custom_formatter(move |n, _| match &zero {
         Some(z) if n < 1e-6 => z.clone(),
-        _ => format!("{n:.2} %"),
+        _ => cc_views::format::slope_with(&units, comma, n),
     }));
     if r.changed() {
-        *value = pct / 100.0;
+        *value = v;
     }
     r
 }

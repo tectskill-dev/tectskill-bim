@@ -21,6 +21,14 @@ pub fn sample_project(name: &str) -> Option<Project> {
     cc_core::from_ron(text).ok()
 }
 
+/// The name of a bundled sample, read from its file once (the home screen asks every frame).
+fn sample_name(name: &str) -> Option<&'static str> {
+    static NAMES: std::sync::OnceLock<Vec<Option<String>>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| SAMPLES.iter().map(|(id, _)| sample_project(id).map(|p| p.info.name)).collect());
+    let index = SAMPLES.iter().position(|(id, _)| *id == name)?;
+    names.get(index)?.as_deref()
+}
+
 pub fn show(ui: &mut Ui, state: &mut AppState) {
     egui::Panel::left("home-sidebar")
         .frame(egui::Frame::new().fill(PALETTE.surface).inner_margin(egui::Margin::symmetric(24, 24)))
@@ -47,12 +55,20 @@ fn sidebar(ui: &mut Ui, state: &mut AppState) {
         actions::guarded(state, PendingAction::Open);
     }
     if side_button(ui, Icon::New, &t!("action-new")).clicked() {
-        actions::guarded(state, PendingAction::New);
+        crate::new_project_dialog::open(state);
     }
     ui.add_space(16.0);
     ui.separator();
     ui.add_space(8.0);
     nav_item(ui, Icon::Open, &t!("home-recent"), true);
+    // App settings at the bottom of the sidebar.
+    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+        let command = crate::commands::UiCommand::Preferences;
+        let label = command.label(state);
+        if side_button(ui, Icon::Settings, &label).on_hover_text(command.shortcut().unwrap_or_default()).clicked() {
+            crate::preferences::open(state, crate::preferences::Section::General);
+        }
+    });
 }
 
 fn round_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
@@ -68,7 +84,7 @@ fn side_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     let painter = ui.painter();
-    let fill = if response.hovered() { PALETTE.hover } else { Color32::WHITE };
+    let fill = if response.hovered() { PALETTE.hover } else { PALETTE.canvas };
     painter.rect_filled(rect, theme::RADIUS as f32, fill);
     let border = if response.hovered() { PALETTE.border_strong } else { PALETTE.border };
     painter.rect_stroke(rect, theme::RADIUS as f32, Stroke::new(1.0, border), StrokeKind::Inside);
@@ -141,12 +157,12 @@ fn content(ui: &mut Ui, state: &mut AppState) {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(18.0, 18.0);
             for (id, _) in SAMPLES {
-                let Some(project) = sample_project(id) else { continue };
+                let Some(name) = sample_name(id) else { continue };
                 let file = thumbnails::sample_file(id);
                 if file.as_ref().is_some_and(|f| !f.exists()) && state.requested_samples.insert(id) {
                     state.thumbnail_jobs.push(Job::Sample(id));
                 }
-                if card(ui, &project.info.name, file.as_deref(), true).clicked() {
+                if card(ui, name, file.as_deref(), true).clicked() {
                     actions::guarded(state, PendingAction::OpenSample(id));
                 }
             }
@@ -207,12 +223,12 @@ fn load_thumbnail(ctx: &egui::Context, file: &Path) -> Option<egui::TextureHandl
     Some(texture)
 }
 
-/// Remember `path` at the top of the recent projects list.
-pub fn push_recent(recent: &mut Vec<PathBuf>, path: &Path) {
+/// Remember `path` at the top of the recent projects list, which keeps at most `max` (at least one).
+pub fn push_recent(recent: &mut Vec<PathBuf>, path: &Path, max: usize) {
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     recent.retain(|p| *p != path);
     recent.insert(0, path);
-    recent.truncate(12);
+    recent.truncate(max.max(1));
 }
 
 #[cfg(test)]
@@ -223,6 +239,7 @@ mod tests {
     fn samples_load() {
         for (id, _) in SAMPLES {
             assert!(sample_project(id).is_some(), "{id}");
+            assert_eq!(sample_name(id), sample_project(id).map(|p| p.info.name).as_deref(), "{id}");
         }
     }
 
@@ -230,11 +247,16 @@ mod tests {
     fn recent_list_is_deduplicated_and_capped() {
         let mut recent = Vec::new();
         for i in 0..15 {
-            push_recent(&mut recent, Path::new(&format!("p{i}.ccad")));
+            push_recent(&mut recent, Path::new(&format!("p{i}.ccad")), 12);
         }
-        push_recent(&mut recent, Path::new("p10.ccad"));
+        push_recent(&mut recent, Path::new("p10.ccad"), 12);
         assert_eq!(recent.len(), 12);
         assert!(recent[0].ends_with("p10.ccad"));
         assert_eq!(recent.iter().filter(|p| p.ends_with("p10.ccad")).count(), 1);
+        // A smaller count (the preference) trims the list.
+        push_recent(&mut recent, Path::new("p3.ccad"), 5);
+        assert_eq!(recent.len(), 5);
+        push_recent(&mut recent, Path::new("p4.ccad"), 0);
+        assert_eq!(recent.len(), 1, "always keeps the latest");
     }
 }

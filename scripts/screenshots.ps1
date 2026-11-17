@@ -85,12 +85,12 @@ $names = @{
 # A view is named by its id in the showcase script, so the list works in every language.
 $shotList = [ordered]@{
     'hero'       = @(65, 69)
-    'roof-3d'    = @(341)
-    'plumbing'   = @(331)
-    'electrical' = @(332, 333)
-    'structure'  = @(334, 335)
-    'graphics'   = @(338, 339)
-    'section'    = @(337)
+    'roof-3d'    = @(343)
+    'plumbing'   = @(333)
+    'electrical' = @(334, 335)
+    'structure'  = @(336, 337)
+    'graphics'   = @(340, 341)
+    'section'    = @(339)
     'sheet'      = @(79)
     'schedule'   = @(78)
 }
@@ -141,7 +141,7 @@ function Capture([string]$project, [string]$lang, [string[]]$views, [string]$fil
     try {
         $deadline = (Get-Date).AddSeconds(30)
         # The title names the project once it is open.
-        while ($p.MainWindowHandle -eq 0 -or $p.MainWindowTitle -notlike 'ConstructCAD *') {
+        while ($p.MainWindowHandle -eq 0 -or $p.MainWindowTitle -notlike 'ConstructCraft *') {
             if ((Get-Date) -gt $deadline) { throw 'the app window did not appear' }
             Start-Sleep -Milliseconds 250
             $p.Refresh()

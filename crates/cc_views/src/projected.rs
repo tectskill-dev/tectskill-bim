@@ -6,7 +6,7 @@
 //! overlap; sorting by centroid depth alone fails for large faces such as roofs.
 
 use crate::{Drawing2D, LineStyle, cut::POCHE, format};
-use cc_core::{CameraState, Direction, ElementId, Project};
+use cc_core::{CameraState, DetailLevel, Direction, ElementId, Project, TypeData, VisualStyle};
 use cc_geom::polygon::signed_area;
 use cc_geom::{ModelGeometry, clip_polygon, face_plane_segments};
 use glam::{DVec2, DVec3};
@@ -70,12 +70,100 @@ fn clip_segment(a: DVec3, b: DVec3, point: DVec3, normal: DVec3) -> Option<(DVec
     }
 }
 
-fn shade(color: [u8; 3], normal: DVec3, frame: &Frame) -> [u8; 4] {
-    let light = (frame.forward * 0.6 + frame.right * 0.3 - frame.up * 0.5).normalize();
-    let k = 0.62 + 0.38 * (-normal.dot(light)).max(0.0);
+/// A face's fill shaded by a light: the default light fixed to the view
+/// (from behind the viewer, above and to the left) when `sun` is `None`,
+/// else the sun's direction (towards it; the zero vector, a sun below the
+/// horizon, leaves the ambient light only).
+fn shade(color: [u8; 3], normal: DVec3, frame: &Frame, sun: Option<DVec3>) -> [u8; 4] {
+    let k = match sun {
+        None => {
+            let light = (frame.forward * 0.6 + frame.right * 0.3 - frame.up * 0.5).normalize();
+            0.62 + 0.38 * (-normal.dot(light)).max(0.0)
+        }
+        Some(towards) => 0.62 + 0.38 * normal.dot(towards).max(0.0),
+    };
     // Wash colors towards white so linework stays legible.
     let c = |v: u8| ((v as f64 * 0.55 + 255.0 * 0.45) * k).min(255.0) as u8;
     [c(color[0]), c(color[1]), c(color[2]), 255]
+}
+
+/// How a view draws the model: its detail level, its visual style, the
+/// spacing of patterns (cut and surface hatches) in drawing units and the
+/// light that shades its faces.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Look {
+    pub detail: DetailLevel,
+    pub style: VisualStyle,
+    pub spacing: f64,
+    /// The sun lighting the faces (shaded and textures styles): the unit
+    /// vector towards it in project coordinates, or the zero vector when it
+    /// is below the horizon (ambient light only). `None`: the default light,
+    /// fixed to the view.
+    pub light: Option<DVec3>,
+}
+
+impl Look {
+    /// The look of `view` in `project`: lit by the view's sun when it has
+    /// one ([`cc_core::View::sun`]).
+    pub fn of(project: &Project, view: &cc_core::View) -> Self {
+        let light = project
+            .sun_state(view)
+            .filter(|_| view.kind.takes_sun())
+            .map(|s| if s.above_horizon && s.direction.is_finite() { s.direction } else { DVec3::ZERO });
+        Self { detail: view.detail, style: view.style(), spacing: crate::cut::spacing(view.scale), light }
+    }
+
+    /// Shaded, at the medium detail level, patterns as at 1:100, the default light.
+    pub fn plain() -> Self {
+        Self { detail: DetailLevel::Medium, style: VisualStyle::Shaded, spacing: crate::cut::spacing(100), light: None }
+    }
+}
+
+/// The fill of a face of `solid` in `style` (none for the wireframe).
+fn face_color(solid: &cc_geom::Solid, face: usize, normal: DVec3, frame: &Frame, look: Look) -> Option<[u8; 4]> {
+    // A painted face shows its paint.
+    let paint = solid.paint_of(face);
+    let color = paint.map_or(solid.color, |p| p.color);
+    let appearance = paint.map_or(solid.appearance, |p| p.appearance);
+    let transparency = paint.map_or(solid.transparency, |p| p.transparency);
+    let mut c = match look.style {
+        VisualStyle::Wireframe => return None,
+        VisualStyle::HiddenLine => [255, 255, 255, 255],
+        VisualStyle::Shaded => shade(color, normal, frame, look.light),
+        VisualStyle::ConsistentColors => [color[0], color[1], color[2], 255],
+        VisualStyle::Textures => shade(appearance, normal, frame, look.light),
+    };
+    // Transparent materials let what is behind show through (never fully: alpha 0 means "no hit").
+    c[3] = ((1.0 - transparency.clamp(0.0, 1.0)) * 255.0).round().clamp(40.0, 255.0) as u8;
+    Some(c)
+}
+
+/// The surface pattern of face `face` of `solid` (its paint's, when painted)
+/// over its outline `pts` (the textures style), each line with the pattern's color.
+fn surface_lines(
+    d: &mut Drawing2D,
+    patterns: &cc_core::fill_pattern::FillPatterns,
+    solid: &cc_geom::Solid,
+    face: usize,
+    pts: &[DVec2],
+    spacing: f64,
+) {
+    let fill = solid.paint_of(face).map_or(solid.surface, |p| p.surface);
+    for (pattern, color) in [(fill.background, fill.background_color), (fill.foreground, fill.foreground_color)] {
+        if matches!(pattern, cc_core::Pattern::Solid | cc_core::Pattern::None) {
+            continue;
+        }
+        let pen = crate::Pen { color: Some(color), ..Default::default() };
+        for (a, b) in crate::hatch::hatch_in(patterns, pattern, pts, spacing) {
+            d.prims.push(crate::Prim::Line {
+                a,
+                b,
+                style: LineStyle::Thin,
+                element: Some(solid.element),
+                pen: Some(pen),
+            });
+        }
+    }
 }
 
 struct ProjectedFace {
@@ -85,9 +173,22 @@ struct ProjectedFace {
     normal: DVec3,
     point: DVec3,
     pts: Vec<DVec2>,
-    color: [u8; 4],
+    color: Option<[u8; 4]>,
     element: ElementId,
+    /// Index of its solid in the geometry and of the face in it (its surface pattern).
+    solid: usize,
+    face: usize,
     edges: Vec<(DVec2, DVec2)>,
+    /// Symbol lines drawn on the face (a window's opening), in their styles.
+    marks: Vec<(DVec2, DVec2, LineStyle)>,
+}
+
+fn symbol_style(line: cc_core::SymbolLine) -> LineStyle {
+    match line {
+        cc_core::SymbolLine::Opening => LineStyle::Hidden,
+        cc_core::SymbolLine::Axis => LineStyle::Center,
+        cc_core::SymbolLine::Plain => LineStyle::Thin,
+    }
 }
 
 /// How section cuts are filled: the project's materials at a hatch spacing.
@@ -97,15 +198,27 @@ pub struct CutStyle<'a> {
     pub spacing: f64,
 }
 
-/// Render all solids through `frame`; section cuts use `cut` (else the neutral poche).
-pub fn render(geom: &ModelGeometry, frame: &Frame, cut: Option<CutStyle>) -> Drawing2D {
+/// Render the solids a view shows through `frame`, at its detail level and
+/// in its visual style; section cuts use `cut` (else, and at the coarse
+/// level, the neutral poche; in the wireframe, only their outline).
+pub fn render(
+    geom: &ModelGeometry,
+    frame: &Frame,
+    cut: Option<CutStyle>,
+    look: Look,
+    patterns: &cc_core::fill_pattern::FillPatterns,
+) -> Drawing2D {
+    let (detail, style) = (look.detail, look.style);
     let planes = frame.planes();
     let mut faces = Vec::new();
-    for solid in &geom.solids {
+    let shown = |s: &&cc_geom::Solid| s.detail.shows(detail);
+    let cut = cut.filter(|_| detail.shows_layers());
+    for (index, solid) in geom.solids.iter().enumerate().filter(|(_, s)| shown(s)) {
         let edges = solid.feature_edges();
         let seams = solid.smooth_edges();
-        for ((face, mut face_edges), seams) in solid.faces.iter().zip(edges).zip(seams) {
-            if face.normal.dot(frame.forward) > -1e-6 {
+        for (face_index, ((face, mut face_edges), seams)) in solid.faces.iter().zip(edges).zip(seams).enumerate() {
+            // The wireframe sees through: faces turned away show their edges too.
+            if face.normal.dot(frame.forward) > -1e-6 && style.fills() {
                 continue;
             }
             // Where a curved surface turns away, the edge to the hidden facet is its silhouette.
@@ -128,32 +241,87 @@ pub fn render(geom: &ModelGeometry, frame: &Frame, cut: Option<CutStyle>) -> Dra
                 normal: face.normal,
                 point: verts[0],
                 pts: verts.iter().map(|v| frame.project(*v)).collect(),
-                color: {
-                    // Transparent materials let what is behind show through (never fully: alpha 0 means "no hit").
-                    let mut c = shade(solid.color, face.normal, frame);
-                    c[3] = ((1.0 - solid.transparency.clamp(0.0, 1.0)) * 255.0).round().clamp(40.0, 255.0) as u8;
-                    c
-                },
+                color: face_color(solid, face_index, face.normal, frame, look),
                 element: solid.element,
+                solid: index,
+                face: face_index,
                 edges,
+                marks: Vec::new(),
             });
         }
     }
-    let order = paint_order(frame, &faces);
-    let mut slots: Vec<Option<ProjectedFace>> = faces.into_iter().map(Some).collect();
-
+    // Windows' opening symbols: unfilled faces just off their walls, so
+    // whatever stands in front hides them like any face.
+    for symbol in &geom.opening_symbols {
+        if symbol.normal.dot(frame.forward) > -1e-6 && style.fills() {
+            continue;
+        }
+        let mut verts = symbol.outline.to_vec();
+        for &(p, n) in &planes {
+            verts = clip_polygon(&verts, p, n);
+        }
+        if verts.len() < 3 {
+            continue;
+        }
+        let marks = symbol
+            .lines
+            .iter()
+            .filter_map(|&(a, b, line)| {
+                let (a, b) = planes.iter().try_fold((a, b), |(a, b), &(p, n)| clip_segment(a, b, p, n))?;
+                Some((frame.project(a), frame.project(b), symbol_style(line)))
+            })
+            .collect();
+        faces.push(ProjectedFace {
+            depth: verts.iter().map(|v| frame.depth(*v)).sum::<f64>() / verts.len() as f64,
+            normal: symbol.normal,
+            point: verts[0],
+            pts: verts.iter().map(|v| frame.project(*v)).collect(),
+            color: None,
+            element: symbol.element,
+            solid: usize::MAX,
+            face: 0,
+            edges: Vec::new(),
+            marks,
+        });
+    }
     let mut d = Drawing2D::default();
-    for f in order.into_iter().filter_map(|i| slots[i].take()) {
-        d.fill(f.pts, f.color, Some(f.element));
-        for (a, b) in f.edges {
-            d.line(a, b, LineStyle::Projection, Some(f.element));
+    if style.fills() {
+        let order = paint_order(frame, &faces);
+        let mut slots: Vec<Option<ProjectedFace>> = faces.into_iter().map(Some).collect();
+        for f in order.into_iter().filter_map(|i| slots[i].take()) {
+            if let Some(color) = f.color {
+                if style == VisualStyle::Textures
+                    && let Some(solid) = geom.solids.get(f.solid)
+                {
+                    d.fill(f.pts.clone(), color, Some(f.element));
+                    surface_lines(&mut d, patterns, solid, f.face, &f.pts, look.spacing);
+                } else {
+                    d.fill(f.pts, color, Some(f.element));
+                }
+            }
+            for (a, b) in f.edges {
+                d.line(a, b, LineStyle::Projection, Some(f.element));
+            }
+            for (a, b, style) in f.marks {
+                d.line(a, b, style, Some(f.element));
+            }
+        }
+    } else {
+        // Every edge, in no particular order: nothing hides anything.
+        for f in faces {
+            for (a, b) in f.edges {
+                d.line(a, b, LineStyle::Projection, Some(f.element));
+            }
+            for (a, b, style) in f.marks {
+                d.line(a, b, style, Some(f.element));
+            }
         }
     }
 
     // Section cut: poche where loops close, heavy outline always.
     if let Some(near) = frame.near {
         let point = frame.origin + frame.forward * near;
-        for solid in &geom.solids {
+        for solid in geom.solids.iter().filter(shown) {
             let segs: Vec<(DVec2, DVec2)> = solid
                 .faces
                 .iter()
@@ -161,11 +329,14 @@ pub fn render(geom: &ModelGeometry, frame: &Frame, cut: Option<CutStyle>) -> Dra
                 .filter_map(|(a, b)| planes.iter().skip(1).try_fold((a, b), |(a, b), &(p, n)| clip_segment(a, b, p, n)))
                 .map(|(a, b)| (frame.project(a), frame.project(b)))
                 .collect();
-            for pts in chain_loops(&segs) {
+            for pts in chain_loops(&segs).into_iter().filter(|_| style.fills()) {
                 match cut {
                     Some(c) => {
                         let ty = c.project.element(solid.element).and_then(|e| c.project.element_type(e.type_id));
-                        let material = ty.map_or("", |t| t.data.cut_material());
+                        let material = ty.map_or("", |t| match &t.data {
+                            TypeData::Roof { framing, .. } if solid.secondary => framing.material.as_str(),
+                            data => data.cut_material(),
+                        });
                         crate::cut::cut_fill(&mut d, c.project, material, pts, c.spacing, Some(solid.element));
                     }
                     None => d.cut_fill(pts, POCHE, Some(solid.element)),
@@ -251,40 +422,100 @@ fn paint_order(frame: &Frame, faces: &[ProjectedFace]) -> Vec<usize> {
     // `before[i]` lists the faces that must be painted after face `i`.
     let mut before: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut pending = vec![0usize; n];
-    for i in 0..n {
-        for j in i + 1..n {
-            let (a, b) = (boxes[i], boxes[j]);
-            if a.0.x >= b.1.x || b.0.x >= a.1.x || a.0.y >= b.1.y || b.0.y >= a.1.y {
-                continue;
+    let mut compare = |i: usize, j: usize| {
+        let (a, b) = (boxes[i], boxes[j]);
+        if a.0.x >= b.1.x || b.0.x >= a.1.x || a.0.y >= b.1.y || b.0.y >= a.1.y {
+            return;
+        }
+        let Some(s) = overlap_point(&tris[i], &tris[j]) else { return };
+        let (di, dj) = (depth_at(frame, &faces[i], s), depth_at(frame, &faces[j], s));
+        if (di - dj).abs() < DEPTH_TOL {
+            return;
+        }
+        let (back, front) = if di > dj { (i, j) } else { (j, i) };
+        before[back].push(front);
+        pending[front] += 1;
+    };
+    // Each pair whose boxes may overlap is compared once, the lower index
+    // first: a sweep along X over the boxes sorted by their left side meets
+    // only faces whose X ranges overlap. Boxes that are not finite are
+    // compared with every face, as their tests may not fail.
+    let finite = |k: usize| boxes[k].0.is_finite() && boxes[k].1.is_finite();
+    let (mut sweep, odd): (Vec<usize>, Vec<usize>) = (0..n).partition(|&k| finite(k));
+    sweep.sort_by(|&a, &b| boxes[a].0.x.total_cmp(&boxes[b].0.x).then(a.cmp(&b)));
+    for (p, &i) in sweep.iter().enumerate() {
+        for &j in &sweep[p + 1..] {
+            // This box and every later one start where this one ends or after.
+            if boxes[j].0.x >= boxes[i].1.x {
+                break;
             }
-            let Some(s) = overlap_point(&tris[i], &tris[j]) else { continue };
-            let (di, dj) = (depth_at(frame, &faces[i], s), depth_at(frame, &faces[j], s));
-            if (di - dj).abs() < DEPTH_TOL {
-                continue;
-            }
-            let (back, front) = if di > dj { (i, j) } else { (j, i) };
-            before[back].push(front);
-            pending[front] += 1;
+            compare(i.min(j), i.max(j));
         }
     }
-    // Kahn's algorithm, taking the farthest ready face first; on a cycle the
-    // farthest remaining face is forced.
+    for &i in &odd {
+        for j in (0..n).filter(|&j| j != i && (finite(j) || j > i)) {
+            compare(i.min(j), i.max(j));
+        }
+    }
+    // Kahn's algorithm, taking the farthest ready face first (the last of
+    // equally far ones). On a cycle the face waiting on the fewest others is
+    // forced (the farthest among them): forcing the farthest instead lets a
+    // large face, such as a roof with many members under it, be painted
+    // before most of what it hides.
+    let mut ready: std::collections::BinaryHeap<(Depth, usize)> =
+        (0..n).filter(|&k| pending[k] == 0).map(|k| (Depth(faces[k].depth), k)).collect();
     let mut done = vec![false; n];
     let mut order = Vec::with_capacity(n);
     for _ in 0..n {
-        let farthest = |ready_only: bool| {
+        let mut next = None;
+        while let Some((_, k)) = ready.pop() {
+            if !done[k] {
+                next = Some(k);
+                break;
+            }
+        }
+        let forced = || {
             (0..n)
-                .filter(|&k| !done[k] && (!ready_only || pending[k] == 0))
-                .max_by(|&x, &y| faces[x].depth.total_cmp(&faces[y].depth))
+                .filter(|&k| !done[k])
+                .min_by(|&x, &y| pending[x].cmp(&pending[y]).then(faces[y].depth.total_cmp(&faces[x].depth)))
         };
-        let Some(k) = farthest(true).or_else(|| farthest(false)) else { break };
+        let Some(k) = next.or_else(forced) else { break };
         done[k] = true;
         order.push(k);
         for &f in &before[k] {
-            pending[f] = pending[f].saturating_sub(1);
+            if pending[f] > 0 {
+                pending[f] -= 1;
+                if pending[f] == 0 && !done[f] {
+                    ready.push((Depth(faces[f].depth), f));
+                }
+            }
         }
     }
     order
+}
+
+/// A depth ordered by [`f64::total_cmp`], for the queue of faces ready to paint.
+#[derive(Debug, Clone, Copy)]
+struct Depth(f64);
+
+impl PartialEq for Depth {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0).is_eq()
+    }
+}
+
+impl Eq for Depth {}
+
+impl PartialOrd for Depth {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Depth {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
 }
 
 /// Join segments end-to-end into closed loops.
@@ -346,36 +577,101 @@ fn level_lines(d: &mut Drawing2D, project: &Project, frame: &Frame) {
     }
 }
 
-pub fn elevation(project: &Project, geom: &ModelGeometry, direction: Direction) -> Drawing2D {
-    let look = direction.look();
-    let frame = Frame::looking(DVec3::ZERO, DVec3::new(look.x, look.y, 0.0));
-    let mut d = render(geom, &frame, None);
-    level_lines(&mut d, project, &frame);
-    d
+/// The frame of an elevation looking `direction`.
+fn elevation_frame(direction: Direction) -> Frame {
+    let toward = direction.look();
+    Frame::looking(DVec3::ZERO, DVec3::new(toward.x, toward.y, 0.0))
 }
 
-pub fn section(project: &Project, geom: &ModelGeometry, start: DVec2, end: DVec2, depth: f64, scale: u32) -> Drawing2D {
+/// The frame of a section along `start`..`end` (looking to the right of
+/// it), clipped to `depth` and to the line's ends.
+fn section_frame(start: DVec2, end: DVec2, depth: f64) -> Frame {
     let dir = (end - start).normalize_or_zero();
-    let look = -dir.perp();
-    let mut frame = Frame::looking(DVec3::new(start.x, start.y, 0.0), DVec3::new(look.x, look.y, 0.0));
+    let toward = -dir.perp();
+    let mut frame = Frame::looking(DVec3::new(start.x, start.y, 0.0), DVec3::new(toward.x, toward.y, 0.0));
     let xe = frame.project(DVec3::new(end.x, end.y, 0.0)).x;
     frame.near = Some(0.0);
     frame.far = Some(depth.max(0.01));
     frame.crop_x = Some((xe.min(0.0), xe.max(0.0)));
-    let cut = CutStyle { project, spacing: crate::cut::spacing(scale) };
-    let mut d = render(geom, &frame, Some(cut));
+    frame
+}
+
+/// The frame of a 3D view's 2D form, looking along its camera.
+fn camera_frame(camera: &CameraState) -> Frame {
+    Frame::looking(DVec3::ZERO, camera.forward())
+}
+
+/// The frame through which a projected view (elevation, section, the 2D
+/// form of a 3D view) maps the model onto its drawing, as its generator
+/// builds it; `None` for other views (plans draw plan coordinates as they are).
+pub fn view_frame(view: &cc_core::View) -> Option<Frame> {
+    match &view.kind {
+        cc_core::ViewKind::Elevation { direction } => Some(elevation_frame(*direction)),
+        cc_core::ViewKind::Section { start, end, depth, .. } => Some(section_frame(*start, *end, *depth)),
+        cc_core::ViewKind::ThreeD { camera, .. } => Some(camera_frame(camera)),
+        _ => None,
+    }
+}
+
+pub fn elevation(project: &Project, geom: &ModelGeometry, direction: Direction, look: Look) -> Drawing2D {
+    let frame = elevation_frame(direction);
+    let mut d = render(geom, &frame, None, look, &project.fill_patterns);
     level_lines(&mut d, project, &frame);
     d
 }
 
-pub fn axonometric(_project: &Project, geom: &ModelGeometry, camera: &CameraState) -> Drawing2D {
-    render(geom, &Frame::looking(DVec3::ZERO, camera.forward()), None)
+pub fn section(
+    project: &Project,
+    geom: &ModelGeometry,
+    (start, end): (DVec2, DVec2),
+    depth: f64,
+    scale: u32,
+    look: Look,
+) -> Drawing2D {
+    let frame = section_frame(start, end, depth);
+    let cut = CutStyle { project, spacing: crate::cut::spacing(scale) };
+    let mut d = render(geom, &frame, Some(cut), look, &project.fill_patterns);
+    existing_ground(&mut d, geom, &frame);
+    level_lines(&mut d, project, &frame);
+    d
+}
+
+/// Where the section plane crosses the existing ground that pads changed, dashed.
+fn existing_ground(d: &mut Drawing2D, geom: &ModelGeometry, frame: &Frame) {
+    let Some(near) = frame.near else { return };
+    let point = frame.origin + frame.forward * near;
+    let planes = frame.planes();
+    for (id, g) in &geom.topographies {
+        for t in &g.existing {
+            let side = t.map(|p| (p - point).dot(frame.forward));
+            let mut hits = Vec::with_capacity(2);
+            for i in 0..3 {
+                let (a, b, da, db) = (t[i], t[(i + 1) % 3], side[i], side[(i + 1) % 3]);
+                if (da >= 0.0) != (db >= 0.0) {
+                    hits.push(a.lerp(b, da / (da - db)));
+                }
+            }
+            let [a, b] = hits[..] else { continue };
+            let Some((a, b)) = planes.iter().skip(1).try_fold((a, b), |(a, b), &(p, n)| clip_segment(a, b, p, n))
+            else {
+                continue;
+            };
+            let (a, b) = (frame.project(a), frame.project(b));
+            if a.distance(b) > 1e-9 {
+                d.line(a, b, LineStyle::Hidden, Some(*id));
+            }
+        }
+    }
+}
+
+pub fn axonometric(project: &Project, geom: &ModelGeometry, camera: &CameraState, look: Look) -> Drawing2D {
+    render(geom, &camera_frame(camera), None, look, &project.fill_patterns)
 }
 
 /// The analytical model seen along the camera: member lines (columns and
 /// beams) and nodes, supports marked with a triangle.
 pub fn analytical(project: &Project, geom: &ModelGeometry, camera: &CameraState) -> Drawing2D {
-    let frame = Frame::looking(DVec3::ZERO, camera.forward());
+    let frame = camera_frame(camera);
     let model = cc_geom::analytical::analytical_model(project, geom);
     let mut d = Drawing2D::default();
     for m in &model.members {
@@ -402,7 +698,7 @@ pub fn analytical(project: &Project, geom: &ModelGeometry, camera: &CameraState)
 
 /// The reinforcing bars seen along the camera, tagged with their sets.
 pub fn rebar(geom: &ModelGeometry, camera: &CameraState) -> Drawing2D {
-    let frame = Frame::looking(DVec3::ZERO, camera.forward());
+    let frame = camera_frame(camera);
     let mut d = Drawing2D::default();
     for set in geom.rebar.values() {
         for bar in &set.bars {
@@ -441,6 +737,8 @@ mod tests {
                 }),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             })
         });
         (doc, id)
@@ -451,7 +749,7 @@ mod tests {
     fn empty_elevation_shows_the_levels() {
         let project = Project::from_template();
         let geom = ModelGeometry::build(&project);
-        let d = elevation(&project, &geom, Direction::South);
+        let d = elevation(&project, &geom, Direction::South, Look::plain());
         for level in &project.levels {
             assert!(
                 d.prims.iter().any(|p| matches!(p, Prim::Text { text, .. } if *text == level.name)),
@@ -460,11 +758,107 @@ mod tests {
             );
         }
     }
+    /// Each visual style draws the same wall differently: the wireframe
+    /// only lines (the far face's edges too), hidden line white faces,
+    /// consistent colors the material's color unlit, textures the
+    /// material's appearance with its surface pattern in the pattern's color.
+    #[test]
+    fn visual_styles_fill_faces_their_own_way() {
+        use cc_core::VisualStyle as V;
+        let (mut doc, id) = one_wall();
+        let material = doc
+            .project
+            .element(id)
+            .and_then(|e| doc.project.element_type(e.type_id))
+            .map(|t| t.main_material().to_string())
+            .unwrap();
+        let m = doc.project.materials.iter_mut().find(|m| m.name == material).unwrap();
+        m.appearance.color = [180, 60, 40];
+        m.graphics.surface.foreground = cc_core::Pattern::Brick;
+        m.graphics.surface.foreground_color = [90, 20, 10];
+        let geom = ModelGeometry::build(&doc.project);
+        let draw = |style| elevation(&doc.project, &geom, Direction::South, Look { style, ..Look::plain() });
+        let fills = |d: &Drawing2D| -> Vec<[u8; 4]> {
+            d.prims
+                .iter()
+                .filter_map(|p| match p {
+                    Prim::Fill { color, cut: false, .. } => Some(*color),
+                    _ => None,
+                })
+                .collect()
+        };
+        let lines = |d: &Drawing2D| d.prims.iter().filter(|p| matches!(p, Prim::Line { .. })).count();
+        let (wire, hidden) = (draw(V::Wireframe), draw(V::HiddenLine));
+        assert!(fills(&wire).is_empty());
+        assert!(lines(&wire) > lines(&hidden), "the far face's edges show through");
+        assert!(!fills(&hidden).is_empty() && fills(&hidden).iter().all(|c| c[..3] == [255, 255, 255]));
+        let color = doc.project.material_color(&material);
+        let consistent = fills(&draw(V::ConsistentColors));
+        assert!(consistent.iter().all(|c| c[..3] == color), "{consistent:?} vs {color:?}");
+        let shaded = fills(&draw(V::Shaded));
+        assert!(shaded.iter().all(|c| c[..3] != color), "shading washes the color");
+        let textures = draw(V::Textures);
+        let bricks = textures
+            .prims
+            .iter()
+            .filter(|p| matches!(p, Prim::Line { pen: Some(pen), .. } if pen.color == Some([90, 20, 10])))
+            .count();
+        assert!(bricks > 10, "{bricks} brick lines");
+        assert!(fills(&textures).iter().all(|c| c[0] > c[1]), "the reddish appearance color");
+        // The wireframe is still picked by its lines.
+        assert_eq!(wire.hit_test(DVec2::new(0.0, 1.5), 0.05), Some(id));
+    }
+
+    /// A sun lights the faces turned to it: the wall's south face is brighter
+    /// with the sun to the south than to the north, a sun below the horizon
+    /// leaves the ambient light only, and no sun keeps the default light.
+    #[test]
+    fn the_sun_lights_the_faces_turned_to_it() {
+        use cc_core::sun::{SunMode, SunSettings};
+        let (doc, _) = one_wall();
+        let geom = ModelGeometry::build(&doc.project);
+        let fills = |d: &Drawing2D| -> Vec<[u8; 4]> {
+            d.prims
+                .iter()
+                .filter_map(|p| match p {
+                    Prim::Fill { color, .. } => Some(*color),
+                    _ => None,
+                })
+                .collect()
+        };
+        let lit = |light| fills(&elevation(&doc.project, &geom, Direction::South, Look { light, ..Look::plain() }));
+        let brightness =
+            |c: &[[u8; 4]]| c.iter().map(|c| u32::from(c[0]) + u32::from(c[1]) + u32::from(c[2])).sum::<u32>();
+        let south = lit(Some(DVec3::new(0.0, -1.0, 1.0).normalize()));
+        let north = lit(Some(DVec3::new(0.0, 1.0, 1.0).normalize()));
+        let night = lit(Some(DVec3::ZERO));
+        assert!(!south.is_empty() && south.len() == north.len());
+        assert!(brightness(&south) > brightness(&north), "{south:?} vs {north:?}");
+        assert_eq!(north, night, "the face turned away gets the ambient light only");
+        assert_ne!(lit(None), south);
+        // No sun: the default light; a view's sun comes from the project.
+        let mut view = cc_core::View::new(
+            cc_core::ViewId(9999),
+            "E",
+            100,
+            cc_core::ViewKind::Elevation { direction: Direction::South },
+        );
+        assert_eq!(Look::of(&doc.project, &view).light, None);
+        assert_eq!(Look::of(&doc.project, &view), Look { light: None, ..Look::of(&doc.project, &view) });
+        view.sun = Some(SunSettings::default());
+        let state = doc.project.sun_state(&view).unwrap();
+        assert!(state.above_horizon);
+        assert_eq!(Look::of(&doc.project, &view).light, Some(state.direction));
+        view.sun =
+            Some(SunSettings { mode: SunMode::Still { date: Default::default(), time: 0 }, ..Default::default() });
+        assert_eq!(Look::of(&doc.project, &view).light, Some(DVec3::ZERO), "midnight at the equator");
+    }
+
     #[test]
     fn south_elevation_shows_wall_face() {
         let (doc, id) = one_wall();
         let geom = ModelGeometry::build(&doc.project);
-        let d = elevation(&doc.project, &geom, Direction::South);
+        let d = elevation(&doc.project, &geom, Direction::South, Look::plain());
         assert_eq!(d.hit_test(DVec2::new(2.0, 1.5), 0.0), Some(id));
         assert_eq!(d.hit_test(DVec2::new(2.0, 3.5), 0.0), None);
     }
@@ -483,7 +877,7 @@ mod tests {
         wall.add_box(DVec2::ZERO, DVec2::X, DVec2::Y, 4.0, 4.2, 0.0, 10.0, 0.0, 3.0);
         let geom = ModelGeometry { solids: vec![roof, wall], ..Default::default() };
         let frame = Frame::looking(DVec3::ZERO, DVec3::new(1.0, 1.0, -1.0));
-        let d = render(&geom, &frame, None);
+        let d = render(&geom, &frame, None, Look::plain(), &Default::default());
         let fills: Vec<(usize, ElementId, f64)> = d
             .prims
             .iter()
@@ -498,12 +892,144 @@ mod tests {
         assert!(roof_top > last_wall, "roof top painted at {roof_top}, a wall face at {last_wall}");
     }
 
+    /// Three members lying over one another in a ring (a cycle) under a
+    /// large tilted face whose mean depth is the farthest: breaking the cycle
+    /// must not paint the large face before the members it hides.
+    #[test]
+    fn cycles_do_not_paint_a_large_face_early() {
+        let frame = Frame::looking(DVec3::new(0.0, 0.0, 10.0), -DVec3::Z);
+        let face = |verts: Vec<DVec3>| {
+            let normal = (verts[1] - verts[0]).cross(verts[2] - verts[0]).normalize();
+            ProjectedFace {
+                depth: verts.iter().map(|v| frame.depth(*v)).sum::<f64>() / verts.len() as f64,
+                normal,
+                point: verts[0],
+                pts: verts.iter().map(|v| frame.project(*v)).collect(),
+                color: Some([0; 4]),
+                element: ElementId(1),
+                solid: 0,
+                face: 0,
+                edges: Vec::new(),
+                marks: Vec::new(),
+            }
+        };
+        // The large face rises along x: 4.25 to 5.75 m high over the members.
+        let z = |x: f64| 1.0 + 0.5 * x;
+        let big = face(vec![
+            DVec3::new(-10.0, -10.0, z(-10.0)),
+            DVec3::new(10.0, -10.0, z(10.0)),
+            DVec3::new(10.0, 10.0, z(10.0)),
+            DVec3::new(-10.0, 10.0, z(-10.0)),
+        ]);
+        // Strips along the sides of a triangle around (8, 0), each rising from
+        // 3 to 3.5 m in turn, so each lies over the next where they cross.
+        let center = DVec2::new(8.0, 0.0);
+        let corner = |k: usize| {
+            let a = std::f64::consts::TAU * k as f64 / 3.0;
+            center + DVec2::new(a.cos(), a.sin()) * 1.5
+        };
+        let mut faces = vec![big];
+        for k in 0..3 {
+            let (p, q) = (corner(k), corner(k + 1));
+            let d = (q - p).normalize();
+            let (a, b) = (p - d * 0.5, q + d * 0.5);
+            let side = d.perp() * 0.15;
+            let at = |p: DVec2, h: f64| DVec3::new(p.x, p.y, h);
+            faces.push(face(vec![at(a - side, 3.0), at(b - side, 3.5), at(b + side, 3.5), at(a + side, 3.0)]));
+        }
+        let order = paint_order(&frame, &faces);
+        assert_eq!(order.len(), 4);
+        assert_eq!(order.last(), Some(&0), "the large face hides the members: painted last, {order:?}");
+    }
+
+    /// The order found with a queue of ready faces and a sweep over their
+    /// boxes is the one comparing every pair and scanning every face gives,
+    /// with overlaps, ties in depth and cycles among many tilted faces.
+    #[test]
+    fn paint_order_matches_comparing_every_pair() {
+        fn reference(frame: &Frame, faces: &[ProjectedFace]) -> Vec<usize> {
+            let n = faces.len();
+            let boxes: Vec<(DVec2, DVec2)> = faces
+                .iter()
+                .map(|f| f.pts.iter().fold((f.pts[0], f.pts[0]), |(lo, hi), p| (lo.min(*p), hi.max(*p))))
+                .collect();
+            let tris: Vec<Vec<[DVec2; 3]>> = faces.iter().map(|f| triangles(&f.pts)).collect();
+            let mut before: Vec<Vec<usize>> = vec![Vec::new(); n];
+            let mut pending = vec![0usize; n];
+            for i in 0..n {
+                for j in i + 1..n {
+                    let (a, b) = (boxes[i], boxes[j]);
+                    if a.0.x >= b.1.x || b.0.x >= a.1.x || a.0.y >= b.1.y || b.0.y >= a.1.y {
+                        continue;
+                    }
+                    let Some(s) = overlap_point(&tris[i], &tris[j]) else { continue };
+                    let (di, dj) = (depth_at(frame, &faces[i], s), depth_at(frame, &faces[j], s));
+                    if (di - dj).abs() < 1e-6 {
+                        continue;
+                    }
+                    let (back, front) = if di > dj { (i, j) } else { (j, i) };
+                    before[back].push(front);
+                    pending[front] += 1;
+                }
+            }
+            let mut done = vec![false; n];
+            let mut order = Vec::with_capacity(n);
+            for _ in 0..n {
+                let ready = (0..n)
+                    .filter(|&k| !done[k] && pending[k] == 0)
+                    .max_by(|&x, &y| faces[x].depth.total_cmp(&faces[y].depth));
+                let forced = || {
+                    (0..n)
+                        .filter(|&k| !done[k])
+                        .min_by(|&x, &y| pending[x].cmp(&pending[y]).then(faces[y].depth.total_cmp(&faces[x].depth)))
+                };
+                let Some(k) = ready.or_else(forced) else { break };
+                done[k] = true;
+                order.push(k);
+                for &f in &before[k] {
+                    pending[f] = pending[f].saturating_sub(1);
+                }
+            }
+            order
+        }
+        let frame = Frame::looking(DVec3::new(0.0, 0.0, 50.0), -DVec3::Z);
+        let mut seed = 12345u64;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut faces = Vec::new();
+        for k in 0..300 {
+            let (x, y) = (rand() * 20.0, rand() * 20.0);
+            let (w, h) = (0.5 + rand() * 4.0, 0.5 + rand() * 4.0);
+            // Some faces share a depth; tilted faces cross one another.
+            let z = if k % 7 == 0 { 1.0 } else { rand() * 5.0 };
+            let tilt = (rand() - 0.5) * 0.8;
+            let at = |px: f64, py: f64| DVec3::new(px, py, z + tilt * (px - x));
+            let verts = [at(x, y), at(x + w, y), at(x + w, y + h), at(x, y + h)];
+            let normal = (verts[1] - verts[0]).cross(verts[2] - verts[0]).normalize();
+            faces.push(ProjectedFace {
+                depth: verts.iter().map(|v| frame.depth(*v)).sum::<f64>() / verts.len() as f64,
+                normal,
+                point: verts[0],
+                pts: verts.iter().map(|v| frame.project(*v)).collect(),
+                color: Some([0; 4]),
+                element: ElementId(1),
+                solid: 0,
+                face: 0,
+                edges: Vec::new(),
+                marks: Vec::new(),
+            });
+        }
+        assert_eq!(paint_order(&frame, &faces), reference(&frame, &faces));
+    }
+
     #[test]
     fn section_cuts_wall_with_poche() {
         let (doc, id) = one_wall();
         let geom = ModelGeometry::build(&doc.project);
         // Section line along X at x = 2, looking -Y... crossing the wall north to south.
-        let d = section(&doc.project, &geom, DVec2::new(2.0, 2.0), DVec2::new(2.0, -2.0), 5.0, 50);
+        let d = section(&doc.project, &geom, (DVec2::new(2.0, 2.0), DVec2::new(2.0, -2.0)), 5.0, 50, Look::plain());
         let cut = d.prims.iter().filter(|p| matches!(p, Prim::Line { style: LineStyle::Cut, .. })).count();
         assert_eq!(cut, 4);
         // The cut is filled with the core material's pattern (the template's masonry hatch).

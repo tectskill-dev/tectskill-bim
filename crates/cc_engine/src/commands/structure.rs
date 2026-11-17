@@ -16,12 +16,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Points closer than this are the same place (1 cm).
-const SAME: f64 = 0.01;
+pub(crate) const SAME: f64 = 0.01;
 
-/// The grid lines named by `ids`, or every grid when none are given.
-fn grid_lines(p: &Project, ids: &[u64]) -> Result<Vec<(DVec2, DVec2)>> {
+/// The grids named by `ids` with their lines, or every grid when none are given.
+pub(crate) fn grids_with_ids(p: &Project, ids: &[u64]) -> Result<Vec<(ElementId, (DVec2, DVec2))>> {
     let line = |id: ElementId| match p.element(id).map(|e| &e.kind) {
-        Some(ElementKind::Grid(g)) => Ok((g.start, g.end)),
+        Some(ElementKind::Grid(g)) => Ok((id, (g.start, g.end))),
         _ => Err(EngineError::invalid(format!("element {} is not a grid", id.0))),
     };
     if ids.is_empty() {
@@ -29,7 +29,7 @@ fn grid_lines(p: &Project, ids: &[u64]) -> Result<Vec<(DVec2, DVec2)>> {
             .elements
             .values()
             .filter_map(|e| match &e.kind {
-                ElementKind::Grid(g) => Some((g.start, g.end)),
+                ElementKind::Grid(g) => Some((e.id, (g.start, g.end))),
                 _ => None,
             })
             .collect());
@@ -37,8 +37,13 @@ fn grid_lines(p: &Project, ids: &[u64]) -> Result<Vec<(DVec2, DVec2)>> {
     ids.iter().map(|&id| refs::element(p, id).and_then(line)).collect()
 }
 
+/// The grid lines named by `ids`, or every grid when none are given.
+fn grid_lines(p: &Project, ids: &[u64]) -> Result<Vec<(DVec2, DVec2)>> {
+    Ok(grids_with_ids(p, ids)?.into_iter().map(|(_, l)| l).collect())
+}
+
 /// Where segments `a` and `b` cross (ends included), if they are not parallel.
-fn crossing((a0, a1): (DVec2, DVec2), (b0, b1): (DVec2, DVec2)) -> Option<DVec2> {
+pub(crate) fn crossing((a0, a1): (DVec2, DVec2), (b0, b1): (DVec2, DVec2)) -> Option<DVec2> {
     let (u, v) = (a1 - a0, b1 - b0);
     let den = u.perp_dot(v);
     if den.abs() < 1e-9 * u.length() * v.length() {
@@ -52,7 +57,7 @@ fn crossing((a0, a1): (DVec2, DVec2), (b0, b1): (DVec2, DVec2)) -> Option<DVec2>
 }
 
 /// Every intersection of the lines, each place once.
-fn intersections(lines: &[(DVec2, DVec2)]) -> Vec<DVec2> {
+pub(crate) fn intersections(lines: &[(DVec2, DVec2)]) -> Vec<DVec2> {
     let mut points: Vec<DVec2> = Vec::new();
     for (i, a) in lines.iter().enumerate() {
         for b in &lines[i + 1..] {
@@ -68,7 +73,7 @@ fn intersections(lines: &[(DVec2, DVec2)]) -> Vec<DVec2> {
 }
 
 /// Columns of `level` with their centers.
-fn columns_on(p: &Project, level: LevelId) -> Vec<(ElementId, DVec2)> {
+pub(crate) fn columns_on(p: &Project, level: LevelId) -> Vec<(ElementId, DVec2)> {
     p.elements
         .values()
         .filter(|e| e.level == level)
@@ -80,7 +85,7 @@ fn columns_on(p: &Project, level: LevelId) -> Vec<(ElementId, DVec2)> {
 }
 
 /// Whether a beam of `level` already runs between `a` and `b` (either way).
-fn beam_exists(p: &Project, level: LevelId, a: DVec2, b: DVec2) -> bool {
+pub(crate) fn beam_exists(p: &Project, level: LevelId, a: DVec2, b: DVec2) -> bool {
     p.elements.values().filter(|e| e.level == level).any(|e| match &e.kind {
         ElementKind::Beam(x) => {
             (x.start.distance(a) < SAME && x.end.distance(b) < SAME)
@@ -92,7 +97,7 @@ fn beam_exists(p: &Project, level: LevelId, a: DVec2, b: DVec2) -> bool {
 
 /// The location elevation of new beams: `top_offset`, else the level's height.
 fn beam_top(p: &Project, level: LevelId, top_offset: Option<f64>) -> Result<f64> {
-    finite(top_offset.unwrap_or_else(|| p.level_height(level, 3.0)), "top_offset")
+    finite(top_offset.unwrap_or_else(|| p.level_height(level, p.defaults().story)), "top_offset")
 }
 
 /// Create beams along `spans` (skipping those already modeled) in one undo step.
@@ -176,7 +181,7 @@ impl Command for ColumnsAtGrids {
                 position,
                 rotation_deg: finite(self.rotation.unwrap_or(0.0), "rotation")?,
                 base_offset: 0.0,
-                height: positive(self.height.unwrap_or_else(|| p.level_height(level, 3.0)), "height")?,
+                height: positive(self.height.unwrap_or_else(|| p.level_height(level, p.defaults().story)), "height")?,
                 top: top(p, self.top_level.as_ref(), self.top_offset)?.unwrap_or_else(|| default_top(p, level)),
                 structural: self.structural.unwrap_or(true),
             })

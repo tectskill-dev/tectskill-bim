@@ -6,7 +6,7 @@ use crate::icons::{self, Badge, Icon, Tones};
 use crate::state::{AppState, RibbonTab};
 use crate::t;
 use crate::theme::{self, PALETTE};
-use crate::tools::{DimensionMode, Tool, walls_loop};
+use crate::tools::{DimensionMode, Run, Tool};
 use cc_core::{Category, ViewCategory};
 use cc_views::format;
 use egui::{Align, Button, DragValue, Layout, Response, RichText, Sense, Stroke, StrokeKind, Ui, vec2};
@@ -23,15 +23,19 @@ pub fn category_icon(category: Category) -> Icon {
         Category::Wall => Icon::Wall,
         Category::Door => Icon::Door,
         Category::Window => Icon::Window,
+        Category::Niche => Icon::Niche,
         Category::Floor => Icon::Floor,
         Category::Ceiling => Icon::Ceiling,
         Category::Roof => Icon::Roof,
         Category::Room => Icon::Room,
         Category::Grid => Icon::Grid,
-        Category::Foundation => Icon::Footing,
+        Category::Foundation | Category::Pile => Icon::Footing,
         Category::Rebar => Icon::Rebar,
         Category::Pipe => Icon::Pipe,
         Category::Conduit => Icon::Conduit,
+        Category::CableTray => Icon::CableTray,
+        Category::Valve => Icon::Valve,
+        Category::LightningConductor => Icon::LightningConductor,
         Category::Dimension => Icon::Dimension,
         Category::Column => Icon::Column,
         Category::Beam => Icon::Beam,
@@ -39,7 +43,23 @@ pub fn category_icon(category: Category) -> Icon {
         Category::Ramp => Icon::Ramp,
         Category::Railing => Icon::Railing,
         Category::Component => Icon::Component,
-        Category::Text => Icon::Text,
+        Category::Text | Category::TitleBlock | Category::BarTag => Icon::Text,
+        Category::LevelMark => Icon::LevelMarkPlan,
+        Category::CadImport => Icon::CadImport,
+        Category::DetailLine => Icon::DetailLine,
+        Category::DetailComponent => Icon::DetailComponent,
+        Category::FilledRegion => Icon::FilledRegion,
+        Category::MaskingRegion => Icon::MaskingRegion,
+        Category::Mass => Icon::Mass,
+        Category::Shaft => Icon::Shaft,
+        Category::SteelBuilding => Icon::SteelBuilding,
+        Category::Truss => Icon::Truss,
+        Category::Bracing => Icon::Brace,
+        Category::Connection => Icon::Connection,
+        Category::WallFraming => Icon::WallFraming,
+        Category::Topography => Icon::Topography,
+        Category::Pad => Icon::Pad,
+        Category::Sweep => Icon::Sweep,
     }
 }
 
@@ -47,6 +67,7 @@ fn tool_icon(tool: &Tool) -> Icon {
     match tool {
         Tool::Select => Icon::Select,
         Tool::Section => Icon::Section,
+        Tool::Callout => Icon::Callout,
         Tool::Move => Icon::Move,
         Tool::Copy => Icon::Copy,
         Tool::Rotate => Icon::Rotate,
@@ -58,14 +79,18 @@ fn tool_icon(tool: &Tool) -> Icon {
         Tool::Split => Icon::Split,
         Tool::Offset => Icon::Offset,
         Tool::Align => Icon::Align,
+        Tool::PushPull => Icon::PushPull,
         Tool::ToggleJoin => Icon::Join,
         Tool::Measure => Icon::Measure,
         Tool::JoinGeometry { unjoin: false } => Icon::JoinGeometry,
         Tool::JoinGeometry { unjoin: true } => Icon::UnjoinGeometry,
+        Tool::AttachTop => Icon::AttachTop,
         Tool::Paste => Icon::Paste,
         Tool::Dimension { mode, .. } => dimension_icon(*mode),
         Tool::MatchType => Icon::MatchType,
         Tool::Demolish => Icon::Demolish,
+        Tool::CurtainGrid => Icon::CurtainGrid,
+        Tool::Paint { .. } => Icon::Paint,
         Tool::AddLeader { .. } => Icon::Leader,
         Tool::Opening { floor: false, .. } => category_icon(Category::Roof),
         Tool::Opening { floor: true, .. } => category_icon(Category::Floor),
@@ -76,20 +101,52 @@ fn tool_icon(tool: &Tool) -> Icon {
 /// Labels wider than this (points) wrap onto two lines at a space.
 const WRAP_WIDTH: f32 = 64.0;
 
-/// Split `label` into one or two lines: long labels break at the space
-/// that best balances the two lines.
+/// The least width of a large ribbon button, so short labels keep the
+/// buttons of a group at an even rhythm.
+const BUTTON_MIN_WIDTH: f32 = 60.0;
+/// Room at each side of a large button's label.
+const BUTTON_PAD: f32 = 8.0;
+
+/// Width of a large button whose label lines are at most `text_w` wide,
+/// with `chevron` more for a menu's arrow.
+fn button_width(text_w: f32, chevron: f32) -> f32 {
+    (text_w + chevron + 2.0 * BUTTON_PAD).max(BUTTON_MIN_WIDTH)
+}
+
+/// Where `label` may break into two lines, as (end of the first line, start
+/// of the second): at a space, which is dropped, or after a slash or a
+/// hyphen between two words, which stays on the first line.
+fn break_points(label: &str) -> Vec<(usize, usize)> {
+    label
+        .char_indices()
+        .filter_map(|(i, c)| match c {
+            ' ' => Some((i, i, i + 1)),
+            '/' | '-' => Some((i, i + 1, i + 1)),
+            _ => None,
+        })
+        // Words on both sides, so neither line is empty or a lone separator.
+        .filter(|(at, _, start)| {
+            let word = |t: Option<&str>| t.is_some_and(|t| !t.trim().is_empty());
+            word(label.get(..*at)) && word(label.get(*start..))
+        })
+        .map(|(_, end, start)| (end, start))
+        .collect()
+}
+
+/// Split `label` into one or two lines: long labels break where the two
+/// lines are best balanced (see [`break_points`]).
 fn label_lines(ui: &Ui, label: &str, font: &egui::FontId) -> Vec<String> {
     let width = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), PALETTE.text).size().x;
-    if width(label) <= WRAP_WIDTH || !label.contains(' ') {
+    if width(label) <= WRAP_WIDTH {
         return vec![label.to_string()];
     }
-    let best = label
-        .match_indices(' ')
-        .map(|(i, _)| (i, width(&label[..i]).max(width(&label[i + 1..]))))
-        .min_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(i, _)| i);
+    let best = break_points(label)
+        .into_iter()
+        .filter_map(|(end, start)| Some((label.get(..end)?.trim_end(), label.get(start..)?.trim_start())))
+        .map(|(first, second)| (first, second, width(first).max(width(second))))
+        .min_by(|a, b| a.2.total_cmp(&b.2));
     match best {
-        Some(i) => vec![label[..i].to_string(), label[i + 1..].to_string()],
+        Some((first, second, _)) => vec![first.to_string(), second.to_string()],
         None => vec![label.to_string()],
     }
 }
@@ -111,7 +168,7 @@ fn big_button(
         .collect();
     let chevron = if dropdown { 11.0 } else { 0.0 };
     let text_w = galleys.iter().map(|g| g.size().x).fold(0.0, f32::max);
-    let width = (text_w + chevron + 14.0).max(50.0);
+    let width = button_width(text_w, chevron);
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, response) = ui.allocate_exact_size(vec2(width, BUTTON_HEIGHT), sense);
     if ui.is_rect_visible(rect) {
@@ -227,6 +284,11 @@ fn icon_button(ui: &mut Ui, (icon, badge): (Icon, Option<Badge>), enabled: bool)
     response
 }
 
+/// A group of the component environment's ribbon.
+pub fn env_group(ui: &mut Ui, state: &mut AppState, caption: String, commands: &[UiCommand]) {
+    group(ui, caption, |ui| command_buttons(ui, state, commands));
+}
+
 /// A captioned group of ribbon buttons followed by a vertical divider.
 fn group(ui: &mut Ui, caption: String, add: impl FnOnce(&mut Ui)) {
     let caption_w =
@@ -253,6 +315,20 @@ fn group(ui: &mut Ui, caption: String, add: impl FnOnce(&mut Ui)) {
 fn tab_font(active: bool) -> egui::FontId {
     egui::FontId::new(13.0, if active { theme::semibold() } else { egui::FontFamily::Proportional })
 }
+
+/// Room around each tab title's text: [`TAB_PAD`], shrunk evenly down to
+/// [`TAB_PAD_MIN`] when the titles (of `text_widths`) do not fit in `available`.
+fn tab_padding(text_widths: &[f32], available: f32) -> f32 {
+    let n = text_widths.len().max(1) as f32;
+    let text: f32 = text_widths.iter().sum();
+    let fit = (available - text) / n;
+    if fit.is_finite() { fit.clamp(TAB_PAD_MIN, TAB_PAD) } else { TAB_PAD }
+}
+
+/// Room around a ribbon tab title's text, pixels.
+const TAB_PAD: f32 = 28.0;
+/// The least room around a title in a narrow window.
+const TAB_PAD_MIN: f32 = 4.0;
 
 /// A tab title in a cell of `width`, its text centered.
 fn tab_title(ui: &mut Ui, label: &str, active: bool, width: f32) -> Response {
@@ -295,29 +371,34 @@ fn command_big(ui: &mut Ui, state: &AppState, command: UiCommand, dropdown: bool
 
 /// The rich tooltip of a command: title and shortcut, what it does, why it
 /// is unavailable, and the engine command that scripts call for the same change.
+/// With detailed tooltips off (a preference), only the title, shortcut and
+/// why it is unavailable.
 pub fn command_tooltip(response: Response, state: &AppState, command: UiCommand, why: Option<String>) -> Response {
     let title = command.title(state);
+    let detailed = state.prefs.detailed_tooltips;
     response.on_hover_ui(|ui| {
         ui.set_max_width(300.0);
         ui.spacing_mut().item_spacing.y = 4.0;
         ui.horizontal(|ui| {
             ui.label(RichText::new(&title).family(theme::semibold()).color(PALETTE.text));
             if let Some(keys) = command.shortcut() {
-                key_cap(ui, keys);
+                key_cap(ui, &keys);
             }
         });
-        ui.label(theme::muted(command.description()));
+        if detailed {
+            ui.label(theme::muted(command.description()));
+        }
         if let Some(why) = &why {
             ui.label(RichText::new(t!("tip-unavailable", "reason" => why)).color(PALETTE.warning));
         }
-        if let Some(name) = command.engine() {
+        if let Some(name) = command.engine().filter(|_| detailed) {
             ui.label(RichText::new(t!("tip-engine", "command" => name)).size(11.0).color(PALETTE.text_faint));
         }
     })
 }
 
 /// A keyboard shortcut drawn as a key cap.
-fn key_cap(ui: &mut Ui, keys: &str) {
+pub(crate) fn key_cap(ui: &mut Ui, keys: &str) -> egui::Response {
     egui::Frame::new()
         .fill(PALETTE.surface)
         .stroke(Stroke::new(1.0, PALETTE.border))
@@ -325,7 +406,8 @@ fn key_cap(ui: &mut Ui, keys: &str) {
         .inner_margin(egui::Margin::symmetric(5, 1))
         .show(ui, |ui| {
             ui.label(RichText::new(keys).size(11.0).color(PALETTE.text_muted));
-        });
+        })
+        .response
 }
 
 /// A small quick access button for `command`.
@@ -369,32 +451,35 @@ pub fn ribbon(ui: &mut Ui, state: &mut AppState) {
             UiCommand::Dimension(DimensionMode::Aligned),
             UiCommand::Default3D,
             UiCommand::Section,
+            UiCommand::CloseInactiveViews,
         ] {
             command_icon(ui, state, command);
         }
     });
-    // Ribbon tab titles, all as wide as the widest (measured bold, as when active).
+    // Ribbon tab titles, each as wide as its own text (measured bold, as when
+    // active, so a tab keeps its width when picked) plus some room around it.
     let tabs = [
         (RibbonTab::File, t!("ribbon-file")),
         (RibbonTab::Architecture, t!("ribbon-architecture")),
         (RibbonTab::Structure, t!("ribbon-structure")),
         (RibbonTab::Mep, t!("ribbon-mep")),
+        (RibbonTab::MassingSite, t!("ribbon-massing-site")),
+        (RibbonTab::Insert, t!("ribbon-insert")),
         (RibbonTab::Modify, t!("ribbon-modify")),
         (RibbonTab::Annotate, t!("ribbon-annotate")),
         (RibbonTab::View, t!("ribbon-view")),
         (RibbonTab::Manage, t!("ribbon-manage")),
     ];
-    let width = tabs
+    let text_widths: Vec<f32> = tabs
         .iter()
         .map(|(_, label)| ui.painter().layout_no_wrap(label.clone(), tab_font(true), PALETTE.text).size().x)
-        .fold(0.0, f32::max)
-        + 28.0;
-    // Narrow windows squeeze the titles, keeping room for the collapse button.
-    let width = width.min(((full_width - 40.0) / tabs.len() as f32).max(width - 24.0));
+        .collect();
+    let pad = tab_padding(&text_widths, full_width - 40.0);
     let collapsed = state.ribbon_collapsed;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        for (tab, label) in tabs {
+        for ((tab, label), text_w) in tabs.into_iter().zip(text_widths) {
+            let width = text_w + pad;
             let active = state.ribbon_tab == tab && (!collapsed || state.ribbon_peek);
             let r = tab_title(ui, &label, active, width);
             // A double click collapses or expands; a click on a collapsed
@@ -506,6 +591,8 @@ fn tab_row(ui: &mut Ui, state: &mut AppState, available: f32) {
                     RibbonTab::Architecture => architecture_tab(ui, state),
                     RibbonTab::Structure => structure_tab(ui, state),
                     RibbonTab::Mep => mep_tab(ui, state),
+                    RibbonTab::MassingSite => massing_site_tab(ui, state),
+                    RibbonTab::Insert => insert_tab(ui, state),
                     RibbonTab::Modify => modify_tab(ui, state),
                     RibbonTab::Annotate => annotate_tab(ui, state),
                     RibbonTab::View => view_tab(ui, state),
@@ -555,35 +642,26 @@ fn command_buttons(ui: &mut Ui, state: &mut AppState, list: &[UiCommand]) {
 }
 
 fn file_tab(ui: &mut Ui, state: &mut AppState) {
-    use UiCommand::{CloseProject, ExportIfc, ExportImage, ExportPdf, ExportSvg, ImportIfc, New, Open, Save, SaveAs};
+    use UiCommand::{CloseProject, ExportDxf, ExportIfc, ExportImage, ExportPdf, ExportSvg, New, Open, Save, SaveAs};
     group(ui, t!("group-project"), |ui| command_buttons(ui, state, &[New, Open, Save, SaveAs, CloseProject]));
-    group(ui, t!("group-import"), |ui| command_button(ui, state, ImportIfc));
-    group(ui, t!("group-export"), |ui| command_buttons(ui, state, &[ExportIfc, ExportPdf, ExportSvg, ExportImage]));
-    group(ui, t!("group-settings"), |ui| {
-        ui.allocate_ui_with_layout(vec2(170.0, BUTTON_HEIGHT), Layout::top_down(Align::Min), |ui| {
-            ui.add_space(6.0);
-            ui.label(theme::muted(t!("settings-language")).size(12.0));
-            let mut lang = crate::i18n::language();
-            egui::ComboBox::from_id_salt("language").width(150.0).selected_text(lang.native_name()).show_ui(ui, |ui| {
-                for l in crate::i18n::Language::ALL {
-                    ui.selectable_value(&mut lang, l, l.native_name());
-                }
-            });
-            actions::set_language(state, lang);
-        });
-        ui.allocate_ui_with_layout(vec2(130.0, BUTTON_HEIGHT), Layout::top_down(Align::Min), |ui| {
-            ui.add_space(6.0);
-            ui.label(theme::muted(t!("settings-theme")).size(12.0));
-            let mut choice = state.theme;
-            egui::ComboBox::from_id_salt("theme").width(110.0).selected_text(choice.label()).show_ui(ui, |ui| {
-                for t in theme::ThemeChoice::ALL {
-                    ui.selectable_value(&mut choice, t, t.label());
-                }
-            });
-            actions::set_theme(ui.ctx(), state, choice);
-        });
+    group(ui, t!("group-export"), |ui| {
+        command_buttons(ui, state, &[ExportIfc, ExportPdf, ExportSvg, ExportImage, ExportDxf])
     });
+    group(ui, t!("group-settings"), |ui| command_button(ui, state, UiCommand::Preferences));
     group(ui, t!("group-help"), |ui| command_buttons(ui, state, &[UiCommand::About, UiCommand::CheckUpdates]));
+}
+
+/// Files brought into the project or written from it, and components to load.
+fn insert_tab(ui: &mut Ui, state: &mut AppState) {
+    use UiCommand::{
+        ComponentLibrary, ExportDxf, ExportIfc, ImportCad, ImportGltf, ImportIfc, ImportImage, ImportObj, ImportSkp,
+        LoadComponent,
+    };
+    group(ui, t!("group-import"), |ui| {
+        command_buttons(ui, state, &[ImportIfc, ImportCad, ImportSkp, ImportObj, ImportGltf, ImportImage]);
+    });
+    group(ui, t!("group-export"), |ui| command_buttons(ui, state, &[ExportIfc, ExportDxf]));
+    group(ui, t!("group-library"), |ui| command_buttons(ui, state, &[LoadComponent, ComponentLibrary]));
 }
 
 fn place(category: Category) -> UiCommand {
@@ -593,34 +671,92 @@ fn place(category: Category) -> UiCommand {
 fn architecture_tab(ui: &mut Ui, state: &mut AppState) {
     use Category::*;
     let buttons = |list: &[Category]| list.iter().map(|c| place(*c)).collect::<Vec<_>>();
-    group(ui, t!("group-build"), |ui| command_buttons(ui, state, &buttons(&[Wall, Door, Window])));
-    group(ui, t!("group-horizontal"), |ui| command_buttons(ui, state, &buttons(&[Floor, Ceiling, Roof])));
+    group(ui, t!("group-build"), |ui| {
+        command_buttons(ui, state, &buttons(&[Wall, Door, Window, Niche]));
+        command_button(ui, state, UiCommand::CurtainGrid);
+    });
+    group(ui, t!("group-horizontal"), |ui| command_buttons(ui, state, &buttons(&[Floor, Ceiling, Roof, Shaft])));
     group(ui, t!("group-circulation"), |ui| command_buttons(ui, state, &buttons(&[Stair, Ramp, Railing])));
     group(ui, t!("group-room"), |ui| command_button(ui, state, place(Room)));
     group(ui, t!("group-model"), |ui| {
-        command_buttons(
-            ui,
-            state,
-            &[place(Component), UiCommand::NewComponent, UiCommand::LoadComponent, UiCommand::ComponentLibrary],
-        );
+        command_button(ui, state, place(Sweep));
+        // Components, next to making, editing and loading them (one column of small buttons).
+        command_button(ui, state, place(Component));
+        stacks(ui, state, &[&[UiCommand::NewComponent, UiCommand::EditComponent, UiCommand::LoadComponent]]);
+        command_button(ui, state, UiCommand::ComponentLibrary);
     });
     group(ui, t!("group-datum"), |ui| command_buttons(ui, state, &[place(Grid), UiCommand::AlignGridEnds]));
     group(ui, t!("group-selection"), |ui| command_button(ui, state, UiCommand::Select));
 }
 
+/// Conceptual masses (and the buildings made from them) and the terrain.
+fn massing_site_tab(ui: &mut Ui, state: &mut AppState) {
+    group(ui, t!("group-massing"), |ui| {
+        command_buttons(ui, state, &[place(Category::Mass), UiCommand::PushPull]);
+        stacks(ui, state, &[&[UiCommand::MassWalls, UiCommand::MassSlabs, UiCommand::MassRoof]]);
+    });
+    group(ui, t!("group-site"), |ui| command_buttons(ui, state, &[place(Category::Topography), place(Category::Pad)]));
+}
+
+/// The Structure tab's material: three stacked toggles.
+fn material_selector(ui: &mut Ui, state: &mut AppState) {
+    ui.vertical(|ui| {
+        for m in cc_core::StructuralMaterial::ALL {
+            let on = state.prefs.structure_material == m;
+            let label = crate::i18n::tr(m.key());
+            let response = ui.selectable_label(on, label.clone());
+            response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, on, label.clone()));
+            if response.clicked() {
+                state.prefs.structure_material = m;
+            }
+        }
+    });
+}
+
 fn structure_tab(ui: &mut Ui, state: &mut AppState) {
     use UiCommand::*;
-    group(ui, t!("group-structure"), |ui| {
-        command_buttons(ui, state, &[place(Category::Column), place(Category::Beam), place(Category::Foundation)]);
-    });
-    // Layout from grids and foundations under what exists, as small stacked buttons.
-    group(ui, t!("group-framing"), |ui| {
-        stacks(ui, state, &[&[ColumnsAtGrids, BeamsOnGrids, BeamsBetweenColumns], &[BracesX, Truss]]);
-    });
+    use cc_core::StructuralMaterial as M;
+    use cc_core::connection::ConnectionKind as K;
+    let m = state.prefs.structure_material;
+    group(ui, t!("group-structure-material"), |ui| material_selector(ui, state));
+    let (column, beam) = (StructurePlace(Category::Column, m), StructurePlace(Category::Beam, m));
+    match m {
+        M::Concrete => {
+            group(ui, t!("group-structure"), |ui| {
+                command_buttons(ui, state, &[column, beam, place(Category::Floor)]);
+            });
+            group(ui, t!("group-reinforcement"), |ui| stacks(ui, state, &[&[TypicalRebar, RebarView, SteelSchedule]]));
+        }
+        M::Steel => {
+            group(ui, t!("group-structure"), |ui| command_buttons(ui, state, &[column, beam, Bracing]));
+            group(ui, t!("group-framing"), |ui| {
+                stacks(
+                    ui,
+                    state,
+                    &[&[ColumnsAtGrids, BeamsOnGrids, BeamsBetweenColumns], &[GridFrame, Truss, SteelBuilding]],
+                );
+                command_button(ui, state, LightSteelFrame);
+            });
+            group(ui, t!("group-connections"), |ui| {
+                stacks(ui, state, &[&[Connection(K::BasePlate), Connection(K::EndPlate), Connection(K::FinPlate)]])
+            });
+        }
+        M::Timber => {
+            group(ui, t!("group-structure"), |ui| command_buttons(ui, state, &[column, beam, Bracing]));
+            group(ui, t!("group-framing"), |ui| {
+                stacks(ui, state, &[&[ColumnsAtGrids, BeamsOnGrids, BeamsBetweenColumns], &[GridFrame, Truss]]);
+                command_button(ui, state, WoodFrame);
+            });
+            group(ui, t!("group-connections"), |ui| {
+                stacks(ui, state, &[&[Connection(K::TimberBolts), Connection(K::Hanger)]])
+            });
+        }
+    }
+    group(ui, t!("group-profiles"), |ui| command_button(ui, state, Profiles));
     group(ui, t!("group-foundation"), |ui| {
+        command_button(ui, state, place(Category::Foundation));
         stacks(ui, state, &[&[FootingsUnderColumns, StripFootingsUnderWalls, FoundationSlab]]);
     });
-    group(ui, t!("group-reinforcement"), |ui| stacks(ui, state, &[&[TypicalRebar, RebarView, SteelSchedule]]));
     group(ui, t!("group-analytical"), |ui| {
         stacks(ui, state, &[&[SlabJoinSupports, AnalyticalView, AnalyticalExport]]);
     });
@@ -633,12 +769,30 @@ fn structure_tab(ui: &mut Ui, state: &mut AppState) {
 
 fn mep_tab(ui: &mut Ui, state: &mut AppState) {
     use UiCommand::*;
-    group(ui, t!("group-plumbing"), |ui| command_buttons(ui, state, &[place(Category::Pipe), PlaceFixture]));
-    group(ui, t!("group-electrical"), |ui| command_buttons(ui, state, &[place(Category::Conduit), PlaceDevice]));
+    group(ui, t!("group-plumbing"), |ui| {
+        command_buttons(ui, state, &[place(Category::Pipe), place(Category::Valve), PlaceFixture]);
+    });
+    group(ui, t!("group-electrical"), |ui| {
+        command_buttons(ui, state, &[place(Category::Conduit), place(Category::CableTray), PlaceDevice]);
+    });
+    group(ui, t!("group-communications"), |ui| {
+        use cc_core::DeviceKind as D;
+        command_buttons(ui, state, &[PlaceDeviceOf(D::Rack), PlaceDeviceOf(D::DataOutlet)]);
+        stacks(ui, state, &[&[Cabling]]);
+    });
+    group(ui, t!("group-lightning"), |ui| {
+        use cc_core::DeviceKind as D;
+        command_buttons(ui, state, &[place(Category::LightningConductor), PlaceDeviceOf(D::AirTerminal)]);
+        stacks(ui, state, &[&[PlaceDeviceOf(D::EarthElectrode), EarthRing, LpsCheck]]);
+    });
     group(ui, t!("group-systems"), |ui| command_buttons(ui, state, &[MepConnect, Systems]));
     group(ui, t!("group-analysis"), |ui| command_button(ui, state, MepSizing));
     group(ui, t!("group-documentation"), |ui| {
-        stacks(ui, state, &[&[PlumbingPlan, ElectricalPlan, MepSchedules], &[PanelDiagram]]);
+        stacks(
+            ui,
+            state,
+            &[&[PlumbingPlan, ElectricalPlan, MepSchedules], &[CommunicationsPlan, LightningPlan, PanelDiagram]],
+        );
     });
     group(ui, t!("group-selection"), |ui| command_button(ui, state, Select));
 }
@@ -647,6 +801,7 @@ pub fn dimension_icon(mode: DimensionMode) -> Icon {
     match mode {
         DimensionMode::Aligned => Icon::Dimension,
         DimensionMode::Linear => Icon::DimLinear,
+        DimensionMode::Ordinate => Icon::DimOrdinate,
         DimensionMode::Angular => Icon::DimAngular,
         DimensionMode::Radial => Icon::DimRadial,
         DimensionMode::Diameter => Icon::DimDiameter,
@@ -657,7 +812,20 @@ fn annotate_tab(ui: &mut Ui, state: &mut AppState) {
     group(ui, t!("group-dimension"), |ui| {
         command_buttons(ui, state, &DimensionMode::ALL.map(UiCommand::Dimension));
     });
+    group(ui, t!("group-detail"), |ui| {
+        command_buttons(
+            ui,
+            state,
+            &[UiCommand::DetailLine, UiCommand::FilledRegion, UiCommand::MaskingRegion, UiCommand::LineStyles],
+        )
+    });
+    group(ui, t!("group-detail-components"), |ui| {
+        command_buttons(ui, state, &[UiCommand::DetailComponent, UiCommand::CreateDetailComponent])
+    });
     group(ui, t!("group-text"), |ui| command_buttons(ui, state, &[UiCommand::Text, UiCommand::AddLeader]));
+    group(ui, t!("group-level-marks"), |ui| {
+        command_buttons(ui, state, &[UiCommand::LevelMarkPlan, UiCommand::LevelMarkSection]);
+    });
     group(ui, t!("group-tags"), |ui| command_button(ui, state, UiCommand::StructureTags));
     group(ui, t!("group-selection"), |ui| command_button(ui, state, UiCommand::Select));
 }
@@ -669,6 +837,11 @@ pub fn selected_text(state: &AppState) -> Option<cc_core::ElementId> {
 }
 
 /// Families of small buttons, each starting its own column.
+/// A captioned group of small buttons in columns (a contextual ribbon's).
+pub fn env_stacks(ui: &mut Ui, state: &mut AppState, caption: String, families: &[&[UiCommand]]) {
+    group(ui, caption, |ui| stacks(ui, state, families));
+}
+
 fn stacks(ui: &mut Ui, state: &mut AppState, families: &[&[UiCommand]]) {
     for family in families {
         if let Some(command) = stacked(ui, state, family) {
@@ -688,8 +861,12 @@ fn modify_tab(ui: &mut Ui, state: &mut AppState) {
         stacks(ui, state, &[transforms, picks, &[Pin, Unpin, Delete]]);
     });
     group(ui, t!("group-measure"), |ui| command_button(ui, state, Measure));
-    group(ui, t!("group-geometry"), |ui| command_buttons(ui, state, &[JoinGeometry, UnjoinGeometry]));
-    group(ui, t!("group-group"), |ui| command_buttons(ui, state, &[Group, Ungroup]));
+    group(ui, t!("group-geometry"), |ui| {
+        command_buttons(ui, state, &[JoinGeometry, UnjoinGeometry, AttachTop, DetachTop, Paint, RemovePaint])
+    });
+    group(ui, t!("group-sketch"), |ui| command_buttons(ui, state, &[EditBoundary, EditProfile]));
+    group(ui, t!("prop-title-block"), |ui| command_button(ui, state, EditTitleBlock));
+    group(ui, t!("group-group"), |ui| command_buttons(ui, state, &[Group, Ungroup, Explode]));
     group(ui, t!("group-phasing"), |ui| command_button(ui, state, Demolish));
 }
 
@@ -724,7 +901,7 @@ fn view_tab(ui: &mut Ui, state: &mut AppState) {
                 }
             });
         }
-        command_buttons(ui, state, &[UiCommand::New3D, UiCommand::Section]);
+        command_buttons(ui, state, &[UiCommand::New3D, UiCommand::Section, UiCommand::Callout]);
         let r = command_menu(ui, state, UiCommand::Elevations);
         egui::Popup::menu(&r).show(|ui| {
             let elevations: Vec<_> =
@@ -737,7 +914,7 @@ fn view_tab(ui: &mut Ui, state: &mut AppState) {
         });
     });
     group(ui, t!("group-documentation"), |ui| {
-        command_button(ui, state, UiCommand::Legend);
+        command_buttons(ui, state, &[UiCommand::Legend, UiCommand::DraftingView, UiCommand::BrowserOrganization]);
         let r = command_menu(ui, state, UiCommand::Schedule);
         egui::Popup::menu(&r).show(|ui| {
             for c in Category::SCHEDULABLE {
@@ -747,9 +924,20 @@ fn view_tab(ui: &mut Ui, state: &mut AppState) {
             }
         });
         command_button(ui, state, UiCommand::Sheet);
+        command_button(ui, state, UiCommand::NewTitleBlock);
     });
     group(ui, t!("group-graphics"), |ui| {
-        command_buttons(ui, state, &[UiCommand::VisibilityGraphics, UiCommand::ViewFilters, UiCommand::ViewTemplates]);
+        command_buttons(
+            ui,
+            state,
+            &[
+                UiCommand::VisibilityGraphics,
+                UiCommand::ViewFilters,
+                UiCommand::ViewTemplates,
+                UiCommand::SunSettings,
+                UiCommand::Render,
+            ],
+        );
     });
     group(ui, t!("group-temporary"), |ui| {
         use UiCommand::*;
@@ -764,42 +952,142 @@ fn view_tab(ui: &mut Ui, state: &mut AppState) {
         );
     });
     group(ui, t!("group-navigate"), |ui| command_button(ui, state, UiCommand::ZoomFit));
+    group(ui, t!("group-windows"), |ui| command_button(ui, state, UiCommand::CloseInactiveViews));
 }
 
 fn manage_tab(ui: &mut Ui, state: &mut AppState) {
     use UiCommand::*;
-    group(ui, t!("group-project"), |ui| command_buttons(ui, state, &[ProjectInfo, Units, Levels, Materials]));
+    group(ui, t!("group-project"), |ui| {
+        command_buttons(ui, state, &[ProjectInfo, SiteLocation, Units, Levels, Materials, FillPatterns, Profiles])
+    });
     group(ui, t!("group-graphics"), |ui| command_buttons(ui, state, &[ViewTemplates, ViewFilters]));
     group(ui, t!("group-phasing"), |ui| command_button(ui, state, Phases));
-    group(ui, t!("group-macros"), |ui| command_buttons(ui, state, &[MacroRecord, MacroRun]));
+    group(ui, t!("group-design-options"), |ui| {
+        command_button(ui, state, DesignOptions);
+        active_option_menu(ui, state);
+    });
+    group(ui, t!("group-macros"), |ui| {
+        command_button(ui, state, MacroRecord);
+        macro_menu(ui, state);
+        command_button(ui, state, VisualProgramming);
+    });
+    group(ui, t!("group-plugins"), |ui| {
+        command_button(ui, state, Plugins);
+        plugin_menu(ui, state);
+    });
+}
+
+/// Plugin Commands: a menu of the loaded plugins' commands, by plugin;
+/// each opens its form in the command palette.
+fn plugin_menu(ui: &mut Ui, state: &mut AppState) {
+    let r = command_menu(ui, state, UiCommand::PluginCommands);
+    egui::Popup::menu(&r).show(|ui| {
+        let groups: Vec<(String, Vec<(String, String)>)> =
+            state.plugins.commands().into_iter().map(|(name, list)| (name.to_string(), list.to_vec())).collect();
+        if groups.is_empty() {
+            ui.label(theme::muted(t!("plug-menu-none")).size(12.0));
+        }
+        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+            for (plugin, commands) in groups {
+                ui.label(theme::muted(plugin).size(11.5));
+                for (name, description) in commands {
+                    let short = name.split_once("__").map_or(name.as_str(), |(_, c)| c).to_string();
+                    let mut r = ui.button(short);
+                    if !description.is_empty() {
+                        r = r.on_hover_text(description);
+                    }
+                    if r.clicked() {
+                        state.ribbon_peek = false;
+                        crate::palette::open_command(state, &name);
+                    }
+                }
+            }
+        });
+        ui.separator();
+        if ui.button(t!("action-plugins")).clicked() {
+            state.ribbon_peek = false;
+            crate::plugins_ui::open(state);
+        }
+    });
+}
+
+/// Run Macro: a menu of the macros in the macros folder (see Preferences)
+/// and Browse… for any other file.
+/// The option being edited: the main model or one option, from a menu.
+fn active_option_menu(ui: &mut Ui, state: &mut AppState) {
+    let r = command_menu(ui, state, UiCommand::ActiveOption);
+    egui::Popup::menu(&r).show(|ui| crate::design_options_ui::active_menu(ui, state));
+}
+
+fn macro_menu(ui: &mut Ui, state: &mut AppState) {
+    let r = command_menu(ui, state, UiCommand::MacroRun);
+    egui::Popup::menu(&r).show(|ui| {
+        match state.prefs.macro_folder.clone() {
+            None => {
+                ui.label(theme::muted(t!("macro-no-folder")).size(12.0));
+            }
+            Some(folder) => {
+                let files = crate::preferences::macro_files(&folder);
+                if files.is_empty() {
+                    ui.label(theme::muted(t!("macro-none")).size(12.0));
+                }
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    for path in files {
+                        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                        if ui.button(name).on_hover_text(path.display().to_string()).clicked() {
+                            state.ribbon_peek = false;
+                            actions::run_macro_file(state, &path);
+                        }
+                    }
+                });
+            }
+        }
+        ui.separator();
+        if ui.button(t!("pref-browse")).clicked() {
+            state.ribbon_peek = false;
+            actions::run_macro(state);
+        }
+    });
 }
 
 /// Context options for the active tool (options bar).
-/// Options of the pipe and conduit tools: the system (or circuit), the
-/// elevation of the run's start and, for pipes, the fall along it. Changing
-/// the system brings back its defaults.
-fn segment_options(ui: &mut Ui, state: &mut AppState, type_id: cc_core::ElementTypeId, pipe: bool) {
-    let mut system = if pipe { state.mep.system } else { state.mep.circuit };
-    ui.label(if pipe { t!("col-system") } else { t!("prop-circuit") });
-    if crate::systems_dialog::system_combo(ui, state, ("segment-system", pipe), Some(!pipe), &mut system) {
-        if pipe {
-            state.mep.system = system;
-        } else {
-            state.mep.circuit = system;
+/// Options of the pipe, conduit, cable tray and lightning conductor tools:
+/// the system (or circuit), the elevation of the run's start and, for
+/// pipes, the fall along it. Changing the system brings back its defaults.
+fn segment_options(ui: &mut Ui, state: &mut AppState, type_id: cc_core::ElementTypeId, run: Run) {
+    use cc_core::SystemClass as C;
+    let pipe = run == Run::Pipe;
+    let (mut system, classes, label): (_, &[C], _) = match run {
+        Run::Pipe => (state.mep.system, &[C::Plumbing], t!("col-system")),
+        Run::Conduit | Run::Tray => (state.mep.circuit, &[C::Circuit, C::Data], t!("prop-circuit")),
+        Run::Conductor => (state.mep.lightning, &[C::Lightning], t!("col-system")),
+    };
+    ui.label(label);
+    if crate::systems_dialog::system_combo(ui, state, ("segment-system", run as u8), classes, &mut system) {
+        match run {
+            Run::Pipe => state.mep.system = system,
+            Run::Conduit | Run::Tray => state.mep.circuit = system,
+            Run::Conductor => state.mep.lightning = system,
         }
         state.mep.offset = None;
         state.mep.slope = None;
     }
     let project = state.project();
     let kind = system.and_then(|id| project.system(id)).map(|s| s.kind);
-    let default_offset = match (pipe, state.active_level()) {
-        (true, _) => cc_engine::pipe_offset(kind),
-        (false, Some(level)) => cc_engine::conduit_offset(project, level),
-        (false, None) => 2.8,
+    let default_offset = match (run, state.active_level()) {
+        (Run::Pipe, _) => cc_engine::pipe_offset(project, kind),
+        (Run::Conduit, Some(level)) => cc_engine::conduit_offset(project, level),
+        (Run::Tray, Some(level)) => cc_engine::tray_offset(project, level),
+        // Conductors lie on the roof under them unless an elevation is given.
+        (Run::Conductor, _) => 0.0,
+        (_, None) => project.defaults().ceiling,
     };
     let diameter = project.element_type(type_id).and_then(|t| t.diameter()).unwrap_or(0.1);
-    let default_slope =
-        if kind.is_some_and(cc_core::SystemKind::is_drainage) { cc_engine::drain_slope(diameter) * 100.0 } else { 0.0 };
+    let default_slope = if kind.is_some_and(cc_core::SystemKind::is_drainage) {
+        cc_engine::drain_slope(project, diameter) * 100.0
+    } else {
+        0.0
+    };
     ui.label(t!("prop-elevation-offset"));
     let mut offset = state.mep.offset.unwrap_or(default_offset);
     if ui.add(crate::properties::length_drag(&mut offset).speed(0.01)).changed() {
@@ -813,13 +1101,52 @@ fn segment_options(ui: &mut Ui, state: &mut AppState, type_id: cc_core::ElementT
     }
     if pipe {
         ui.label(t!("col-slope"));
-        let mut slope = state.mep.slope.unwrap_or(default_slope);
-        if ui.add(DragValue::new(&mut slope).speed(0.1).range(-20.0..=20.0).suffix(" %")).changed() {
-            state.mep.slope = Some(slope);
+        // Kept in percent; shown and typed in the project's slope unit.
+        let mut slope = state.mep.slope.unwrap_or(default_slope) / 100.0;
+        if ui.add(crate::properties::slope_drag(&mut slope).range(-0.2..=0.2)).changed() {
+            state.mep.slope = Some(slope * 100.0);
         }
     }
     ui.separator();
-    ui.label(theme::muted(if pipe { t!("hint-pipe") } else { t!("hint-conduit") }));
+    let hint = match run {
+        Run::Pipe => t!("hint-pipe"),
+        Run::Conduit => t!("hint-conduit"),
+        Run::Tray => t!("hint-cable-tray"),
+        Run::Conductor => t!("hint-lightning-conductor"),
+    };
+    ui.label(theme::muted(hint));
+}
+
+/// Options of the device tool after the rotation: the circuit of an
+/// electrical device, the cabling (rack) of a data outlet or the lightning
+/// protection system of an air terminal or earth electrode, with a hint.
+fn device_options(ui: &mut Ui, state: &mut AppState, type_id: cc_core::ElementTypeId) {
+    use cc_core::{DeviceKind as D, SystemClass as C};
+    let Some(device) = crate::tools::device_type(state.project(), type_id) else { return };
+    let class = device.class();
+    if device != D::Rack {
+        let (label, mut system) = match class {
+            C::Circuit => (t!("prop-circuit"), state.mep.circuit),
+            C::Data => (t!("device-rack"), state.mep.data),
+            C::Lightning | C::Plumbing => (t!("col-system"), state.mep.lightning),
+        };
+        ui.label(label);
+        if crate::systems_dialog::system_combo(ui, state, ("device-system", type_id.0), &[class], &mut system) {
+            match class {
+                C::Circuit => state.mep.circuit = system,
+                C::Data => state.mep.data = system,
+                C::Lightning | C::Plumbing => state.mep.lightning = system,
+            }
+        }
+    }
+    let hint = match device {
+        D::DataOutlet => t!("hint-data-outlet"),
+        D::Rack => t!("hint-rack"),
+        D::AirTerminal => t!("hint-air-terminal"),
+        D::EarthElectrode => t!("hint-earth-electrode"),
+        _ => t!("hint-device"),
+    };
+    ui.label(theme::muted(hint));
 }
 
 pub fn options_bar(ui: &mut Ui, state: &mut AppState) {
@@ -832,13 +1159,16 @@ pub fn options_bar(ui: &mut Ui, state: &mut AppState) {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 let (r, _) = ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
                 icons::paint(ui.painter(), r, tool_icon(&state.tool), PALETTE.accent_text);
-                let name = crate::i18n::tr(state.tool.key());
+                let name = crate::i18n::tr(state.tool.name_key(state.project()));
                 ui.label(RichText::new(name).family(theme::semibold()).color(PALETTE.accent_text));
             });
         ui.separator();
         if let (Some(category), Some(type_id)) = (state.tool.category(), state.tool.type_id()) {
-            let types: Vec<_> = state.project().types_of(category).map(|t| (t.id, t.name.clone())).collect();
+            let types = crate::tools::tool_types(state.project(), category, type_id, state.tool.material());
             let mut selected = type_id;
+            // Walls: a project without a curtain type gets one from the list.
+            let offer_curtain = category == Category::Wall && !crate::curtain_ui::has_curtain_type(state);
+            let mut new_curtain = false;
             egui::ComboBox::from_id_salt("tool_type")
                 .selected_text(state.project().type_name(type_id).to_string())
                 .width(200.0)
@@ -846,7 +1176,14 @@ pub fn options_bar(ui: &mut Ui, state: &mut AppState) {
                     for (id, name) in types {
                         ui.selectable_value(&mut selected, id, name);
                     }
+                    if offer_curtain {
+                        ui.separator();
+                        new_curtain = ui.selectable_label(false, crate::curtain_ui::new_type_label()).clicked();
+                    }
                 });
+            if new_curtain && let Some(id) = crate::curtain_ui::new_curtain_type(state) {
+                selected = id;
+            }
             if selected != type_id {
                 state.tool = state.tool.with_type(selected);
             }
@@ -901,35 +1238,13 @@ pub fn options_bar(ui: &mut Ui, state: &mut AppState) {
             Tool::Hosted { .. } => {
                 ui.checkbox(&mut state.interaction.flip_hand, t!("prop-flip-hand"));
                 ui.label(theme::muted(t!("hint-hosted")));
+                ui.label(theme::muted(t!("hint-hosted-distance")));
             }
-            Tool::Sketch { category, type_id } => {
-                let n = state.interaction.points.len();
-                if ui.add_enabled(n >= 3, Button::new(t!("sketch-finish"))).clicked()
-                    && let Some(level) = state.active_level()
-                {
-                    let pts = state.interaction.points.clone();
-                    crate::tools::finish_sketch(state, level, category, type_id, pts);
-                }
-                if ui.button(t!("sketch-from-walls")).on_hover_text(t!("hint-from-walls")).clicked() {
-                    match state.active_level() {
-                        Some(level) => {
-                            let outward = if category == Category::Ceiling { -1.0 } else { 1.0 };
-                            match walls_loop(state.project(), level, outward) {
-                                Some(pts) => crate::tools::finish_sketch(state, level, category, type_id, pts),
-                                None => state.message = t!("msg-no-wall-loop"),
-                            }
-                        }
-                        None => state.message = t!("msg-open-plan"),
-                    }
-                }
-                if ui.add_enabled(n > 0, Button::new(t!("action-cancel"))).clicked() {
-                    state.interaction.points.clear();
-                }
-                ui.label(theme::muted(t!("hint-sketch")));
-            }
+            Tool::Sketch { .. } => crate::sketch_mode::options(ui, state),
             Tool::Section => {
                 ui.label(theme::muted(t!("msg-section-hint")));
             }
+            Tool::Callout => crate::callout_ui::options(ui, state),
             Tool::Opening { host, floor } => {
                 let n = state.interaction.points.len();
                 if ui.add_enabled(n >= 3, Button::new(t!("sketch-finish"))).clicked() {
@@ -954,71 +1269,73 @@ pub fn options_bar(ui: &mut Ui, state: &mut AppState) {
                     ui.selectable_value(c, true, t!("dim-continuous")).on_hover_text(t!("dim-continuous-tip"));
                     ui.separator();
                 }
-                let hint = if state.interaction.dim_chain.is_some() {
+                let hint = if state.interaction.dim_chain.is_some_and(|c| c.ordinate) {
+                    t!("hint-dim-ordinate-next")
+                } else if state.interaction.dim_chain.is_some() {
                     t!("hint-dim-chain")
                 } else {
                     crate::i18n::tr(mode.hint_key())
                 };
                 let r = ui.label(theme::muted(hint));
-                if matches!(mode, DimensionMode::Aligned | DimensionMode::Linear) {
+                if matches!(mode, DimensionMode::Aligned | DimensionMode::Linear | DimensionMode::Ordinate) {
                     r.on_hover_text(t!("hint-dim-align"));
                 }
             }
             Tool::Text { .. } => crate::text_tool::options(ui, state, false),
+            Tool::LevelMark { .. } => {
+                ui.label(theme::muted(t!("hint-level-mark")));
+            }
             Tool::AddLeader { .. } => crate::text_tool::options(ui, state, true),
+            Tool::DetailLine => crate::detail_ui::options(ui, state),
+            Tool::DetailComponent { .. } => crate::detail_component_ui::options(ui, state),
             Tool::Column { .. } => {
                 ui.label(theme::muted(t!("hint-column")));
             }
             Tool::Beam { .. } => {
-                ui.label(theme::muted(t!("hint-beam")));
+                // Straight, or arcs through a third point, as walls.
+                let mut arc = state.beam_arc;
+                ui.selectable_value(&mut arc, false, t!("wall-mode-line")).on_hover_text(t!("hint-beam"));
+                ui.selectable_value(&mut arc, true, t!("wall-mode-arc")).on_hover_text(t!("hint-wall-arc"));
+                if arc != state.beam_arc {
+                    state.beam_arc = arc;
+                    state.interaction.points.clear();
+                }
+                ui.separator();
+                ui.label(theme::muted(if state.beam_arc { t!("hint-wall-arc") } else { t!("hint-beam") }));
+            }
+            Tool::Footing { type_id } if crate::tools::is_strip(state.project(), type_id) => {
+                // Strip footings: straight, or arcs through a third point, as walls.
+                let mut arc = state.strip_arc;
+                ui.selectable_value(&mut arc, false, t!("wall-mode-line")).on_hover_text(t!("hint-wall"));
+                ui.selectable_value(&mut arc, true, t!("wall-mode-arc")).on_hover_text(t!("hint-wall-arc"));
+                if arc != state.strip_arc {
+                    state.strip_arc = arc;
+                    state.interaction.points.clear();
+                }
+                ui.separator();
+                ui.label(theme::muted(if state.strip_arc { t!("hint-wall-arc") } else { t!("hint-wall") }));
             }
             Tool::Footing { .. } => {
                 ui.label(theme::muted(t!("hint-footing")));
             }
-            Tool::Truss { .. } => {
-                let o = &mut state.truss;
-                ui.label(t!("prop-truss-height"));
-                ui.add(crate::properties::length_drag(&mut o.height).speed(0.01).range(0.1..=20.0));
-                ui.label(t!("prop-truss-panels"));
-                ui.add(
-                    DragValue::new(&mut o.panels)
-                        .range(0..=100)
-                        .custom_formatter(|n, _| if n < 0.5 { t!("truss-panels-auto") } else { format!("{n:.0}") }),
-                );
-                let current = crate::tools::TRUSS_PATTERNS
-                    .iter()
-                    .find(|(p, _)| *p == o.pattern)
-                    .map_or(String::new(), |(_, key)| crate::i18n::tr(key));
-                egui::ComboBox::from_id_salt("truss-pattern").selected_text(current).show_ui(ui, |ui| {
-                    for (pattern, key) in crate::tools::TRUSS_PATTERNS {
-                        ui.selectable_value(&mut o.pattern, pattern, crate::i18n::tr(key));
-                    }
-                });
-                ui.separator();
-                ui.label(theme::muted(t!("hint-truss")));
-            }
+            Tool::Truss { .. } => crate::truss_ui::tool_options(ui, state),
+            Tool::Bracing { .. } => crate::bracing_ui::tool_options(ui, state),
             Tool::Stair { .. } => crate::stair_ui::tool_options(ui, state),
             Tool::Ramp { .. } => crate::stair_ui::ramp_tool_options(ui, state),
-            Tool::Pipe { type_id } => segment_options(ui, state, type_id, true),
-            Tool::Conduit { type_id } => segment_options(ui, state, type_id, false),
+            Tool::Pipe { type_id } => segment_options(ui, state, type_id, Run::Pipe),
+            Tool::Conduit { type_id } => segment_options(ui, state, type_id, Run::Conduit),
+            Tool::CableTray { type_id } => segment_options(ui, state, type_id, Run::Tray),
+            Tool::LightningConductor { type_id } => segment_options(ui, state, type_id, Run::Conductor),
+            Tool::Valve { .. } => {
+                ui.label(theme::muted(t!("hint-valve")));
+            }
             Tool::Component { type_id } if crate::tools::device_type(state.project(), type_id).is_some() => {
                 ui.label(t!("prop-rotation"));
                 let rotation = &mut state.interaction.rotation;
                 if ui.add(DragValue::new(rotation).speed(1.0).suffix("°")).changed() {
                     *rotation = rotation.rem_euclid(360.0);
                 }
-                ui.label(t!("prop-circuit"));
-                let mut circuit = state.mep.circuit;
-                if crate::systems_dialog::system_combo(
-                    ui,
-                    state,
-                    ("device-circuit", type_id.0),
-                    Some(true),
-                    &mut circuit,
-                ) {
-                    state.mep.circuit = circuit;
-                }
-                ui.label(theme::muted(t!("hint-device")));
+                device_options(ui, state, type_id);
             }
             Tool::Component { .. } => {
                 ui.label(t!("prop-rotation"));
@@ -1074,6 +1391,10 @@ pub fn options_bar(ui: &mut Ui, state: &mut AppState) {
             Tool::Measure => {
                 ui.label(theme::muted(t!("hint-measure")));
             }
+            Tool::PushPull => {
+                let key = if state.interaction.push.is_some() { "hint-push-pull-drag" } else { "hint-push-pull" };
+                ui.label(theme::muted(crate::i18n::tr(key)));
+            }
             Tool::JoinGeometry { unjoin } => {
                 let key = match (state.interaction.targets.is_empty(), unjoin) {
                     (true, _) => "hint-join-pick",
@@ -1081,6 +1402,9 @@ pub fn options_bar(ui: &mut Ui, state: &mut AppState) {
                     (false, true) => "hint-unjoin-second",
                 };
                 ui.label(theme::muted(crate::i18n::tr(key)));
+            }
+            Tool::AttachTop => {
+                ui.label(theme::muted(t!("hint-attach-top")));
             }
             Tool::Paste => {
                 ui.label(theme::muted(t!("hint-paste")));
@@ -1091,11 +1415,38 @@ pub fn options_bar(ui: &mut Ui, state: &mut AppState) {
             Tool::Demolish => {
                 ui.label(theme::muted(t!("hint-demolish")));
             }
+            Tool::CurtainGrid => crate::curtain_ui::options_bar(ui, state),
+            Tool::Paint { remove } => crate::paint_ui::options_bar(ui, state, remove),
             Tool::Mirror { draw } => {
                 ui.checkbox(&mut state.modify.mirror_copy, t!("opt-copy"));
                 ui.label(theme::muted(if draw { t!("hint-mirror-draw") } else { t!("hint-mirror-pick") }));
             }
+            Tool::Sweep { type_id } => {
+                let o = &mut state.sweep;
+                ui.label(t!("prop-base-offset"));
+                ui.add(crate::properties::length_drag(&mut o.base_offset).range(-100.0..=100.0));
+                ui.checkbox(&mut o.closed, t!("opt-sweep-closed"));
+                ui.checkbox(&mut o.flip, t!("opt-sweep-flip"));
+                let n = state.interaction.points.len();
+                let needed = if state.sweep.closed { 3 } else { 2 };
+                if ui.add_enabled(n >= needed, Button::new(t!("sketch-finish"))).clicked()
+                    && let Some(level) = state.active_level()
+                {
+                    crate::tools::finish_sweep(state, level, type_id);
+                }
+                if ui.add_enabled(n > 0, Button::new(t!("action-cancel"))).clicked() {
+                    state.interaction.points.clear();
+                }
+                ui.label(theme::muted(t!("hint-sweep")));
+            }
             Tool::Railing { type_id } => {
+                ui.checkbox(&mut state.railing_host.on, t!("opt-railing-on-host"));
+                if state.railing_host.on {
+                    state.interaction.points.clear();
+                    ui.checkbox(&mut state.railing_host.both, t!("opt-railing-both-sides"));
+                    ui.label(theme::muted(t!("hint-railing-host")));
+                    return;
+                }
                 let n = state.interaction.points.len();
                 if ui.add_enabled(n >= 2, Button::new(t!("sketch-finish"))).clicked()
                     && let Some(level) = state.active_level()
@@ -1132,6 +1483,20 @@ pub fn status_bar(ui: &mut Ui, state: &mut AppState) {
             ui.separator();
         }
         ui.label(theme::muted(&state.message));
+        let rev = (state.active_view, state.session.doc.revision());
+        let cache = egui::Id::new("title-block-error");
+        let error = match ui.data(|d| d.get_temp::<((Option<cc_core::ViewId>, u64), Option<String>)>(cache)) {
+            Some((r, e)) if r == rev => e,
+            _ => {
+                let e = crate::sheet_props::title_block_error(state);
+                ui.data_mut(|d| d.insert_temp(cache, (rev, e.clone())));
+                e
+            }
+        };
+        if let Some(e) = error {
+            ui.separator();
+            ui.label(RichText::new(e).color(PALETTE.warning));
+        }
         if state.updates.available.is_some() {
             ui.separator();
             crate::update::notice(ui, &mut state.updates);
@@ -1154,6 +1519,18 @@ pub fn status_bar(ui: &mut Ui, state: &mut AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_titles_take_their_own_width_and_squeeze_evenly() {
+        let texts = [30.0, 80.0, 50.0];
+        // Room to spare: the full padding, so each tab is its text plus 28.
+        assert_eq!(tab_padding(&texts, 1000.0), TAB_PAD);
+        // A little short: the padding shrinks so the titles just fit.
+        assert_eq!(tab_padding(&texts, 160.0 + 3.0 * 10.0), 10.0);
+        // Far too narrow: never below the least padding.
+        assert_eq!(tab_padding(&texts, 50.0), TAB_PAD_MIN);
+        assert_eq!(tab_padding(&[], f32::NAN), TAB_PAD);
+    }
 
     #[test]
     fn long_labels_wrap_on_two_balanced_lines() {
@@ -1186,6 +1563,39 @@ mod tests {
         }
         // A single long word cannot wrap.
         assert_eq!(lines[4], vec!["Supercalifragilístico"]);
+    }
+
+    #[test]
+    fn labels_also_wrap_after_a_slash_or_a_hyphen() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut lines = Vec::new();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let font = egui::FontId::proportional(12.0);
+            lines = ["Visibilidade/gráficos", "Contra-flecha estrutural", "Importar IFC…"]
+                .map(|l| label_lines(ui, l, &font))
+                .to_vec();
+        });
+        out.textures_delta.clear();
+        // The slash stays at the end of the first line.
+        assert_eq!(lines[0], vec!["Visibilidade/", "gráficos"]);
+        assert_eq!(lines[1].len(), 2);
+        assert_eq!(lines[2], vec!["Importar", "IFC…"]);
+        // Never an empty line: no break before the first or after the last character.
+        assert!(break_points("/a").is_empty());
+        assert!(break_points("a-").is_empty());
+        assert!(break_points(" a ").is_empty());
+        assert_eq!(break_points("a/b c"), vec![(2, 2), (3, 4)]);
+    }
+
+    #[test]
+    fn large_buttons_keep_a_least_width_and_even_padding() {
+        // Short labels share one width, so their icons stand evenly apart.
+        assert_eq!(button_width(20.0, 0.0), BUTTON_MIN_WIDTH);
+        assert_eq!(button_width(40.0, 0.0), BUTTON_MIN_WIDTH);
+        // Longer ones get the same room at each side.
+        assert_eq!(button_width(70.0, 0.0), 70.0 + 2.0 * BUTTON_PAD);
+        assert_eq!(button_width(70.0, 11.0), 81.0 + 2.0 * BUTTON_PAD);
     }
 
     #[test]

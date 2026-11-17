@@ -1,14 +1,15 @@
-//! The networks formed by pipes and conduits: where runs meet (their ends
-//! within a centimeter, or an end on another run), the fittings there, and
-//! the fixtures and devices attached to the networks' nodes.
+//! The networks formed by pipes, conduits and cable trays: where runs meet
+//! (their ends within a centimeter, or an end on another run), the fittings
+//! there, the valves on pipes (each a node on its pipe's run) and the
+//! fixtures and devices attached to the networks' nodes.
 //!
 //! Pipes connect only to pipes of the same system; conduits connect to any
-//! conduit (they meet in boxes). Fittings are derived like wall joins: an
-//! elbow where two runs turn, a coupling (or a reducer, between diameters)
-//! where they continue straight, a tee where three branches meet and a
-//! cross from four.
+//! conduit (they meet in boxes), cable trays to any cable tray. Fittings
+//! are derived like wall joins: an elbow where two runs turn, a coupling
+//! (or a reducer, between diameters or tray widths) where they continue
+//! straight, a tee where three branches meet and a cross from four.
 
-use crate::SegmentGeom;
+use crate::{SegmentGeom, ValveGeom};
 use cc_core::{Category, ElementId, ElementKind, LevelId, MepData, Project, SystemId};
 use glam::{DVec2, DVec3};
 use std::collections::{BTreeMap, HashMap};
@@ -108,21 +109,36 @@ pub struct NetEdge {
     pub length: f64,
 }
 
-/// The pipe and conduit networks of a project.
+/// The pipe, conduit and cable tray networks of a project.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MepNetwork {
     pub nodes: Vec<NetNode>,
     pub edges: Vec<NetEdge>,
     pub fittings: Vec<Fitting>,
-    /// Fixtures (on pipe nodes) and devices (on conduit nodes) attached to the networks.
+    /// Valves, each on the node of its pipe where it sits.
+    pub valves: Vec<(ElementId, usize)>,
+    /// Fixtures (on pipe nodes), devices (on conduit nodes) and air terminals
+    /// and earth electrodes (on lightning conductor nodes) attached to the networks.
     pub attached: Vec<(ElementId, usize)>,
 }
 
-/// Which runs may connect: pipes of one system, all conduits.
+/// The runs that serve a family of systems: pipes, conduits or lightning conductors.
+fn category_of(class: cc_core::SystemClass) -> Category {
+    match class {
+        cc_core::SystemClass::Plumbing => Category::Pipe,
+        cc_core::SystemClass::Circuit | cc_core::SystemClass::Data => Category::Conduit,
+        cc_core::SystemClass::Lightning => Category::LightningConductor,
+    }
+}
+
+/// Which runs may connect: pipes of one system, all conduits, all cable
+/// trays, all lightning conductors.
 fn group(e: &cc_core::Element) -> Option<(Category, Option<SystemId>)> {
     match &e.kind {
         ElementKind::Pipe(s) => Some((Category::Pipe, s.system())),
         ElementKind::Conduit(_) => Some((Category::Conduit, None)),
+        ElementKind::CableTray(_) => Some((Category::CableTray, None)),
+        ElementKind::LightningConductor(_) => Some((Category::LightningConductor, None)),
         _ => None,
     }
 }
@@ -136,7 +152,11 @@ fn cell(p: DVec3) -> (i64, i64, i64) {
 }
 
 impl MepNetwork {
-    pub fn build(project: &Project, segments: &BTreeMap<ElementId, SegmentGeom>) -> Self {
+    pub fn build(
+        project: &Project,
+        segments: &BTreeMap<ElementId, SegmentGeom>,
+        valves: &BTreeMap<ElementId, ValveGeom>,
+    ) -> Self {
         let mut net = MepNetwork::default();
         // Nodes per group, found through a grid of TOL cells.
         let mut grid: HashMap<GridKey, Vec<usize>> = HashMap::new();
@@ -205,6 +225,32 @@ impl MepNetwork {
                 }
             }
         }
+        // Valves: a node on their pipe's run where they sit (a node already there within TOL).
+        let mut run_of: std::collections::HashMap<ElementId, usize> = std::collections::HashMap::new();
+        for (i, r) in runs.iter().enumerate() {
+            run_of.entry(r.0.element).or_insert(i);
+        }
+        for v in valves.values() {
+            let Some((g, category, system, level)) = run_of.get(&v.host).and_then(|i| runs.get(*i)) else { continue };
+            let d = g.b - g.a;
+            let len2 = d.length_squared();
+            if len2 < 1e-12 {
+                continue;
+            }
+            let t = ((v.point - g.a).dot(d) / len2).clamp(0.0, 1.0);
+            let list = along.entry(g.element).or_default();
+            let n = match list.iter().find(|(_, m)| net.nodes.get(*m).is_some_and(|x| x.point.distance(v.point) <= TOL))
+            {
+                Some(&(_, m)) => m,
+                None => {
+                    net.nodes.push(NetNode { point: v.point, category: *category, system: *system, level: *level });
+                    let n = net.nodes.len() - 1;
+                    list.push((t, n));
+                    n
+                }
+            };
+            net.valves.push((v.element, n));
+        }
         // Edges along each run, between consecutive nodes.
         let mut branches: Vec<Vec<(ElementId, DVec3, f64)>> = vec![Vec::new(); net.nodes.len()];
         for (g, ..) in &runs {
@@ -262,7 +308,7 @@ impl MepNetwork {
             let connectors = crate::component_connectors(project, e);
             if !connectors.is_empty() {
                 for k in connectors {
-                    let category = if k.system.is_electrical() { Category::Conduit } else { Category::Pipe };
+                    let category = category_of(k.system.class());
                     let near = net
                         .nodes
                         .iter()
@@ -280,7 +326,7 @@ impl MepNetwork {
             }
             let category = match project.mep_data(e) {
                 Some(MepData::Fixture { .. }) => Category::Pipe,
-                Some(MepData::Device { .. }) => Category::Conduit,
+                Some(MepData::Device { device, .. }) => category_of(device.class()),
                 None => continue,
             };
             let z = project.level_elevation(e.level) + c.base_offset;
@@ -298,7 +344,7 @@ impl MepNetwork {
                     }
                 }
             }
-            if category == Category::Conduit {
+            if category != Category::Pipe {
                 if let Some((_, n)) = best.values().min_by(|a, b| a.0.total_cmp(&b.0)) {
                     net.attached.push((e.id, *n));
                 }
@@ -348,6 +394,8 @@ mod tests {
                 kind,
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             });
             id
         })
@@ -411,5 +459,60 @@ mod tests {
         assert_eq!(found.len(), 3, "{found:?}");
         assert!(found.contains(&elbow(ground)) && found.contains(&elbow(first)), "{found:?}");
         assert!(found.contains(&(first, FittingKind::Tee)), "{found:?}");
+    }
+
+    fn add_type(doc: &mut Document, data: cc_core::TypeData) {
+        doc.edit("t", |e| {
+            let id = cc_core::ElementTypeId(e.alloc_id());
+            e.add_type(cc_core::ElementType {
+                id,
+                name: "t".into(),
+                data,
+                info: Default::default(),
+                uid: Default::default(),
+            })
+        });
+    }
+
+    #[test]
+    fn cable_trays_join_trays_only() {
+        let mut doc = Document::new(Project::from_template());
+        let tray = cc_core::TypeData::CableTray {
+            width: 0.3,
+            height: 0.1,
+            style: cc_core::TrayStyle::SolidBottom,
+            material: String::new(),
+        };
+        add_type(&mut doc, tray);
+        add(&mut doc, ElementKind::CableTray(run([0.0, 0.0], [4.0, 0.0], 2.5)), Category::CableTray);
+        add(&mut doc, ElementKind::CableTray(run([4.0, 0.0], [4.0, 3.0], 2.5)), Category::CableTray);
+        // A conduit ending at the corner: it meets no tray.
+        add(&mut doc, ElementKind::Conduit(run([4.0, 0.0], [6.0, 0.0], 2.5)), Category::Conduit);
+        let geom = crate::ModelGeometry::build(&doc.project);
+        assert_eq!(geom.mep.fittings.len(), 1);
+        let f = &geom.mep.fittings[0];
+        assert_eq!(f.category, Category::CableTray);
+        assert!(matches!(f.kind, FittingKind::Elbow { angle } if (angle - 90.0).abs() < 1e-6));
+        assert!((f.diameter() - 0.3).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_valve_is_a_node_on_its_pipe() {
+        let mut doc = Document::new(Project::from_template());
+        add_type(&mut doc, cc_core::TypeData::Valve { kind: cc_core::ValveKind::Ball, material: String::new() });
+        let pipe = add(&mut doc, ElementKind::Pipe(run([0.0, 0.0], [4.0, 0.0], 0.5)), Category::Pipe);
+        let valve = add(&mut doc, ElementKind::Valve(cc_core::Valve { host: pipe, at: 1.0 }), Category::Valve);
+        let geom = crate::ModelGeometry::build(&doc.project);
+        assert!(geom.mep.fittings.is_empty());
+        assert_eq!(geom.mep.edges.len(), 2);
+        let &(id, node) = geom.mep.valves.first().unwrap();
+        assert_eq!(id, valve);
+        assert!(geom.mep.nodes[node].point.distance(DVec3::new(1.0, 0.0, 0.5)) < 1e-9);
+        let lengths: Vec<f64> = geom.mep.edges.iter().map(|e| e.length).collect();
+        assert!((lengths[0] - 1.0).abs() < 1e-9 && (lengths[1] - 3.0).abs() < 1e-9, "{lengths:?}");
+        assert_eq!(geom.solids_of(valve).count(), 1);
+        // Deleting the pipe deletes its valve.
+        doc.edit("t", |e| e.remove_element(pipe));
+        assert!(doc.project.element(valve).is_none());
     }
 }

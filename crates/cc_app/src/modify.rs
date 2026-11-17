@@ -28,11 +28,29 @@ pub struct ModifyOptions {
     pub angle: f64,
     /// Offset distance, meters.
     pub offset: f64,
+    /// Elevation of the next terrain point a sketch places, meters above
+    /// the level (kept from one sketch to the next).
+    pub point_elevation: f64,
+    /// Elevation of the next building pad sketched, meters above the level.
+    pub pad_elevation: f64,
+    /// The face of the walls a sketch's *From Walls* follows (`None`: the
+    /// outside finish faces, the inside ones for ceilings).
+    pub wall_face: Option<cc_core::LocationLine>,
 }
 
 impl Default for ModifyOptions {
     fn default() -> Self {
-        Self { multiple: true, rotate_copy: false, mirror_copy: true, count: 3, angle: 90.0, offset: 1.0 }
+        Self {
+            multiple: true,
+            rotate_copy: false,
+            mirror_copy: true,
+            count: 3,
+            angle: 90.0,
+            offset: 1.0,
+            point_elevation: 0.0,
+            pad_elevation: 0.0,
+            wall_face: None,
+        }
     }
 }
 
@@ -76,7 +94,7 @@ fn hint_key(tool: &Tool) -> &'static str {
 /// The selection's linework, transformed (for previews).
 fn ghost(drawing: &Drawing2D, ids: &BTreeSet<ElementId>, t: &PlanTransform) -> Drawing2D {
     let mut d = Drawing2D::default();
-    for p in &drawing.prims {
+    for p in drawing.prims_of(ids).into_iter().filter_map(|i| drawing.prims.get(i)) {
         match p {
             Prim::Line { a, b, style, element: Some(e), .. } if ids.contains(e) => {
                 d.line(t.apply(*a), t.apply(*b), *style, Some(*e));
@@ -104,7 +122,7 @@ pub(crate) fn paint_ghost(
 
 /// Center of the selection's linework.
 fn center_of(drawing: &Drawing2D, ids: &BTreeSet<ElementId>) -> Option<DVec2> {
-    let pts = drawing.prims.iter().flat_map(|p| match p {
+    let pts = drawing.prims_of(ids).into_iter().filter_map(|i| drawing.prims.get(i)).flat_map(|p| match p {
         Prim::Line { a, b, element: Some(e), .. } if ids.contains(e) => vec![*a, *b],
         _ => Vec::new(),
     });
@@ -361,10 +379,24 @@ pub(crate) fn apply_mirror(state: &mut AppState, targets: &BTreeSet<ElementId>, 
     finish(state, if copy { result } else { ids });
 }
 
-/// The linear element (wall, beam, grid) under the pointer, and its line.
+/// The linear element (wall, beam, grid) or detail line under the
+/// pointer, and its line (a detail line's chord). Outside plans only
+/// detail lines are picked: the view's coordinates are not the plan's.
 fn linear_at(state: &AppState, drawing: &Drawing2D, raw: DVec2, tol: f64) -> Option<(ElementId, (DVec2, DVec2))> {
     let id = drawing.hit_test(raw, tol)?;
-    let line = state.project().element(id).and_then(cc_core::wall_ops::line_of)?;
+    let e = state.project().element(id)?;
+    if let ElementKind::DetailLine(l) = &e.kind {
+        let pts = l.curve.points();
+        return Some((id, (*pts.first()?, *pts.last()?)));
+    }
+    let plan = state
+        .active_view
+        .and_then(|v| state.project().view(v))
+        .is_some_and(|v| matches!(v.kind, cc_core::ViewKind::FloorPlan { .. } | cc_core::ViewKind::CeilingPlan { .. }));
+    if !plan {
+        return None;
+    }
+    let line = cc_core::wall_ops::line_of(e)?;
     Some((id, line))
 }
 
@@ -373,6 +405,39 @@ fn linear_at(state: &AppState, drawing: &Drawing2D, raw: DVec2, tol: f64) -> Opt
 pub(crate) fn alignable(state: &AppState, id: ElementId) -> bool {
     let line = state.project().element(id).and_then(cc_core::wall_ops::line_of).is_some();
     line || !state.session.geom().plan_edges(id).is_empty()
+}
+
+/// The plan line Align uses when element `id` is picked at `at`, as the
+/// engine does: the face or side nearest to the pick, else its location line.
+pub(crate) fn align_edge(state: &AppState, id: ElementId, at: DVec2) -> Option<(DVec2, DVec2)> {
+    match cc_engine::commands::modify::align_line(state.project(), state.session.geom(), id, Some(at)) {
+        Some(cc_core::wall_ops::Path::Line(a, b)) => Some((a, b)),
+        _ => None,
+    }
+}
+
+/// The color of Align's reference line.
+const ALIGN_REFERENCE: egui::Color32 = egui::Color32::from_rgb(220, 38, 38);
+
+/// Align's feedback: the line under the pointer that a click picks, and
+/// once the reference is chosen, its line across the view, dashed in red.
+fn align_feedback(painter: &Painter, xf: &Xf, state: &AppState, hovered: Option<ElementId>, raw: DVec2) {
+    let first = state.interaction.targets.first().copied();
+    let first_pick = state.interaction.points.first().copied();
+    if let (Some(r), Some(rp)) = (first, first_pick)
+        && let Some((a, b)) = align_edge(state, r, rp)
+    {
+        let reach = (painter.clip_rect().size().length() as f64 / xf.scale.max(1e-9)).max(1.0);
+        let d = (b - a).normalize_or_zero() * reach;
+        let line = [xf.to_screen(a - d), xf.to_screen(b + d)];
+        painter.extend(egui::Shape::dashed_line(&line, Stroke::new(1.5, ALIGN_REFERENCE), 8.0, 5.0));
+        painter.line_segment([xf.to_screen(a), xf.to_screen(b)], Stroke::new(3.0, ALIGN_REFERENCE));
+    }
+    if let Some(id) = hovered
+        && let Some((a, b)) = align_edge(state, id, raw)
+    {
+        painter.line_segment([xf.to_screen(a), xf.to_screen(b)], Stroke::new(3.0, PREVIEW));
+    }
 }
 
 /// Align `id` (picked at `pick`) onto `reference` (picked at `reference_pick`), in plan.
@@ -408,6 +473,83 @@ pub fn join_tool(resp: &Response, painter: &Painter, state: &mut AppState, xf: &
     paint_ghost(painter, xf, drawing, &lit, &PlanTransform::IDENTITY);
     if resp.clicked() {
         join_pick(state, hovered, unjoin);
+    }
+}
+
+/// Attach Top: the selected walls wait for a click on the roof, ceiling or
+/// floor their tops attach to.
+pub fn start_attach(state: &mut AppState) {
+    let walls: Vec<ElementId> = state
+        .selection
+        .iter()
+        .copied()
+        .filter(|id| matches!(state.project().element(*id).map(|e| &e.kind), Some(cc_core::ElementKind::Wall(_))))
+        .collect();
+    state.set_tool(Tool::AttachTop);
+    state.interaction.targets = walls;
+    state.message = t!("hint-attach-top");
+}
+
+/// Whether `id` is something a wall's top attaches to.
+pub fn attach_target(state: &AppState, id: ElementId) -> bool {
+    state.project().element(id).is_some_and(|e| {
+        matches!(
+            e.kind,
+            cc_core::ElementKind::Roof(_) | cc_core::ElementKind::Ceiling(_) | cc_core::ElementKind::Floor(_)
+        )
+    })
+}
+
+/// The Attach Top tool: the roof, ceiling or floor under the pointer is
+/// highlighted, and a click attaches the walls' tops to it.
+pub fn attach_tool(resp: &Response, painter: &Painter, state: &mut AppState, xf: &Xf, drawing: &Drawing2D) {
+    let Some(raw) = resp.hover_pos().map(|p| xf.to_world(p)) else { return };
+    let hovered = drawing.hit_test(raw, 6.0 / xf.scale).filter(|id| attach_target(state, *id));
+    let mut lit: BTreeSet<ElementId> = state.interaction.targets.iter().copied().collect();
+    lit.extend(hovered);
+    paint_ghost(painter, xf, drawing, &lit, &PlanTransform::IDENTITY);
+    if resp.clicked()
+        && let Some(target) = hovered
+    {
+        attach_to(state, target);
+    }
+}
+
+/// A click of the Attach Top tool in a 3D view on `picked`: a roof, ceiling
+/// or floor takes the walls' tops; anything else repeats the hint.
+pub(crate) fn attach_pick(state: &mut AppState, picked: Option<ElementId>) {
+    match picked.filter(|id| attach_target(state, *id)) {
+        Some(target) => attach_to(state, target),
+        None => state.message = t!("hint-attach-top"),
+    }
+}
+
+/// Attach the walls the tool holds to `target`, then go back to selecting them.
+pub(crate) fn attach_to(state: &mut AppState, target: ElementId) {
+    let walls = std::mem::take(&mut state.interaction.targets);
+    if walls.is_empty() {
+        return;
+    }
+    let ids = walls.iter().map(|id| id.0).collect();
+    let command = cc_engine::commands::modify::WallAttach { ids, top: Some(target.0), detach: false };
+    if crate::actions::run_command(state, command).is_some() {
+        state.set_tool(Tool::Select);
+        state.selection = walls.into_iter().collect();
+    }
+}
+
+/// Detach Top: the selected walls keep their own tops again.
+pub fn detach_tops(state: &mut AppState) {
+    let ids: Vec<u64> = state
+        .selection
+        .iter()
+        .filter(|id| {
+            matches!(state.project().element(**id).map(|e| &e.kind), Some(cc_core::ElementKind::Wall(w)) if w.attach_top.is_some())
+        })
+        .map(|id| id.0)
+        .collect();
+    if !ids.is_empty() {
+        crate::actions::run_command(state, cc_engine::commands::modify::WallAttach { ids, top: None, detach: true });
     }
 }
 
@@ -454,6 +596,9 @@ fn pick_tool(resp: &Response, painter: &Painter, state: &mut AppState, xf: &Xf, 
     let mut lit: BTreeSet<ElementId> = first.into_iter().collect();
     lit.extend(hovered_id);
     paint_ghost(painter, xf, drawing, &lit, &PlanTransform::IDENTITY);
+    if *tool == Tool::Align {
+        align_feedback(painter, xf, state, hovered_id, raw);
+    }
     let clicked = resp.clicked();
     // Pinned elements are not edited (offset only copies, so it may pick them).
     let pinned = |state: &AppState, id: ElementId| state.project().is_pinned(id);
@@ -503,6 +648,9 @@ fn pick_tool(resp: &Response, painter: &Painter, state: &mut AppState, xf: &Xf, 
         }
         Tool::Split => {
             let Some((id, (a, b))) = hovered else { return };
+            if crate::detail_ui::split_pick(painter, xf, state, id, raw, clicked) {
+                return;
+            }
             let dir = (b - a).normalize_or_zero();
             let p = a + dir * (raw - a).dot(dir);
             let n = dir.perp() * (8.0 / xf.scale);
@@ -529,6 +677,10 @@ fn pick_tool(resp: &Response, painter: &Painter, state: &mut AppState, xf: &Xf, 
         }
         Tool::Offset => {
             let Some((id, (a, b))) = hovered else { return };
+            let distance = state.modify.offset;
+            if crate::detail_ui::offset_pick(painter, xf, state, id, raw, distance, clicked) {
+                return;
+            }
             let n = (b - a).normalize_or_zero().perp();
             let side = if (raw - a).dot(n) >= 0.0 { 1.0 } else { -1.0 };
             let d = state.modify.offset.abs() * side;

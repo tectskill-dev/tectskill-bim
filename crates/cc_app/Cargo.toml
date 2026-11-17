@@ -1,6 +1,6 @@
 [package]
 name = "cc_app"
-description = "ConstructCAD desktop application"
+description = "ConstructCraft desktop application"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -19,8 +19,11 @@ cc_core.workspace = true
 cc_geom.workspace = true
 cc_views.workspace = true
 cc_render.workspace = true
+cc_raytracing.workspace = true
 cc_ifc.workspace = true
 cc_engine.workspace = true
+cc_plugins.workspace = true
+cc_script.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
@@ -36,6 +39,7 @@ sys-locale.workspace = true
 env_logger.workspace = true
 resvg.workspace = true
 ureq.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

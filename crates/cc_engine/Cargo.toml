@@ -1,6 +1,7 @@
 [package]
+autotests = false
 name = "cc_engine"
-description = "ConstructCAD engine: every user-facing operation as a named command, without a GUI"
+description = "ConstructCraft engine: every user-facing operation as a named command, without a GUI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,8 +11,13 @@ repository.workspace = true
 [dependencies]
 cc_core.workspace = true
 cc_geom.workspace = true
+cc_script.workspace = true
+mlua.workspace = true
 cc_views.workspace = true
+cc_raytracing.workspace = true
 cc_ifc.workspace = true
+cc_cad.workspace = true
+cc_skp.workspace = true
 glam.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,3 +26,10 @@ sys-locale.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+image.workspace = true
+
+[[test]]
+name = "main"
+path = "tests/main.rs"

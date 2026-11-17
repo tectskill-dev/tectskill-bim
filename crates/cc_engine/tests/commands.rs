@@ -28,7 +28,7 @@ fn scratch(name: &str) -> std::path::PathBuf {
 #[test]
 fn catalog_is_well_formed() {
     let commands = catalog();
-    let mut names: Vec<&str> = commands.iter().map(|c| c.name).collect();
+    let mut names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
     names.sort();
     names.dedup();
     assert_eq!(names.len(), commands.len(), "duplicate command names");
@@ -41,13 +41,50 @@ fn catalog_is_well_formed() {
     }
 }
 
+/// The places in a schema that JSON Schema 2020-12 (which MCP clients and model APIs validate
+/// tool schemas against) rejects although draft 7 accepts them: `items` as an array (tuples) and
+/// `additionalItems`.
+fn not_2020_12(path: &str, v: &Value, found: &mut Vec<String>) {
+    match v {
+        Value::Object(o) => {
+            for (k, child) in o {
+                let at = format!("{path}/{k}");
+                // A `properties` map's keys are parameter names, not keywords.
+                if k != "properties"
+                    && ((k == "items" && !(child.is_object() || child.is_boolean())) || k == "additionalItems")
+                {
+                    found.push(at.clone());
+                }
+                not_2020_12(&at, child, found);
+            }
+        }
+        Value::Array(a) => {
+            for (i, child) in a.iter().enumerate() {
+                not_2020_12(&format!("{path}/{i}"), child, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every parameter schema is valid under JSON Schema 2020-12 as well as draft 7, so MCP clients
+/// load every tool (tuples once made `curtain_grid_set` invalid).
+#[test]
+fn schemas_are_valid_under_2020_12() {
+    let mut found = Vec::new();
+    for c in catalog() {
+        not_2020_12(&c.name, &c.input_schema, &mut found);
+    }
+    assert!(found.is_empty(), "schemas 2020-12 rejects: {found:#?}");
+}
+
 /// Every command answers empty or wrong arguments with an error value, never a panic.
 #[test]
 fn every_command_survives_bad_arguments() {
     for c in catalog() {
         for args in [json!({}), json!({"bogus": 1}), json!([1, 2]), json!({"id": 999_999, "ids": [999_999]})] {
             let mut s = Session::default();
-            if let Err(e) = s.execute(c.name, args.clone()) {
+            if let Err(e) = s.execute(&c.name, args.clone()) {
                 assert_ne!(e.code, ErrorCode::Internal, "{} with {args}: {}", c.name, e.message);
                 assert_ne!(e.code, ErrorCode::UnknownCommand);
             }
@@ -252,16 +289,14 @@ fn a_house_through_commands() {
     run(&mut s, "view_export", json!({"view": id_of("floor_plan"), "path": b, "dpi": 80}));
     let (wa, wb) = (png_size(&std::fs::read(&a).unwrap()).0, png_size(&std::fs::read(&b).unwrap()).0);
     assert!((wb as i64 - 2 * wa as i64).abs() <= 1, "{wa} {wb}");
-    // Schedules have no drawing; absurd resolutions and unknown formats are refused.
+    // Schedules export as their table; absurd resolutions and unknown formats are refused.
     let bad = |file: &str, extra: Value| {
         let mut args = json!({"view": id_of("floor_plan"), "path": scratch(file)});
         args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         args
     };
-    assert_eq!(
-        fails(&mut s, "view_export", json!({"view": schedule["id"], "path": scratch("x.png")})),
-        ErrorCode::InvalidArguments
-    );
+    let table = run(&mut s, "view_export", json!({"view": schedule["id"], "path": scratch("x.png"), "dpi": 50}));
+    assert_eq!(table["format"], "png");
     assert_eq!(fails(&mut s, "view_export", bad("x.png", json!({"dpi": 1e6}))), ErrorCode::InvalidArguments);
     assert_eq!(fails(&mut s, "view_export", bad("x.png", json!({"dpi": 0}))), ErrorCode::InvalidArguments);
     assert_eq!(fails(&mut s, "view_export", bad("x.bmp", json!({}))), ErrorCode::InvalidArguments);
@@ -295,7 +330,7 @@ fn queries_change_nothing() {
     let mut s = Session::default();
     let revision = s.doc.revision();
     for c in catalog().into_iter().filter(|c| c.kind == CommandKind::Query) {
-        let _ = s.execute(c.name, json!({}));
+        let _ = s.execute(&c.name, json!({}));
     }
     assert_eq!(s.doc.revision(), revision);
 }
@@ -435,6 +470,121 @@ fn a_dimension_chain_shares_one_line_and_follows_its_elements() {
 }
 
 #[test]
+fn imperial_units_show_feet_and_inches_and_survive_a_save() {
+    let mut s = Session::default();
+    let units = run(&mut s, "units_set", json!({"preset": "imperial"}));
+    assert_eq!(units["length"]["unit"], "FeetInches");
+    assert_eq!(units["length"]["decimals"], 4);
+    assert_eq!(units["area"]["unit"], "SquareFoot");
+    // Values merge over the preset: precision to 1/8".
+    let units = run(&mut s, "units_set", json!({"preset": "imperial", "values": {"length": {"decimals": 3}}}));
+    assert_eq!(units["length"]["decimals"], 3);
+    // A 12'-6" wall: lengths are still meters in the model and the commands.
+    let wall = run(&mut s, "wall_create", json!({"start": [0, 0], "end": [3.81, 0]}));
+    let end = run(&mut s, "element_get", json!({"id": wall["id"]}))["params"]["end"][0].as_f64().unwrap();
+    assert!((end - 3.81).abs() < 1e-12);
+    // A schedule shows feet and inches, areas in square feet.
+    let schedule = run(&mut s, "view_create", json!({"kind": "schedule", "category": "wall"}));
+    let table = run(&mut s, "schedule_table", json!({"view": schedule["id"]})).to_string();
+    assert!(table.contains("12'-6\\\""), "{table}");
+    assert!(table.contains("ft²"), "{table}");
+    // Saved and reopened, the project keeps its units.
+    let path = scratch("imperial.ccad");
+    run(&mut s, "project_save", json!({"path": path}));
+    let mut reopened = Session::default();
+    run(&mut reopened, "project_open", json!({"path": path}));
+    assert_eq!(run(&mut reopened, "units_get", json!({}))["length"]["unit"], "FeetInches");
+    // Back to metric; unknown presets and units are refused.
+    let units = run(&mut s, "units_set", json!({"preset": "metric"}));
+    assert_eq!(units["length"]["unit"], "Meter");
+    assert_eq!(fails(&mut s, "units_set", json!({"preset": "nautical"})), ErrorCode::InvalidArguments);
+    assert_eq!(
+        fails(&mut s, "units_set", json!({"values": {"length": {"unit": "Furlong"}}})),
+        ErrorCode::InvalidArguments
+    );
+}
+
+#[test]
+fn ordinate_dimensions_show_running_totals_and_follow_the_model() {
+    let mut s = Session::default();
+    let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/casa_simples.ccad");
+    run(&mut s, "project_open", json!({"path": sample}));
+    let plan = run(&mut s, "views_list", json!({"category": "floor_plan"}))[0]["id"].clone();
+    // A row of 20 cm studs (columns) far from the house; the origin is the first one's left face.
+    let studs: Vec<Value> =
+        [50.0, 50.6, 51.2, 52.4].iter().map(|x| run(&mut s, "column_create", json!({"position": [x, 50.0]}))).collect();
+    let depth = s.doc.undo_depth();
+    let out = run(
+        &mut s,
+        "dimension_ordinate_create",
+        json!({"view": plan, "points": [[49.9, 50.0], [50.5, 50.0], [51.1, 50.05], [52.3, 50.0]], "offset": -1.0}),
+    );
+    assert_eq!(out["count"], 3);
+    assert_eq!(s.doc.undo_depth(), depth + 1, "one undo step");
+    let f = |v: &Value| v.as_f64().unwrap();
+    let get = |s: &mut Session, id: &Value| run(s, "element_get", json!({"id": id}))["params"].clone();
+    let total = |p: &Value| f(&p["b"][0]) - f(&p["a"][0]);
+    for (id, value) in out["ids"].as_array().unwrap().iter().zip([0.6, 1.2, 2.4]) {
+        let p = get(&mut s, id);
+        assert_eq!(p["kind"]["Ordinate"]["dir"], json!([1.0, 0.0]), "{p}");
+        // One origin and one line for the whole set.
+        assert_eq!(p["a"], json!([49.9, 50.0]), "{p}");
+        assert!((f(&p["offset"]) + 1.0).abs() < 1e-9, "{p}");
+        assert!((total(&p) - value).abs() < 1e-9, "{p}");
+        assert_eq!(p["refs"][0]["target"]["Element"], studs[0]["id"], "{p}");
+    }
+    // Moving the origin's stud moves every total; moving one stud only its own.
+    run(&mut s, "elements_move", json!({"ids": [studs[0]["id"]], "delta": [-0.1, 0.0]}));
+    let p = get(&mut s, &out["ids"][2]);
+    assert!((total(&p) - 2.5).abs() < 1e-9, "{p}");
+    run(&mut s, "elements_move", json!({"ids": [studs[2]["id"]], "delta": [0.2, 0.0]}));
+    assert!((total(&get(&mut s, &out["ids"][1])) - 1.5).abs() < 1e-9);
+    assert!((total(&get(&mut s, &out["ids"][2])) - 2.5).abs() < 1e-9);
+    // A new value moves the stud at the point, never the origin.
+    run(&mut s, "dimension_set_value", json!({"id": out["ids"][1], "value": 1.3}));
+    let x = f(&run(&mut s, "element_get", json!({"id": studs[2]["id"]}))["params"]["position"][0]);
+    assert!((x - 51.2).abs() < 1e-9, "{x}");
+    let x0 = f(&run(&mut s, "element_get", json!({"id": studs[0]["id"]}))["params"]["position"][0]);
+    assert!((x0 - 49.9).abs() < 1e-9, "{x0}");
+    // Mirrored with its studs, the set keeps measuring from the same (mirrored) origin.
+    let mut ids: Vec<Value> = studs.iter().map(|c| c["id"].clone()).collect();
+    ids.extend(out["ids"].as_array().unwrap().iter().cloned());
+    let copy = run(&mut s, "elements_mirror", json!({"ids": ids, "axis": [[60.0, 0.0], [60.0, 1.0]], "copy": true}));
+    let copies: Vec<Value> = copy["created"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| run(&mut s, "element_get", json!({"id": id})))
+        .filter(|e| e["category"] == "dimension")
+        .collect();
+    assert_eq!(copies.len(), 3);
+    for (c, value) in copies.iter().zip([0.7, 1.3, 2.5]) {
+        let p = &c["params"];
+        assert!((f(&p["a"][0]) - 70.2).abs() < 1e-9, "{p}");
+        assert!((total(p) + value).abs() < 1e-9, "{p}");
+        assert!(p["refs"][0].is_object() && p["refs"][1].is_object(), "{p}");
+    }
+    // `dimension_create` places a single one; `angle` measures along any direction.
+    let one = run(&mut s, "dimension_create", json!({"view": plan, "a": [0, 100], "b": [0, 103], "kind": "ordinate"}));
+    assert_eq!(get(&mut s, &one["id"])["kind"]["Ordinate"]["dir"], json!([0.0, 1.0]));
+    let out =
+        run(&mut s, "dimension_ordinate_create", json!({"view": plan, "points": [[200, 0], [201, 2]], "angle": 90.0}));
+    assert_eq!(get(&mut s, &out["ids"][0])["kind"]["Ordinate"]["dir"], json!([0.0, 1.0]));
+
+    // Bad sets are refused and change nothing.
+    let depth = s.doc.undo_depth();
+    for args in [
+        json!({"view": plan, "points": [[0, 0]]}),
+        json!({"view": plan, "points": [[0, 0], [2, 0], [0, 3]], "direction": "horizontal"}),
+        json!({"view": plan, "points": [[0, 0], [2, 0]], "direction": "sideways"}),
+        json!({"view": plan, "points": [[0, 0], [0, 0]]}),
+    ] {
+        assert_eq!(fails(&mut s, "dimension_ordinate_create", args), ErrorCode::InvalidArguments);
+    }
+    assert_eq!(s.doc.undo_depth(), depth);
+}
+
+#[test]
 fn turning_and_pinned_elements() {
     let mut s = Session::default();
     let wall = run(&mut s, "wall_create", json!({"start": [0, 0], "end": [6, 0]}));
@@ -455,6 +605,23 @@ fn turning_and_pinned_elements() {
     assert_eq!(moved["pinned_skipped"], json!([wall["id"]]));
 }
 
+/// A door raised above the wall's base (#70): the opening in the wall
+/// moves up with it, and the head is the raised sill plus the door's height.
+#[test]
+fn raised_doors_cut_their_wall_higher() {
+    let mut s = Session::default();
+    let wall = run(&mut s, "wall_create", json!({"start": [0, 0], "end": [5, 0]}));
+    let door = run(&mut s, "door_create", json!({"wall": wall["id"]}));
+    let opening = |s: &mut Session| {
+        let o = &s.geometry().walls[&cc_core::ElementId(id(&wall))].openings[0];
+        (o.z0, o.z1)
+    };
+    let (z0, z1) = opening(&mut s);
+    run(&mut s, "element_set", json!({"id": door["id"], "params": {"sill_height": 0.3}}));
+    let (r0, r1) = opening(&mut s);
+    assert!((r0 - z0 - 0.3).abs() < 1e-9 && (r1 - z1 - 0.3).abs() < 1e-9, "({z0}, {z1}) → ({r0}, {r1})");
+}
+
 #[test]
 fn export_and_paste_elements() {
     let mut s = Session::default();
@@ -468,6 +635,37 @@ fn export_and_paste_elements() {
     let y = |s: &mut Session, id: &Value| run(s, "element_get", json!({"id": id}))["params"]["start"][1].as_f64();
     assert!(created.iter().any(|id| y(&mut s, id) == Some(4.0)));
     assert_eq!(fails(&mut s, "elements_paste", json!({"elements": [{"bogus": true}]})), ErrorCode::InvalidArguments);
+}
+
+/// Columns copied on one level and pasted on another keep their span: the
+/// top moves up as many levels as the base (issue #99: it stayed on the
+/// level it was copied with, so the copies ended at their own base). With
+/// no level that high, the top is left unconnected at the same height.
+#[test]
+fn pasted_columns_reach_the_matching_level() {
+    let mut s = Session::default();
+    let levels = run(&mut s, "levels_list", json!({}));
+    let ids: Vec<u64> = levels.as_array().unwrap().iter().map(id).collect();
+    assert_eq!(ids.len(), 2, "the template's ground and first floor");
+    let roof = id(&run(&mut s, "level_create", json!({"name": "Cobertura", "elevation": 6.0})));
+    let column = run(&mut s, "column_create", json!({"position": [0, 0], "level": ids[0], "top_level": ids[1]}));
+    let set = run(&mut s, "elements_export", json!({"ids": [id(&column)]}));
+    let top_of = |s: &mut Session, c: &Value| {
+        let e = run(s, "element_get", json!({"id": c}));
+        (e["level"]["id"].as_u64(), e["params"]["top"]["Level"]["level"].as_u64(), e["params"]["height"].as_f64())
+    };
+    let pasted = run(&mut s, "elements_paste", json!({"elements": set["elements"], "level": ids[1]}));
+    let (base, top, _) = top_of(&mut s, &pasted["created"][0]);
+    assert_eq!((base, top), (Some(ids[1]), Some(roof)), "one level up, base and top");
+    // From the top level there is none above: unconnected, as tall as the original.
+    let pasted = run(&mut s, "elements_paste", json!({"elements": set["elements"], "level": roof}));
+    let (base, top, height) = top_of(&mut s, &pasted["created"][0]);
+    assert_eq!((base, top), (Some(roof), None));
+    let floor = run(&mut s, "levels_list", json!({}))[1]["elevation"].as_f64().unwrap();
+    assert!((height.unwrap() - floor).abs() < 1e-9, "{height:?} vs {floor}");
+    // On its own level nothing changes.
+    let pasted = run(&mut s, "elements_paste", json!({"elements": set["elements"], "level": ids[0], "delta": [2, 0]}));
+    assert_eq!(top_of(&mut s, &pasted["created"][0]).1, Some(ids[1]));
 }
 
 /// A window copied without its wall and pasted on another level goes into
@@ -629,6 +827,73 @@ fn outlines_from_walls_follow_the_outer_boundary() {
     assert!(shrunk < on_lines - 40.0 * half && shrunk > on_lines - 50.0 * half, "{shrunk} vs {on_lines}");
 }
 
+/// Issue #311: an outline from walls may follow the core faces, so a slab
+/// stops at the structure inside the plaster. Each side goes to that face of
+/// its own wall, whichever way the wall was drawn and wherever its location
+/// line is; exterior is the side outside the loop.
+#[test]
+fn outlines_from_walls_follow_the_face_asked_for() {
+    let mut s = Session::default();
+    // 25 cm: 4 cm of finish on the type's exterior (left) side, a 20 cm core, 1 cm inside.
+    let layers = json!([
+        {"function": "Finish", "material": "Reboco", "thickness": 0.04},
+        {"function": "Structure", "material": "Alvenaria", "thickness": 0.2},
+        {"function": "Finish", "material": "Reboco", "thickness": 0.01}
+    ]);
+    run(&mut s, "type_set", json!({"type": 4, "params": {"layers": layers}}));
+    let walls = [
+        // Along the counter-clockwise loop: the type's exterior side is inside the room.
+        json!({"start": [0, 0], "end": [6, 0], "type": 4}),
+        // Drawn on its (inner) finish face: the body lies outside the line.
+        json!({"start": [6, 0], "end": [6, 4], "type": 4, "location_line": "FinishExterior"}),
+        // Against the loop: the type's exterior side is outside.
+        json!({"start": [0, 4], "end": [6, 4], "type": 4}),
+        json!({"start": [0, 4], "end": [0, 0], "type": 4}),
+    ];
+    for wall in walls {
+        run(&mut s, "wall_create", wall);
+    }
+    // The box of a floor made on a face: (min x, min y, max x, max y).
+    let mut on = |face: &str| {
+        let floor = run(&mut s, "floor_create", json!({"from_walls": true, "wall_face": face}));
+        let pts: Vec<(f64, f64)> = floor["params"]["boundary"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p[0].as_f64().unwrap(), p[1].as_f64().unwrap()))
+            .collect();
+        assert_eq!(pts.len(), 4, "{face}: {pts:?}");
+        let fold =
+            |f: fn(f64, f64) -> f64, start: f64, pick: fn(&(f64, f64)) -> f64| pts.iter().map(pick).fold(start, f);
+        [
+            fold(f64::min, f64::INFINITY, |p| p.0),
+            fold(f64::min, f64::INFINITY, |p| p.1),
+            fold(f64::max, f64::NEG_INFINITY, |p| p.0),
+            fold(f64::max, f64::NEG_INFINITY, |p| p.1),
+        ]
+    };
+    let mut check = |face: &str, expected: [f64; 4]| {
+        let got = on(face);
+        for (g, e) in got.iter().zip(expected) {
+            assert!((g - e).abs() < 1e-9, "{face}: {got:?} vs {expected:?}");
+        }
+    };
+    check("FinishExterior", [-0.125, -0.125, 6.25, 4.125]);
+    check("FinishInterior", [0.125, 0.125, 6.0, 3.875]);
+    // Inside the plaster: 1 cm in on three sides, 4 cm on the wall drawn the other way.
+    check("CoreExterior", [-0.115, -0.115, 6.24, 4.085]);
+    check("CoreInterior", [0.085, 0.085, 6.04, 3.885]);
+    check("Centerline", [0.0, 0.0, 6.125, 4.0]);
+    check("CoreCenter", [-0.015, -0.015, 6.14, 3.985]);
+    assert_eq!(
+        fails(&mut s, "floor_create", json!({"from_walls": true, "wall_face": "Outside"})),
+        ErrorCode::InvalidArguments
+    );
+    // Ceilings and roofs take it too; a wall with no finish layers has its core faces on its faces.
+    let ceiling = run(&mut s, "ceiling_create", json!({"from_walls": true, "wall_face": "CoreInterior"}));
+    assert_eq!(ceiling["params"]["boundary"].as_array().unwrap().len(), 4);
+}
+
 /// The showcase macro (the project of the README screenshots) keeps working,
 /// and the ids its later steps name still point at what they expect.
 #[test]
@@ -641,18 +906,22 @@ fn the_showcase_macro_builds_its_project() {
     assert_eq!([count(&mut s, "wall"), count(&mut s, "door"), count(&mut s, "room")], [13, 5, 5]);
     assert!(count(&mut s, "rebar") > 0 && count(&mut s, "pipe") > 0 && count(&mut s, "conduit") > 0);
     let get = |s: &mut Session, id: u64| run(s, "element_get", json!({"id": id}));
-    assert!(get(&mut s, 97)["params"]["bulge"].as_f64().unwrap() > 0.0, "the arc wall");
-    assert!(get(&mut s, 116)["params"]["shape"]["Hip"].is_object(), "the hip roof");
-    assert_eq!(get(&mut s, 94)["phase_demolished"]["id"], 81, "the demolished partition");
-    assert_eq!(get(&mut s, 247)["type"]["id"], 58, "the distribution board");
+    assert!(get(&mut s, 110)["params"]["bulge"].as_f64().unwrap() > 0.0, "the arc wall");
+    // Its strip footing follows the arc (#22).
+    let foundations = run(&mut s, "elements_list", json!({"category": "foundation"}));
+    let ids: Vec<u64> = foundations.as_array().unwrap().iter().map(|f| f["id"].as_u64().unwrap()).collect();
+    assert!(ids.iter().any(|&f| get(&mut s, f)["params"]["shape"]["Strip"]["bulge"].as_f64().is_some_and(|b| b > 0.0)));
+    assert!(get(&mut s, 129)["params"]["shape"]["Hip"].is_object(), "the hip roof");
+    assert_eq!(get(&mut s, 107)["phase_demolished"]["id"], 86, "the demolished partition");
+    assert_eq!(get(&mut s, 260)["type"]["id"], 62, "the distribution board");
     let views = run(&mut s, "views_list", json!({}));
     let view = |id: u64| views.as_array().unwrap().iter().find(|v| v["id"] == id).map(|v| v["name"].clone());
-    assert_eq!(view(334), Some(json!("Board diagram")));
-    assert_eq!(view(342), Some(json!("3D North-east")));
-    let loads = run(&mut s, "circuit_loads", json!({"panel": 247}));
+    assert_eq!(view(347), Some(json!("Board diagram")));
+    assert_eq!(view(355), Some(json!("3D North-east")));
+    let loads = run(&mut s, "circuit_loads", json!({"panel": 260}));
     assert!(loads.to_string().contains("Kitchen and bath outlets"));
-    for filter in [341, 343] {
-        assert!(run(&mut s, "filter_elements", json!({"filter": filter, "view": 340}))["count"].as_u64().unwrap() > 0);
+    for filter in [354, 356] {
+        assert!(run(&mut s, "filter_elements", json!({"filter": filter, "view": 353}))["count"].as_u64().unwrap() > 0);
     }
 }
 
@@ -1030,6 +1299,33 @@ fn sloped_beams_and_steel_sections() {
     assert!(derived(&mut s, column)["volume"].as_f64().unwrap() < volume);
 }
 
+/// Editing a profiled type's legacy section points it to a profile of the new
+/// section, and undo restores both the section and the profile.
+#[test]
+fn editing_a_legacy_section_repoints_the_profile() {
+    let mut s = Session::default();
+    let ty = run(&mut s, "type_duplicate", json!({"type": "Viga 15 x 40 cm", "name": "Perfil I"}));
+    // `type_get` shows the profile by name; its id comes from `profile_get`.
+    let profile_of = |s: &mut Session| {
+        let name = run(s, "type_get", json!({"type": ty["id"]}))["params"]["profile"].clone();
+        assert!(name.is_string(), "the beam type has a profile: {name}");
+        run(s, "profile_get", json!({"profile": name}))["id"].clone()
+    };
+    let before = profile_of(&mut s);
+    assert!(before.is_u64(), "the template beam has a profile: {before}");
+    run(&mut s, "type_set", json!({"type": ty["id"], "params": {"shape": {"I": {"web": 0.01, "flange": 0.02}}}}));
+    let got = run(&mut s, "type_get", json!({"type": ty["id"]}));
+    assert_eq!(got["params"]["shape"], json!({"I": {"web": 0.01, "flange": 0.02}}), "{got}");
+    let after = profile_of(&mut s);
+    assert_ne!(after, before);
+    let def = s.project().profile(cc_core::ProfileId(after.as_u64().unwrap())).unwrap();
+    assert_eq!(def.shape, cc_core::ProfileShape::I { d: 0.4, bf: 0.15, tw: 0.01, tf: 0.02, r: 0.0 });
+    run(&mut s, "undo", json!({}));
+    assert_eq!(profile_of(&mut s), before);
+    assert_eq!(run(&mut s, "type_get", json!({"type": ty["id"]}))["params"]["shape"], json!("Solid"));
+    assert!(s.project().profile(cc_core::ProfileId(after.as_u64().unwrap())).is_none(), "the new profile is undone");
+}
+
 #[test]
 fn slabs_join_their_supports_and_the_analytical_model() {
     let mut s = Session::default();
@@ -1125,15 +1421,15 @@ fn reinforcement_of_beams_and_columns() {
 #[test]
 fn trusses_braces_numbering_and_structural_plans() {
     let mut s = Session::default();
-    // A Pratt truss, 6 m in 4 panels, 1 m deep: 2 chords, 4 diagonals, 5 posts.
+    // A flat Pratt truss, 6 m in 4 panels, 1 m deep: 8 chords, 4 diagonals, 5 posts (two at the supports).
     let out = run(
         &mut s,
         "truss_create",
         json!({"start": [0, 0], "end": [6, 0], "height": 1.0, "panels": 4, "bottom_offset": 2.0}),
     );
-    assert_eq!(out["created"].as_array().unwrap().len(), 11, "{out}");
-    let group = run(&mut s, "groups_list", json!({}));
-    assert_eq!(group.as_array().unwrap().len(), 1);
+    assert_eq!(out["members"].as_array().unwrap().len(), 17, "{out}");
+    let host = run(&mut s, "element_get", json!({"id": out["id"]}));
+    assert_eq!(host["params"]["panels"], json!(4), "{host}");
     // Its analytical model: all members meet at the 10 panel points.
     let m = run(&mut s, "analytical_model", json!({}));
     assert_eq!(m["nodes"].as_array().unwrap().len(), 10, "{m}");
@@ -1551,6 +1847,54 @@ fn panel_diagrams_follow_their_board() {
     assert_eq!(run(&mut s, "view_get", json!({"view": id(&diagram)}))["params"]["panel"], json!(panel));
 }
 
+/// Schedules go on sheets: drawn as a ruled table at their printed size,
+/// titled in their first row (no viewport title or scale), following the
+/// model; exported with the sheet.
+#[test]
+fn schedules_go_on_sheets() {
+    let mut s = Session::default();
+    for (a, b) in [([0.0, 0.0], [6.0, 0.0]), ([6.0, 0.0], [6.0, 4.0])] {
+        run(&mut s, "wall_create", json!({"start": a, "end": b}));
+    }
+    let schedule = run(&mut s, "view_create", json!({"kind": "schedule", "category": "wall", "name": "Wall Schedule"}));
+    let sheet = id(&run(&mut s, "view_create", json!({"kind": "sheet"})));
+    run(&mut s, "sheet_place_view", json!({"sheet": sheet, "view": id(&schedule), "center": [150.0, 150.0]}));
+    let texts = |s: &mut Session| -> Vec<String> {
+        let composed = s.sheet(cc_core::ViewId(sheet)).unwrap();
+        composed
+            .drawing
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                cc_views::Prim::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let shown = texts(&mut s);
+    assert_eq!(shown.iter().filter(|t| *t == "Wall Schedule").count(), 1, "titled once: {shown:?}");
+    assert!(!shown.iter().any(|t| t == "1:1"), "no scale under a schedule");
+    // Title, headers, two walls and the totals: five rows of 6 mm.
+    let composed = s.sheet(cc_core::ViewId(sheet)).unwrap();
+    let vp = composed.viewports.iter().find(|v| v.view.0 == id(&schedule)).unwrap();
+    assert!((vp.half.y * 2.0 - 30.0).abs() < 1e-6, "{:?}", vp.half);
+    // A third wall adds a row on the sheet.
+    run(&mut s, "wall_create", json!({"start": [6.0, 4.0], "end": [0.0, 4.0]}));
+    let composed = s.sheet(cc_core::ViewId(sheet)).unwrap();
+    let vp = composed.viewports.iter().find(|v| v.view.0 == id(&schedule)).unwrap();
+    assert!((vp.half.y * 2.0 - 36.0).abs() < 1e-6, "{:?}", vp.half);
+    // Once per project, like any view; sheets themselves still cannot be placed.
+    let other = id(&run(&mut s, "view_create", json!({"kind": "sheet"})));
+    assert_eq!(fails(&mut s, "sheet_place_view", json!({"sheet": other, "view": id(&schedule)})), ErrorCode::Rejected);
+    assert_eq!(fails(&mut s, "sheet_place_view", json!({"sheet": other, "view": sheet})), ErrorCode::InvalidArguments);
+    // The sheet's export carries the table.
+    let out = std::env::temp_dir().join(format!("ccad-schedule-sheet-{}.svg", std::process::id()));
+    run(&mut s, "sheet_export", json!({"sheet": sheet, "path": out}));
+    let svg = std::fs::read_to_string(&out).unwrap();
+    assert!(svg.contains("Wall Schedule"));
+    let _ = std::fs::remove_file(out);
+}
+
 /// Arc walls: three points or a bulge; quantities along the arc; doors on
 /// the arc; a room and floor from walls that include an arc; edits.
 #[test]
@@ -1664,6 +2008,39 @@ fn arc_walls_through_commands() {
     assert!(host["derived"]["radius"].is_number());
 }
 
+/// Align by faces, as picked (#86): a wall's face goes onto another wall's
+/// face, not its location line onto the other's; a wall at an angle turns
+/// until parallel, then moves.
+#[test]
+fn align_walls_by_the_faces_picked() {
+    let mut s = Session::default();
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    let a = id(&run(&mut s, "wall_create", json!({"start": [0.0, 0.0], "end": [5.0, 0.0]})));
+    let half = run(&mut s, "element_get", json!({"id": a}))["derived"]["thickness"].as_f64().unwrap() / 2.0;
+    let b = id(&run(&mut s, "wall_create", json!({"start": [0.0, 3.0], "end": [5.0, 3.0]})));
+    // B's south face onto A's north face: B's line ends a whole thickness from A's.
+    let args = json!({"id": b, "reference": a, "pick": [2.0, 3.0 - half], "reference_pick": [2.0, half]});
+    run(&mut s, "element_align", args);
+    let w = run(&mut s, "element_get", json!({"id": b}));
+    assert!(near(w["params"]["start"][1].as_f64().unwrap(), 2.0 * half), "{w}");
+    assert!(near(w["params"]["end"][1].as_f64().unwrap(), 2.0 * half), "{w}");
+
+    // A wall at an angle turns about the point picked, then its face lands on A's south face.
+    let c = id(&run(&mut s, "wall_create", json!({"start": [0.0, -6.0], "end": [4.0, -5.0]})));
+    let dir = glam::DVec2::new(4.0, 1.0).normalize();
+    let north = dir.perp() * half;
+    let pick = glam::DVec2::new(2.0, -5.5) + north;
+    run(
+        &mut s,
+        "element_align",
+        json!({"id": c, "reference": a, "pick": pick.to_array(), "reference_pick": [2.0, -half]}),
+    );
+    let w = run(&mut s, "element_get", json!({"id": c}));
+    let (y0, y1) = (w["params"]["start"][1].as_f64().unwrap(), w["params"]["end"][1].as_f64().unwrap());
+    assert!(near(y0, y1), "parallel now: {w}");
+    assert!(near(y0, -2.0 * half), "its north face on A's south face: {w}");
+}
+
 /// Align works in plan, whatever the levels: a column of the upper floor
 /// moves onto the faces of the column below by the outline edges picked,
 /// onto a grid by its center, and a wall onto a column face.
@@ -1703,10 +2080,15 @@ fn align_columns_across_levels() {
     let (x, y, _) = position(&mut s, above);
     assert!(near(x, 2.0) && near(y, 0.0), "({x}, {y})");
 
-    // A turned column has no edge parallel to the reference face.
+    // A turned column turns until the side picked is parallel to the face, then moves onto it (#86).
     run(&mut s, "element_set", json!({"id": above, "params": {"rotation_deg": 30.0}}));
-    let turned = json!({"id": above, "reference": below, "pick": [2.2, 0.0], "reference_pick": [0.2, 0.0]});
-    assert_eq!(fails(&mut s, "element_align", turned), ErrorCode::Rejected);
+    let side = [2.0 + 0.15 * 30f64.to_radians().cos(), 0.15 * 30f64.to_radians().sin()];
+    let turned = json!({"id": above, "reference": below, "pick": side, "reference_pick": [0.2, 0.0]});
+    run(&mut s, "element_align", turned);
+    let (x, _, _) = position(&mut s, above);
+    let rotation = run(&mut s, "element_get", json!({"id": above}))["params"]["rotation_deg"].as_f64().unwrap();
+    assert!(near(rotation.rem_euclid(90.0).min(90.0 - rotation.rem_euclid(90.0)), 0.0), "{rotation}");
+    assert!(near(x, 0.0), "its east side on the east face: {x}");
 
     // A wall moves its line onto the column's west face.
     let wall = id(&run(&mut s, "wall_create", json!({"start": [-3.0, -1.0], "end": [-3.0, 1.0]})));
@@ -2052,7 +2434,7 @@ fn grid_ends_align_to_a_reference() {
 #[test]
 fn stairs_shapes_rules_and_railings() {
     let mut s = Session::default();
-    let shapes = ["straight", "straight_landing", "l_shaped", "u_shaped", "spiral"];
+    let shapes = ["straight", "straight_landing", "l_shaped", "u_shaped", "three_flight", "spiral"];
     for (k, shape) in shapes.iter().enumerate() {
         let st = run(&mut s, "stair_create", json!({"start": [k as f64 * 5.0, 0.0], "shape": shape}));
         assert_eq!(st["params"]["layout"]["shape"], json!(shape_name(shape)), "{st}");
@@ -2154,11 +2536,187 @@ fn stairs_shapes_rules_and_railings() {
     assert_eq!(back["risers"], 17);
 }
 
+/// Level marks write the finished level of a floor and the raw level of its
+/// structure, after the type's datum: in plans the floor under the point,
+/// in sections the height of the point.
+#[test]
+fn level_marks_write_finished_and_raw_levels() {
+    let mut s = Session::default();
+    // The template's slab: 3 cm of screed over 12 cm of concrete, its top 15 cm up.
+    let square = json!([[0, 0], [4, 0], [4, 4], [0, 4]]);
+    run(&mut s, "floor_create", json!({"boundary": square, "offset": 0.15}));
+    let plans = run(&mut s, "views_list", json!({"category": "floor_plan"}));
+    let plan = plans[0]["id"].as_u64().unwrap();
+    let mark = run(&mut s, "level_mark_create", json!({"view": plan, "position": [1, 1]}));
+    assert_eq!(mark["category"], "levelmark");
+    let near = |v: &Value, x: f64| v.as_f64().is_some_and(|v| (v - x).abs() < 1e-9);
+    assert!(near(&mark["derived"]["finished"], 0.15) && near(&mark["derived"]["raw"], 0.12), "{mark}");
+    // The project's zero written as 100.00.
+    let ty = mark["type"]["id"].clone();
+    run(&mut s, "type_set", json!({"type": ty, "params": {"datum": 100.0}}));
+    let texts = run(&mut s, "element_get", json!({"id": id(&mark)}))["derived"]["texts"].clone();
+    let texts: Vec<&str> = texts.as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+    assert_eq!(texts.len(), 2, "{texts:?}");
+    assert!(texts[0].starts_with("+ 100") && texts[0].contains("15") && texts[0].ends_with("(N.A.)"), "{texts:?}");
+    assert!(texts[1].contains("12") && texts[1].ends_with("(N.O.)"), "{texts:?}");
+    // Drawn in the plan: the two values, belonging to the mark.
+    let d = s.drawing(cc_core::ViewId(plan)).unwrap();
+    let drawn: Vec<&str> = d
+        .prims
+        .iter()
+        .filter_map(|p| match p {
+            cc_views::Prim::Text { text, element: Some(e), .. } if e.0 == id(&mark) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(drawn, texts);
+    // Set values win; without the raw level only one line is written.
+    let params = json!({"finished": 3.0, "show_raw": false});
+    run(&mut s, "element_set", json!({"id": id(&mark), "params": params}));
+    let got = run(&mut s, "element_get", json!({"id": id(&mark)}));
+    assert!(near(&got["derived"]["finished"], 3.0) && got["derived"]["raw"].is_null(), "{got}");
+
+    // In a section across the floor, on its top: its height and the raw level.
+    let section = run(&mut s, "view_create", json!({"kind": "section", "start": [-1, 2], "end": [6, 2]}));
+    let sid = cc_core::ViewId(id(&section));
+    let x = s.project().view(sid).unwrap().projection().unwrap().project(cc_core::DVec2::new(1.0, 2.0), 0.0).x;
+    let cut = run(&mut s, "level_mark_create", json!({"view": sid.0, "position": [x, 0.15]}));
+    assert!(near(&cut["derived"]["finished"], 0.15) && near(&cut["derived"]["raw"], 0.12), "{cut}");
+    assert!(s.drawing(sid).unwrap().prims.iter().any(|p| p.element().is_some_and(|e| e.0 == id(&cut))));
+
+    // Not in schedules; bad levels are refused.
+    let schedule = run(&mut s, "view_create", json!({"kind": "schedule", "category": "wall"}));
+    let bad = json!({"view": id(&schedule), "position": [0, 0]});
+    assert_eq!(fails(&mut s, "level_mark_create", bad), ErrorCode::InvalidArguments);
+    let bad = json!({"view": plan, "position": [0, 0], "finished": 1e9});
+    assert_eq!(fails(&mut s, "level_mark_create", bad), ErrorCode::InvalidArguments);
+    // Deleting the view deletes its marks.
+    run(&mut s, "view_delete", json!({"view": sid.0}));
+    assert_eq!(fails(&mut s, "element_get", json!({"id": id(&cut)})), ErrorCode::NotFound);
+
+    // The first mark gave the project its type; others can be made.
+    assert!(Session::default().project().default_type(cc_core::Category::LevelMark).is_none());
+    let args = json!({"name": "Site", "datum": 742.5, "finished_suffix": "FFL", "raw_suffix": "SSL"});
+    let site = run(&mut s, "level_mark_type_create", args);
+    let mark = run(&mut s, "level_mark_create", json!({"view": plan, "position": [1, 1], "type": site["id"]}));
+    let texts = mark["derived"]["texts"].as_array().unwrap();
+    assert!(texts[0].as_str().is_some_and(|t| t.starts_with("+ 742") && t.ends_with(" FFL")), "{mark}");
+    let bad = json!({"text_size": 0.0});
+    assert_eq!(fails(&mut s, "level_mark_type_create", bad), ErrorCode::InvalidArguments);
+}
+
+/// A stair given its riser count and tread: the riser height is the height
+/// over the risers, the run follows the tread; element_set changes them and
+/// a three-flight stair splits them between its flights.
+/// Issue #143: the landings of an assembled stair are a deck on beams, with
+/// posts down to the base only where asked for; `stair_check` lists where
+/// they can stand.
+#[test]
+fn assembled_stair_landings_take_posts_where_asked() {
+    let mut s = Session::default();
+    let st = run(&mut s, "stair_create", json!({"start": [0, 0], "shape": "l_shaped", "posts": [["back"]]}));
+    let sid = id(&st);
+    let build = json!({"construction": "Assembled", "stringers": "Center", "landing_beams": "Tee"});
+    run(&mut s, "type_set", json!({"type": st["type"]["id"], "params": {"build": build}}));
+    let check = run(&mut s, "stair_check", json!({"id": sid}));
+    let spots = check["landings"][0]["posts"].as_array().unwrap();
+    let names: Vec<&str> = spots.iter().map(|p| p["place"].as_str().unwrap()).collect();
+    assert_eq!(names, ["front", "back", "inner"], "{check}");
+    let placed: Vec<bool> = spots.iter().map(|p| p["post"].as_bool().unwrap()).collect();
+    assert_eq!(placed, [false, true, false]);
+    let volume = |s: &mut Session| run(s, "element_get", json!({"id": sid}))["derived"]["volume"].as_f64().unwrap();
+    let one = volume(&mut s);
+    // A second post, at the front: one more 8 cm post as high as the first.
+    let posts = json!({"layout": {"posts": [{"back": true, "front": true}, {}]}});
+    run(&mut s, "element_set", json!({"id": sid, "params": posts}));
+    let two = volume(&mut s);
+    let z = check["landings"][0]["z"].as_f64().unwrap();
+    let post = 0.08 * 0.08 * (z - 0.04 - 0.25);
+    assert!((two - one - post).abs() < 1e-9, "{two} - {one} vs {post}");
+    // None: less again.
+    run(&mut s, "element_set", json!({"id": sid, "params": {"layout": {"posts": [{}, {}]}}}));
+    assert!((one - volume(&mut s) - post).abs() < 1e-9);
+    // Unknown places and too many landings are refused.
+    let bad = json!({"start": [5, 0], "shape": "l_shaped", "posts": [["middle"]]});
+    assert_eq!(fails(&mut s, "stair_create", bad), ErrorCode::InvalidArguments);
+    let bad = json!({"start": [5, 0], "posts": [[], [], []]});
+    assert_eq!(fails(&mut s, "stair_create", bad), ErrorCode::InvalidArguments);
+}
+
+/// Stairs number their steps in plans when asked: the treads from the start
+/// number up to the floor they arrive at; element_set changes the start.
+#[test]
+fn stairs_number_their_steps_in_plans() {
+    let mut s = Session::default();
+    let numbers = |s: &mut Session, sid: u64| -> Vec<String> {
+        let plan = run(s, "views_list", json!({"category": "floor_plan"}))[0]["id"].as_u64().unwrap();
+        let d = s.drawing(cc_core::ViewId(plan)).unwrap();
+        d.prims
+            .iter()
+            .filter_map(|p| match p {
+                cc_views::Prim::Text { text, element: Some(e), .. } if e.0 == sid => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let plain = id(&run(&mut s, "stair_create", json!({"start": [0, 0]})));
+    assert!(numbers(&mut s, plain).is_empty(), "no numbers unless asked");
+    // 17 risers to the level above: treads 1 to 16, 17 on the floor above.
+    let st = run(&mut s, "stair_create", json!({"start": [5, 0], "numbers": true}));
+    let sid = id(&st);
+    assert_eq!(st["params"]["layout"]["number_start"], 1);
+    let expected: Vec<String> = (1..=17).map(|n| n.to_string()).collect();
+    assert_eq!(numbers(&mut s, sid), expected);
+    // Continuing the count of a stair below.
+    run(&mut s, "element_set", json!({"id": sid, "params": {"layout": {"number_start": 18}}}));
+    let expected: Vec<String> = (18..=34).map(|n| n.to_string()).collect();
+    assert_eq!(numbers(&mut s, sid), expected);
+    let bad = json!({"id": sid, "params": {"layout": {"number_start": 100_000}}});
+    assert!(s.execute("element_set", bad).is_err());
+    let bad = json!({"start": [0, 0], "numbers": true, "number_start": -10_000});
+    assert_eq!(fails(&mut s, "stair_create", bad), ErrorCode::InvalidArguments);
+}
+
+#[test]
+fn stairs_take_a_riser_count_and_a_tread() {
+    let mut s = Session::default();
+    // 3.00 m to the level above in 20 risers of 15 cm on 30 cm treads.
+    let args = json!({"start": [0, 0], "risers": 20, "tread": 0.30});
+    let st = run(&mut s, "stair_create", args);
+    let sid = id(&st);
+    let check = run(&mut s, "stair_check", json!({"id": sid}));
+    assert_eq!(check["risers"], 20, "{check}");
+    assert!((check["riser"].as_f64().unwrap() - 0.15).abs() < 1e-9);
+    assert!((check["run"].as_f64().unwrap() - 19.0 * 0.30).abs() < 1e-9, "{check}");
+    // Back to the type's: the fewest risers within 18 cm (17) and its 28 cm tread.
+    let layout = json!({"layout": {"risers": 0, "tread": 0.0}});
+    run(&mut s, "element_set", json!({"id": sid, "params": layout}));
+    let check = run(&mut s, "stair_check", json!({"id": sid}));
+    assert_eq!(check["risers"], 17);
+    assert!((check["tread"].as_f64().unwrap() - 0.28).abs() < 1e-9);
+    for bad in [json!({"risers": 0}), json!({"risers": 201}), json!({"tread": -0.2})] {
+        let mut args = bad.clone();
+        args["start"] = json!([0, 0]);
+        assert_eq!(fails(&mut s, "stair_create", args), ErrorCode::InvalidArguments, "{bad}");
+    }
+    // Three flights of 6, 5 and 6 risers (two of them reach the landings).
+    let args = json!({"start": [5, 0], "shape": "three_flight", "risers": 18, "split": 6, "split2": 5});
+    let three = run(&mut s, "stair_create", args);
+    let p = s.project();
+    let el = p.element(cc_core::ElementId(id(&three))).unwrap();
+    let cc_core::ElementKind::Stair(st) = &el.kind else { panic!("not a stair") };
+    let g = cc_geom::stair_geom(p, el, st).unwrap();
+    let treads: Vec<usize> = g.flights.iter().map(|f| f.treads).collect();
+    assert_eq!(treads, [5, 4, 6]);
+    assert_eq!(g.steps.iter().filter(|st| st.kind == cc_geom::StepKind::Landing).count(), 2);
+}
+
 fn shape_name(shape: &str) -> &'static str {
     match shape {
         "straight_landing" => "StraightLanding",
         "l_shaped" => "LShaped",
         "u_shaped" => "UShaped",
+        "three_flight" => "ThreeFlight",
         "spiral" => "Spiral",
         _ => "Straight",
     }
@@ -2262,4 +2820,693 @@ fn ramps_shapes_rules_and_railings() {
     assert!(ifc.contains("IFCRAMP(") && ifc.contains(".SPIRAL_RAMP.") && ifc.contains(".QUARTER_TURN_RAMP."));
     assert!(ifc.contains("IFCRAMPTYPE("));
     assert_representation_types(&ifc);
+}
+
+/// Tags move by hand in a plan (door, window, beam, column tags): the tag
+/// is drawn where it was put, with a leader back to its element, each plan
+/// keeping its own; reset puts it back, and deleting the element drops it.
+#[test]
+fn tags_are_moved_in_their_plan() {
+    let mut s = Session::default();
+    let wall = run(&mut s, "wall_create", json!({"start": [0, 0], "end": [6, 0]}));
+    let window = id(&run(&mut s, "window_create", json!({"wall": wall["id"], "mark": "J1"})));
+    let plans = run(&mut s, "views_list", json!({"category": "floor_plan"}));
+    let plan = cc_core::ViewId(id(&plans[0]));
+    let tag = |s: &mut Session| {
+        let d = s.drawing(plan).unwrap();
+        let t = d.tags.iter().find(|t| t.element.0 == window).copied().unwrap();
+        let leader = d.prims.iter().filter(|p| matches!(p, cc_views::Prim::Line { style: cc_views::LineStyle::Annotation, element: Some(e), .. } if e.0 == window)).count();
+        (t.center, leader)
+    };
+    let (home, lines_home) = tag(&mut s);
+    run(&mut s, "tag_move", json!({"view": plan.0, "id": window, "delta": [0.5, 2.0]}));
+    let (moved, lines_moved) = tag(&mut s);
+    assert!((moved - home - glam::DVec2::new(0.5, 2.0)).length() < 1e-9, "{home} → {moved}");
+    assert_eq!(lines_moved, lines_home + 1, "a leader to the window");
+    // A duplicate plan starts with the same tag positions, then each keeps its own.
+    let other = id(&run(&mut s, "view_duplicate", json!({"view": plan.0})));
+    run(&mut s, "tag_move", json!({"view": other, "id": window, "reset": true}));
+    let d = s.drawing(cc_core::ViewId(other)).unwrap();
+    assert!((d.tags.iter().find(|t| t.element.0 == window).unwrap().center - home).length() < 1e-9);
+    assert!((tag(&mut s).0 - moved).length() < 1e-9, "the first plan keeps its tag");
+    // Back home, then moved again and the window deleted: the offset goes with it.
+    run(&mut s, "tag_move", json!({"view": plan.0, "id": window, "reset": true}));
+    assert!((tag(&mut s).0 - home).length() < 1e-9);
+    run(&mut s, "tag_move", json!({"view": plan.0, "id": window, "offset": [1, 1]}));
+    run(&mut s, "elements_delete", json!({"ids": [window]}));
+    assert!(s.project().view(plan).unwrap().tag_offsets.is_empty());
+    // Bad requests.
+    let three_d = run(&mut s, "view_create", json!({"kind": "three_d"}));
+    assert_eq!(
+        fails(&mut s, "tag_move", json!({"view": three_d["id"], "id": id(&wall), "reset": true})),
+        ErrorCode::InvalidArguments
+    );
+    assert_eq!(fails(&mut s, "tag_move", json!({"view": plan.0, "id": id(&wall)})), ErrorCode::InvalidArguments);
+    assert_eq!(
+        fails(&mut s, "tag_move", json!({"view": plan.0, "id": id(&wall), "offset": [5000, 0]})),
+        ErrorCode::InvalidArguments
+    );
+}
+
+/// Conceptual masses (#31): an extrusion and a loft, their mass floors at
+/// the levels they span with areas, perimeters and volume, choosing the
+/// floors, schedules, moving, undo, saving, and a level deleted under them.
+#[test]
+fn masses_and_mass_floors() {
+    let mut s = Session::default();
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    let levels = run(&mut s, "levels_list", json!({}));
+    let ground = id(&levels[0]);
+    let first_z = levels[1]["elevation"].as_f64().unwrap();
+    let top_level = id(&run(&mut s, "level_create", json!({"name": "Cobertura", "elevation": 2.0 * first_z})));
+    // 10 x 6 m, three storeys high: floors at the three levels it spans.
+    let outline = json!([[0, 0], [10, 0], [10, 6], [0, 6]]);
+    let mass = run(&mut s, "mass_create", json!({"outline": outline, "height": 3.0 * first_z}));
+    let m = id(&mass);
+    assert_eq!(mass["category"], "mass");
+    let floors = run(&mut s, "mass_floors", json!({"id": m}));
+    assert_eq!(floors["floors"].as_array().unwrap().len(), 3);
+    assert!(near(floors["floor_area"].as_f64().unwrap(), 180.0), "{floors}");
+    assert!(near(floors["volume"].as_f64().unwrap(), 60.0 * 3.0 * first_z));
+    assert!(near(floors["floors"][0]["perimeter"].as_f64().unwrap(), 32.0));
+    let e = run(&mut s, "element_get", json!({"id": m}));
+    assert!(near(e["derived"]["floor_area"].as_f64().unwrap(), 180.0));
+    // Plans: the upper floor's plan cuts the mass (it stands on the ground
+    // level) and labels the mass floor of that level with its area.
+    let first_name = levels[1]["name"].clone();
+    let plans = run(&mut s, "views_list", json!({"category": "floor_plan"}));
+    let upper_plan = plans.as_array().unwrap().iter().find(|v| v["name"] == first_name).map(id).unwrap();
+    let d = s.drawing(cc_core::ViewId(upper_plan)).unwrap();
+    let mine = |e: &Option<cc_core::ElementId>| e.is_some_and(|e| e.0 == m);
+    assert!(
+        d.prims.iter().any(
+            |p| matches!(p, cc_views::Prim::Line { style: cc_views::LineStyle::Cut, element, .. } if mine(element))
+        )
+    );
+    assert!(
+        d.prims
+            .iter()
+            .any(|p| matches!(p, cc_views::Prim::Text { text, element, .. } if mine(element) && text.contains("60")))
+    );
+
+    // Only the ground and the roof level.
+    run(&mut s, "mass_floors_set", json!({"id": m, "levels": [ground, "Cobertura"]}));
+    assert!(near(run(&mut s, "mass_floors", json!({"id": m}))["floor_area"].as_f64().unwrap(), 120.0));
+    // No floors, then all again.
+    run(&mut s, "mass_floors_set", json!({"id": m, "levels": []}));
+    assert_eq!(run(&mut s, "mass_floors", json!({"id": m}))["floors"], json!([]));
+    run(&mut s, "mass_floors_set", json!({"id": m}));
+    assert_eq!(run(&mut s, "mass_floors", json!({"id": m}))["floors"].as_array().unwrap().len(), 3);
+
+    // A loft set in by 1 m: 10 x 6 at the base, 8 x 4 at the top; halfway 9 x 5.
+    let loft = id(&run(
+        &mut s,
+        "mass_create",
+        json!({"outline": [[20, 0], [30, 0], [30, 6], [20, 6]], "height": 2.0 * first_z, "top_inset": 1.0}),
+    ));
+    let floors = run(&mut s, "mass_floors", json!({"id": loft}));
+    let areas: Vec<f64> = floors["floors"].as_array().unwrap().iter().map(|f| f["area"].as_f64().unwrap()).collect();
+    assert_eq!(areas.len(), 2, "the top level is not a floor of a mass that ends there");
+    assert!(near(areas[0], 60.0) && near(areas[1], 45.0), "{areas:?}");
+
+    // A schedule of masses: floors, gross floor area, volume.
+    let schedule = run(&mut s, "view_create", json!({"kind": "schedule", "category": "mass"}));
+    let table = run(&mut s, "schedule_table", json!({"view": schedule["id"]})).to_string();
+    assert!(table.contains("180"), "{table}");
+
+    // Moving moves both outlines; undo puts it back.
+    run(&mut s, "elements_move", json!({"ids": [loft], "delta": [0, 10]}));
+    let e = run(&mut s, "element_get", json!({"id": loft}));
+    assert!(near(e["params"]["outline"][0][1].as_f64().unwrap(), 10.0), "{e}");
+    assert!(near(e["params"]["top"][0][1].as_f64().unwrap(), 11.0), "{e}");
+    run(&mut s, "undo", json!({}));
+
+    // Saved and reopened.
+    let path = scratch("masses.ccad");
+    run(&mut s, "project_save", json!({"path": path}));
+    let mut reopened = Session::default();
+    run(&mut reopened, "project_open", json!({"path": path}));
+    assert!(near(run(&mut reopened, "mass_floors", json!({"id": m}))["floor_area"].as_f64().unwrap(), 180.0));
+
+    // Deleting a level takes its mass floors along.
+    run(&mut s, "level_delete", json!({"level": top_level}));
+    assert_eq!(run(&mut s, "mass_floors", json!({"id": m}))["floors"].as_array().unwrap().len(), 2);
+
+    // Bad input is refused.
+    for args in [
+        json!({"outline": [[0, 0], [1, 0]]}),
+        json!({"outline": [[0, 0], [1, 0], [2, 0]]}),
+        json!({"outline": outline, "height": -1}),
+        json!({"outline": outline, "top_inset": 10}),
+        json!({"outline": outline, "top_inset": 1, "top": outline}),
+    ] {
+        assert_eq!(fails(&mut s, "mass_create", args), ErrorCode::InvalidArguments);
+    }
+    assert_eq!(fails(&mut s, "mass_floors", json!({"id": id(&levels[0])})), ErrorCode::NotFound);
+}
+
+/// Push/pull on masses (#71): the top raises the mass (and gains the mass
+/// floors of the levels it now spans), the bottom lowers its base, a side
+/// moves out keeping its neighbors' directions; lofts keep their sides and
+/// a face pushed through the mass is refused.
+#[test]
+fn mass_faces_push_and_pull() {
+    let mut s = Session::default();
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    let levels = run(&mut s, "levels_list", json!({}));
+    let first_z = levels[1]["elevation"].as_f64().unwrap();
+    let m = id(&run(
+        &mut s,
+        "mass_create",
+        json!({"outline": [[0, 0], [10, 0], [10, 6], [0, 6]], "height": first_z / 2.0}),
+    ));
+    assert_eq!(run(&mut s, "mass_floors", json!({"id": m}))["floors"].as_array().unwrap().len(), 1);
+    // The top up past the first floor: two floors now.
+    run(&mut s, "mass_face_move", json!({"id": m, "face": "top", "distance": first_z}));
+    let floors = run(&mut s, "mass_floors", json!({"id": m}));
+    assert_eq!(floors["floors"].as_array().unwrap().len(), 2, "{floors}");
+    // The east side out by 2 m: 12 x 6 on both floors.
+    run(&mut s, "mass_face_move", json!({"id": m, "face": "side", "side": 1, "distance": 2.0}));
+    assert!(near(run(&mut s, "mass_floors", json!({"id": m}))["floor_area"].as_f64().unwrap(), 144.0));
+    // The bottom down 1 m.
+    run(&mut s, "mass_face_move", json!({"id": m, "face": "bottom", "distance": 1.0}));
+    let e = run(&mut s, "element_get", json!({"id": m}));
+    assert!(near(e["params"]["base_offset"].as_f64().unwrap(), -1.0), "{e}");
+    // Undo goes back one push at a time.
+    run(&mut s, "undo", json!({}));
+    assert!(near(run(&mut s, "element_get", json!({"id": m}))["params"]["base_offset"].as_f64().unwrap(), 0.0));
+    // Through the mass, a missing side, a loft's side: refused.
+    assert_eq!(fails(&mut s, "mass_face_move", json!({"id": m, "face": "top", "distance": -100})), ErrorCode::Rejected);
+    assert_eq!(
+        fails(&mut s, "mass_face_move", json!({"id": m, "face": "side", "side": 7, "distance": 1})),
+        ErrorCode::InvalidArguments
+    );
+    assert_eq!(
+        fails(&mut s, "mass_face_move", json!({"id": m, "face": "front", "distance": 1})),
+        ErrorCode::InvalidArguments
+    );
+    let loft =
+        id(&run(&mut s, "mass_create", json!({"outline": [[20, 0], [30, 0], [30, 6], [20, 6]], "top_inset": 1.0})));
+    assert_eq!(
+        fails(&mut s, "mass_face_move", json!({"id": loft, "face": "side", "side": 0, "distance": 1})),
+        ErrorCode::Rejected
+    );
+    run(&mut s, "mass_face_move", json!({"id": loft, "face": "top", "distance": 1.0}));
+}
+
+/// Walls, floors and a roof from a mass (#31): walls on its sides with
+/// their exterior faces on the mass's, joined at the corners; a floor on
+/// each mass floor; a flat roof on its top. Lofts take no walls.
+#[test]
+fn walls_floors_and_roof_by_face() {
+    let mut s = Session::default();
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    let levels = run(&mut s, "levels_list", json!({}));
+    let first_z = levels[1]["elevation"].as_f64().unwrap();
+    let outline = json!([[0, 0], [10, 0], [10, 6], [0, 6]]);
+    let m = id(&run(&mut s, "mass_create", json!({"outline": outline, "height": 2.0 * first_z})));
+    let walls = run(&mut s, "mass_walls_create", json!({"id": m}));
+    let walls: Vec<u64> = walls["created"].as_array().unwrap().iter().filter_map(Value::as_u64).collect();
+    assert_eq!(walls.len(), 4);
+    let geom = s.geometry().clone();
+    for w in &walls {
+        let g = &geom.walls[&cc_core::ElementId(*w)];
+        assert!(g.start_joined && g.end_joined, "wall {w} joins at both corners");
+        // The exterior face lies on the mass's outline: every corner of the
+        // body is within the 10 x 6 rectangle.
+        for f in geom.solids_of(cc_core::ElementId(*w)).flat_map(|s| s.faces.iter()) {
+            for v in &f.verts {
+                assert!(v.x > -1e-6 && v.x < 10.0 + 1e-6 && v.y > -1e-6 && v.y < 6.0 + 1e-6, "{v}");
+            }
+        }
+        let e = run(&mut s, "element_get", json!({"id": w}));
+        assert!(near(e["params"]["height"].as_f64().unwrap(), 2.0 * first_z));
+    }
+    // Two mass floors: two floors of 60 m².
+    let slabs = run(&mut s, "mass_slabs_create", json!({"id": m}));
+    let slabs = slabs["created"].as_array().unwrap();
+    assert_eq!(slabs.len(), 2);
+    let floor = run(&mut s, "element_get", json!({"id": slabs[1]}));
+    assert_eq!(floor["level"]["id"], levels[1]["id"]);
+    // A flat roof on the top.
+    let roof = run(&mut s, "mass_roof_create", json!({"id": m}));
+    assert_eq!(roof["category"], "roof");
+    assert!(near(roof["params"]["base_offset"].as_f64().unwrap(), 2.0 * first_z));
+    // One undo step each.
+    run(&mut s, "undo", json!({}));
+    run(&mut s, "undo", json!({}));
+    assert_eq!(run(&mut s, "elements_list", json!({"category": "floor"})).as_array().unwrap().len(), 0);
+    // Lofts take no walls, some sides only, bad sides refused.
+    let loft =
+        id(&run(&mut s, "mass_create", json!({"outline": [[20, 0], [30, 0], [30, 6], [20, 6]], "top_inset": 1.0})));
+    assert_eq!(fails(&mut s, "mass_walls_create", json!({"id": loft})), ErrorCode::Rejected);
+    run(&mut s, "mass_roof_create", json!({"id": loft}));
+    let two = run(&mut s, "mass_walls_create", json!({"id": m, "sides": [0, 2]}));
+    assert_eq!(two["created"].as_array().unwrap().len(), 2);
+    assert_eq!(fails(&mut s, "mass_walls_create", json!({"id": m, "sides": [4]})), ErrorCode::InvalidArguments);
+}
+
+/// Roof coverings and framing: a gable roof with French tiles on timber
+/// purlins, rafters and battens; the check against the tiles' least slope,
+/// the tiles and weight, the framing figures and its own solid (left out of
+/// the roof's volume); steel purlins for fiber cement sheets.
+#[test]
+fn roof_tiles_and_framing() {
+    let mut s = Session::default();
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    let roof = id(&run(&mut s, "roof_create", json!({"boundary": [[0, 0], [10, 0], [10, 8], [0, 8]], "overhang": 0})));
+    run(&mut s, "element_set", json!({"id": roof, "params": {"shape": {"Gable": {"slope": 0.35, "ridge_deg": 0}}}}));
+    let ty = run(&mut s, "element_get", json!({"id": roof}))["type"]["id"].as_u64().unwrap();
+    let volume_bare = run(&mut s, "element_get", json!({"id": roof}))["derived"]["volume"].as_f64().unwrap();
+
+    // A covering brings the framing it usually lies on when none was chosen.
+    run(&mut s, "type_set", json!({"type": ty, "params": {"covering": "CeramicFrench"}}));
+    assert_eq!(run(&mut s, "roof_check", json!({"id": roof}))["framing"]["system"], "Timber");
+    // Tiles only: the check and the figures, no members.
+    run(&mut s, "type_set", json!({"type": ty, "params": {"framing": {"system": "None"}}}));
+    let check = run(&mut s, "roof_check", json!({"id": roof}));
+    assert_eq!(check["ok"], true, "{check}");
+    assert!(near(check["slopes"][0].as_f64().unwrap(), 0.35));
+    let area = check["sloped_area"].as_f64().unwrap();
+    assert!(area > 80.0 && area < 90.0, "about 80 m² of plan at 35 %: {area}");
+    assert_eq!(check["tiles"].as_f64().unwrap(), (16.0 * area).ceil());
+    assert!(near(check["weight"].as_f64().unwrap(), 45.0 * area));
+    assert_eq!(check["framing"]["members"], 0);
+
+    // Timber framing: purlins, rafters and battens, in their own solid.
+    run(&mut s, "type_set", json!({"type": ty, "params": {"framing": {"system": "Timber"}}}));
+    let check = run(&mut s, "roof_check", json!({"id": roof}));
+    for k in ["purlins", "rafters", "battens"] {
+        assert!(check["framing"][k].as_f64().unwrap() > 10.0, "{k}: {check}");
+    }
+    assert!(check["framing"]["volume"].as_f64().unwrap() > 0.1);
+    let e = run(&mut s, "element_get", json!({"id": roof}));
+    assert!(near(e["derived"]["volume"].as_f64().unwrap(), volume_bare), "framing is not the roof's volume");
+    assert_eq!(e["derived"]["roofing"]["ok"], true);
+    assert!(s.geometry().solids_of(cc_core::ElementId(roof)).any(|x| x.category == cc_core::Category::Beam));
+    // Not the roof's body (joins, IFC export).
+    assert!(s.geometry().body_of(cc_core::ElementId(roof)).all(|x| !x.secondary));
+    assert_eq!(check["framing"]["trusses"], 0);
+
+    // Timber trusses under the purlins, no farther apart than their spacing along the 10 m ridge.
+    run(
+        &mut s,
+        "type_set",
+        json!({"type": ty, "params": {"framing": {"system": "TimberTrusses", "truss_spacing": 2.5}}}),
+    );
+    let trussed = run(&mut s, "roof_check", json!({"id": roof}));
+    let n = trussed["framing"]["trusses"].as_u64().unwrap();
+    assert!((5..=6).contains(&n), "{trussed}");
+    assert!(trussed["framing"]["truss_members"].as_f64().unwrap() > n as f64 * 8.0, "chords and tie span 8 m");
+    assert!(trussed["framing"]["volume"].as_f64().unwrap() > check["framing"]["volume"].as_f64().unwrap());
+    run(&mut s, "type_set", json!({"type": ty, "params": {"framing": {"system": "Timber"}}}));
+
+    // A schedule lists the tiles and the framing.
+    let schedule = run(&mut s, "view_create", json!({"kind": "schedule", "category": "roof"}));
+    run(
+        &mut s,
+        "view_set",
+        json!({"view": schedule["id"], "params": {"def": {"fields": ["Type", "TileCount", "Weight", "FramingLength"]}}}),
+    );
+    let table = run(&mut s, "schedule_table", json!({"view": schedule["id"]})).to_string();
+    assert!(table.contains(&format!("{}", (16.0 * area).ceil() as u64)), "{table}");
+
+    // Too flat for French tiles; a flat roof with tiles.
+    run(&mut s, "element_set", json!({"id": roof, "params": {"shape": {"Gable": {"slope": 0.2, "ridge_deg": 0}}}}));
+    let check = run(&mut s, "roof_check", json!({"id": roof}));
+    assert_eq!(check["ok"], false);
+    assert_eq!(check["issues"].as_array().unwrap().len(), 1);
+    run(&mut s, "element_set", json!({"id": roof, "params": {"shape": "Flat"}}));
+    let check = run(&mut s, "roof_check", json!({"id": roof}));
+    assert_eq!((check["ok"].clone(), check["framing"]["members"].clone()), (json!(false), json!(0)));
+
+    // Fiber cement on steel purlins: purlins only.
+    run(&mut s, "element_set", json!({"id": roof, "params": {"shape": {"Gable": {"slope": 0.2, "ridge_deg": 0}}}}));
+    run(&mut s, "type_set", json!({"type": ty, "params": {"covering": "FiberCement", "framing": {"system": "Steel"}}}));
+    let check = run(&mut s, "roof_check", json!({"id": roof}));
+    assert_eq!(check["ok"], true, "{check}");
+    assert!(check["framing"]["purlins"].as_f64().unwrap() > 0.0);
+    assert_eq!((check["framing"]["rafters"].as_f64(), check["framing"]["battens"].as_f64()), (Some(0.0), Some(0.0)));
+    assert_eq!(fails(&mut s, "roof_check", json!({"id": ty})), ErrorCode::NotFound);
+}
+
+/// Outlines drawn with curves: a mass on a circle and a floor from a
+/// rectangle with a round opening keep their curves, which follow moves and
+/// rotations; `sketch_set` draws a roof's outline again; an outline edited
+/// without its curves drops them; open and crossing sketches are refused.
+#[test]
+fn sketched_outlines_keep_their_curves() {
+    let mut s = Session::default();
+    let area = |s: &mut Session, id: u64| run(s, "element_get", json!({"id": id}))["derived"]["volume"].as_f64();
+    // A mass on a circle of radius 5: its outline is the circle's chords.
+    let mass = id(&run(
+        &mut s,
+        "mass_create",
+        json!({"curves": [{"kind": "circle", "center": [0, 0], "radius": 5}], "height": 3}),
+    ));
+    let volume = area(&mut s, mass).unwrap();
+    assert!((volume - std::f64::consts::PI * 25.0 * 3.0).abs() < 0.2, "{volume}");
+    let got = run(&mut s, "sketch_get", json!({"id": mass}));
+    assert_eq!((got["drawn"].clone(), got["curves"][0]["kind"].clone()), (json!(true), json!("circle")));
+
+    // A floor from a rectangle with a round opening (a loop inside it).
+    let floor = id(&run(
+        &mut s,
+        "floor_create",
+        json!({"curves": [
+            {"kind": "rectangle", "corner": [20, 0], "opposite": [30, 8]},
+            {"kind": "circle", "center": [25, 4], "radius": 1},
+        ]}),
+    ));
+    let params = &run(&mut s, "element_get", json!({"id": floor}))["params"];
+    assert_eq!(params["openings"].as_array().unwrap().len(), 1);
+    assert_eq!(run(&mut s, "sketch_get", json!({"id": floor}))["curves"].as_array().unwrap().len(), 5);
+
+    // Moved and turned, the curves go along.
+    run(&mut s, "elements_move", json!({"ids": [floor], "delta": [0, 10]}));
+    run(&mut s, "elements_rotate", json!({"ids": [floor], "angle": 90, "center": [20, 10]}));
+    let curves = run(&mut s, "sketch_get", json!({"id": floor}))["curves"].clone();
+    assert_eq!(curves.as_array().unwrap().len(), 5, "still drawn: {curves}");
+    let circle = curves.as_array().unwrap().iter().find(|c| c["kind"] == "circle").unwrap();
+    let c = (circle["center"][0].as_f64().unwrap(), circle["center"][1].as_f64().unwrap());
+    assert!((c.0 - 16.0).abs() < 1e-9 && (c.1 - 15.0).abs() < 1e-9, "{c:?}");
+    assert_eq!(run(&mut s, "sketch_get", json!({"id": floor}))["drawn"], true);
+
+    // Edit the boundary of a roof: an ellipse, with an arc-ended courtyard.
+    let roof =
+        id(&run(&mut s, "roof_create", json!({"boundary": [[40, 0], [50, 0], [50, 10], [40, 10]], "overhang": 0})));
+    assert_eq!(run(&mut s, "sketch_get", json!({"id": roof}))["drawn"], false, "lines along its outline");
+    run(
+        &mut s,
+        "sketch_set",
+        json!({"id": roof, "curves": [
+            {"kind": "ellipse", "center": [45, 5], "radii": [6, 4]},
+            {"kind": "line", "start": [44, 4], "end": [46, 4]},
+            {"kind": "arc", "start": [46, 4], "end": [46, 6], "bulge": 1},
+            {"kind": "line", "start": [46, 6], "end": [44, 6]},
+            {"kind": "arc", "start": [44, 6], "end": [44, 4], "bulge": 1},
+        ]}),
+    );
+    let params = &run(&mut s, "element_get", json!({"id": roof}))["params"];
+    assert!(params["footprint"].as_array().unwrap().len() > 60, "the ellipse's chords");
+    assert_eq!(params["holes"].as_array().unwrap().len(), 1);
+    run(&mut s, "undo", json!({}));
+    assert_eq!(run(&mut s, "element_get", json!({"id": roof}))["params"]["footprint"].as_array().unwrap().len(), 4);
+    run(&mut s, "redo", json!({}));
+
+    // The outline edited on its own leaves the curves behind.
+    run(&mut s, "element_set", json!({"id": mass, "params": {"outline": [[0, 0], [4, 0], [4, 4], [0, 4]]}}));
+    assert_eq!(run(&mut s, "sketch_get", json!({"id": mass}))["drawn"], false);
+
+    // Refused: an open sketch, crossing loops, openings in a ceiling or a mass, two inputs.
+    let open =
+        json!([{"kind": "line", "start": [0, 0], "end": [4, 0]}, {"kind": "line", "start": [4, 0], "end": [4, 4]}]);
+    assert_eq!(fails(&mut s, "floor_create", json!({"curves": open})), ErrorCode::InvalidArguments);
+    let crossing =
+        json!([{"kind": "circle", "center": [0, 0], "radius": 2}, {"kind": "circle", "center": [1, 0], "radius": 2}]);
+    assert_eq!(fails(&mut s, "sketch_set", json!({"id": floor, "curves": crossing})), ErrorCode::InvalidArguments);
+    let holed =
+        json!([{"kind": "circle", "center": [0, 0], "radius": 3}, {"kind": "circle", "center": [0, 0], "radius": 1}]);
+    assert_eq!(fails(&mut s, "ceiling_create", json!({"curves": holed})), ErrorCode::InvalidArguments);
+    assert_eq!(fails(&mut s, "sketch_set", json!({"id": mass, "curves": holed})), ErrorCode::InvalidArguments);
+    let both =
+        json!({"boundary": [[0, 0], [1, 0], [1, 1]], "curves": [{"kind": "circle", "center": [0, 0], "radius": 1}]});
+    assert_eq!(fails(&mut s, "floor_create", both), ErrorCode::InvalidArguments);
+}
+
+/// Swept profiles: a baseboard type comes with the first sweep; closed paths
+/// run around a room; profiles come from points or curves and are checked;
+/// a mirror keeps the profile on its wall's side; IFC writes moldings.
+#[test]
+fn sweeps_carry_a_profile_along_a_path() {
+    let mut s = Session::default();
+    let volume = |s: &mut Session, id: u64| run(s, "element_get", json!({"id": id}))["derived"]["volume"].as_f64();
+    // Around a 4 × 3 m room, counter-clockwise: the baseboard on the left is inside.
+    let room = json!({"path": [[0, 0], [4, 0], [4, 3], [0, 3]], "closed": true});
+    let board = run(&mut s, "sweep_create", room);
+    let bid = id(&board);
+    assert_eq!(board["category"], "sweep", "{board}");
+    let types = run(&mut s, "types_list", json!({"category": "sweep"}));
+    assert_eq!(types.as_array().map(Vec::len), Some(1), "{types}");
+    // (12 - 3.97 × 2.97) × 0.10 m³ of a 1.5 × 10 cm board.
+    let inside = (12.0 - 3.97 * 2.97) * 0.1;
+    assert!(volume(&mut s, bid).is_some_and(|v| (v - inside).abs() < 1e-9), "{:?}", volume(&mut s, bid));
+    let got = run(&mut s, "element_get", json!({"id": bid}));
+    assert!((got["derived"]["length"].as_f64().unwrap() - 14.0).abs() < 1e-9);
+    // Flipped, it runs outside: (4.03 × 3.03 - 12) × 0.10.
+    run(&mut s, "element_set", json!({"id": bid, "params": {"flip": true}}));
+    let outside = (4.03 * 3.03 - 12.0) * 0.1;
+    assert!(volume(&mut s, bid).is_some_and(|v| (v - outside).abs() < 1e-9));
+    // A mirrored copy keeps the profile on the same side of the path.
+    let mirrored =
+        run(&mut s, "elements_mirror", json!({"ids": [bid], "axis": [[10.0, 0.0], [10.0, 1.0]], "copy": true}));
+    let copy = mirrored["created"][0].as_u64().unwrap();
+    assert_eq!(run(&mut s, "element_get", json!({"id": copy}))["params"]["flip"], false);
+    assert!(volume(&mut s, copy).is_some_and(|v| (v - outside).abs() < 1e-9));
+
+    // A crown molding drawn with curves: a quarter-round cove of 6 cm, 2.7 m up, open path.
+    let cove = json!([
+        {"kind": "line", "start": [0, 0], "end": [0.06, 0]},
+        {"kind": "arc", "start": [0.06, 0], "end": [0, 0.06], "bulge": -0.41421356237},
+        {"kind": "line", "start": [0, 0.06], "end": [0, 0]}
+    ]);
+    let crown = run(&mut s, "sweep_type_create", json!({"name": "Crown", "curves": cove}));
+    let molding =
+        run(&mut s, "sweep_create", json!({"path": [[0, 0], [4, 0]], "type": crown["id"], "base_offset": 2.64}));
+    // 4 m of the corner square less the quarter circle: 4 × (0.06² - π 0.06² / 4).
+    let expected = 4.0 * (0.0036 - std::f64::consts::PI * 0.0036 / 4.0);
+    let v = volume(&mut s, id(&molding)).unwrap();
+    assert!((v - expected).abs() < 2e-5, "{v} vs {expected}");
+    // The type keeps the curves (the arc as an arc) to edit the profile again (#166).
+    let sketch = |s: &mut Session| run(s, "type_get", json!({"type": crown["id"]}))["params"]["sketch"].clone();
+    let kept = sketch(&mut s);
+    assert_eq!(kept["curves"].as_array().map(Vec::len), Some(3), "{kept}");
+    assert!(kept.to_string().contains("Arc"), "{kept}");
+    run(&mut s, "sweep_profile_set", json!({"type": crown["id"], "curves": cove}));
+    assert_eq!(sketch(&mut s), kept);
+    // A profile changed without its curves leaves them behind.
+    let square = json!([[0, 0], [0.06, 0], [0.06, 0.06], [0, 0.06]]);
+    run(&mut s, "type_set", json!({"type": crown["id"], "params": {"profile": square}}));
+    assert!(sketch(&mut s).is_null());
+    run(&mut s, "sweep_profile_set", json!({"type": crown["id"], "curves": cove}));
+    // Redrawn by points: a fascia board 2.5 × 20 cm.
+    let fascia = json!([[0, 0], [0.025, 0], [0.025, 0.2], [0, 0.2]]);
+    run(&mut s, "sweep_profile_set", json!({"type": crown["id"], "profile": fascia}));
+    assert!(volume(&mut s, id(&molding)).is_some_and(|v| (v - 4.0 * 0.005).abs() < 1e-9));
+    assert!(sketch(&mut s).is_null(), "points drop the curves");
+
+    // Refused: a crossing profile, both points and curves, a short path, a profile on a wall type.
+    let wall_type = run(&mut s, "types_list", json!({"category": "wall"}))[0]["id"].clone();
+    let depth = s.doc.undo_depth();
+    let bow = json!([[0, 0], [0.1, 0.1], [0.1, 0], [0, 0.1]]);
+    assert_eq!(fails(&mut s, "sweep_type_create", json!({"profile": bow})), ErrorCode::InvalidArguments);
+    let both = json!({"profile": fascia, "curves": cove});
+    assert_eq!(fails(&mut s, "sweep_type_create", both), ErrorCode::InvalidArguments);
+    assert_eq!(
+        fails(&mut s, "sweep_create", json!({"path": [[0, 0], [1, 0]], "closed": true})),
+        ErrorCode::InvalidArguments
+    );
+    assert_eq!(
+        fails(&mut s, "sweep_profile_set", json!({"type": wall_type, "profile": fascia})),
+        ErrorCode::InvalidArguments
+    );
+    assert!(
+        s.execute("type_set", json!({"type": crown["id"], "params": {"profile": [[0, 0], [1, 1]]}})).is_err(),
+        "a profile of two points is refused"
+    );
+    assert_eq!(s.doc.undo_depth(), depth);
+
+    // IFC: coverings typed as moldings; saved and loaded, they come back.
+    let ifc = scratch("sweeps.ifc");
+    run(&mut s, "ifc_export", json!({"path": ifc.to_string_lossy()}));
+    let text = std::fs::read_to_string(&ifc).unwrap();
+    assert!(text.contains("IFCCOVERINGTYPE") && text.matches(".MOLDING.").count() >= 4, "moldings");
+    assert_representation_types(&text);
+    let path = scratch("sweeps.ccad");
+    run(&mut s, "project_save", json!({"path": path}));
+    let mut t = Session::default();
+    run(&mut t, "project_open", json!({"path": path}));
+    assert!(volume(&mut t, bid).is_some_and(|v| (v - outside).abs() < 1e-9));
+}
+
+/// Railings put on stairs and ramps: on the side nearest a picked point, an
+/// existing railing attached to the side its path runs along, switched to
+/// the other side, and taken off again keeping its plan path.
+#[test]
+fn railings_take_and_leave_a_host() {
+    let mut s = Session::default();
+    let stair = id(&run(&mut s, "stair_create", json!({"start": [0, 0], "direction": 0})));
+    let host_of = |s: &mut Session, id: u64| run(s, "element_get", json!({"id": id}))["params"]["stair"].clone();
+    let length = |s: &mut Session, id: u64| run(s, "element_get", json!({"id": id}))["derived"]["length"].as_f64();
+    // A click below the stair (walking up +x, that is its right side) puts one railing there.
+    let added = run(&mut s, "stair_railings_add", json!({"id": stair, "near": [1.0, -3.0]}));
+    let ids = added["ids"].as_array().unwrap();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(host_of(&mut s, ids[0].as_u64().unwrap())["side"], "Right");
+
+    // A railing drawn along the stair's left edge, then attached: it takes the left side and climbs.
+    let drawn = id(&run(&mut s, "railing_create", json!({"path": [[0.5, 0.6], [3.0, 0.6]]})));
+    assert!((length(&mut s, drawn).unwrap() - 2.5).abs() < 1e-9);
+    let set = run(&mut s, "railing_host_set", json!({"id": drawn, "host": stair}));
+    assert_eq!((set["side"].as_str(), set["host"].as_u64()), (Some("left"), Some(stair)), "{set}");
+    let climbing = length(&mut s, drawn).unwrap();
+    assert!(climbing > 3.0, "it follows the stair up: {climbing}");
+    // Switched to the right, closer in.
+    run(&mut s, "railing_host_set", json!({"id": drawn, "side": "right", "inset": 0.1}));
+    let h = host_of(&mut s, drawn);
+    assert_eq!(h["side"], "Right");
+    assert!((h["inset"].as_f64().unwrap() - 0.1).abs() < 1e-12);
+    // Taken off: flat, along the plan path it had.
+    run(&mut s, "railing_host_set", json!({"id": drawn, "detach": true}));
+    assert!(host_of(&mut s, drawn).is_null());
+    let flat = length(&mut s, drawn).unwrap();
+    assert!(flat > 2.0 && flat < climbing, "{flat} vs {climbing}");
+    run(&mut s, "undo", json!({}));
+    assert!(!host_of(&mut s, drawn).is_null());
+
+    // A ramp hosts too.
+    let ramp = id(&run(&mut s, "ramp_create", json!({"start": [0, 10], "direction": 0})));
+    let on_ramp = run(&mut s, "railing_host_set", json!({"id": drawn, "host": ramp, "side": "left"}));
+    assert_eq!(on_ramp["host"].as_u64(), Some(ramp));
+
+    // Refused without an undo step.
+    let wall = id(&run(&mut s, "wall_create", json!({"start": [20, 0], "end": [25, 0]})));
+    let depth = s.doc.undo_depth();
+    for args in [
+        json!({"id": drawn, "host": wall}),
+        json!({"id": drawn, "host": stair, "detach": true}),
+        json!({"id": drawn, "side": "up"}),
+        json!({"id": wall, "host": stair}),
+    ] {
+        let code = fails(&mut s, "railing_host_set", args.clone());
+        assert!(matches!(code, ErrorCode::InvalidArguments | ErrorCode::NotFound), "{args}: {code:?}");
+    }
+    run(&mut s, "railing_host_set", json!({"id": drawn, "detach": true}));
+    assert_eq!(fails(&mut s, "railing_host_set", json!({"id": drawn, "detach": true})), ErrorCode::InvalidArguments);
+    assert_eq!(s.doc.undo_depth(), depth + 1);
+}
+
+#[test]
+fn site_location_is_set_patched_and_cleared() {
+    let mut s = Session::default();
+    assert_eq!(run(&mut s, "site_get", json!({}))["site"], Value::Null);
+    // A new location needs both coordinates.
+    assert_eq!(fails(&mut s, "site_set", json!({"latitude": -3.73})), ErrorCode::InvalidArguments);
+    let out = run(
+        &mut s,
+        "site_set",
+        json!({
+            "latitude": -3.7319, "longitude": -38.5267, "elevation": 21.5, "true_north": 370,
+            "place": "Praça do Ferreira",
+            "address": {"street": "Rua Floriano Peixoto", "number": "10", "city": "Fortaleza", "region": "CE", "country": "Brasil"}
+        }),
+    );
+    assert_eq!(out["site"]["elevation"], 21.5);
+    assert_eq!(out["site"]["true_north"], 10.0);
+    assert_eq!(out["address"], "Rua Floriano Peixoto, 10, Fortaleza - CE, Brasil");
+    // Fields left out keep their values; the project address stays when asked.
+    let out = run(&mut s, "site_set", json!({"elevation": 30, "address": {"number": "12"}, "project_address": false}));
+    assert_eq!(out["site"]["latitude"], -3.7319);
+    assert_eq!(out["site"]["address"]["number"], "12");
+    assert_eq!(out["address"], "Rua Floriano Peixoto, 10, Fortaleza - CE, Brasil");
+    assert_eq!(fails(&mut s, "site_set", json!({"latitude": 95})), ErrorCode::InvalidArguments);
+    assert_eq!(fails(&mut s, "site_set", json!({"address": {"planet": "Earth"}})), ErrorCode::InvalidArguments);
+    assert_eq!(fails(&mut s, "site_set", json!({"elevation": 20000})), ErrorCode::InvalidArguments);
+    // The location is saved with the project and reloads.
+    let path = scratch("site.ccad");
+    run(&mut s, "project_save", json!({"path": path}));
+    let mut t = Session::default();
+    run(&mut t, "project_open", json!({"path": path}));
+    assert_eq!(run(&mut t, "site_get", json!({}))["site"]["elevation"], 30.0);
+    // One undo step each; clear removes it.
+    run(&mut s, "site_set", json!({"clear": true}));
+    assert_eq!(run(&mut s, "site_get", json!({}))["site"], Value::Null);
+    run(&mut s, "undo", json!({}));
+    assert_eq!(run(&mut s, "site_get", json!({}))["site"]["elevation"], 30.0);
+}
+
+#[test]
+fn site_context_comes_in_as_a_drawing_and_masses() {
+    let mut s = Session::default();
+    let overpass = json!({"elements": [
+        {"type": "way", "id": 1, "tags": {"building": "yes", "building:levels": "3", "name": "Bloco A"},
+         "geometry": [{"lat": -3.7319, "lon": -38.5267}, {"lat": -3.7319, "lon": -38.5265},
+                      {"lat": -3.7317, "lon": -38.5265}, {"lat": -3.7317, "lon": -38.5267},
+                      {"lat": -3.7319, "lon": -38.5267}]},
+        {"type": "way", "id": 2, "tags": {"highway": "residential", "name": "Rua Major Facundo"},
+         "geometry": [{"lat": -3.7322, "lon": -38.5275}, {"lat": -3.7322, "lon": -38.5255}]}
+    ]})
+    .to_string();
+    // The location places the data, so it comes first.
+    assert_eq!(fails(&mut s, "site_context_import", json!({"data": overpass})), ErrorCode::Rejected);
+    run(&mut s, "site_set", json!({"latitude": -3.7319, "longitude": -38.5267}));
+    let out = run(&mut s, "site_context_import", json!({"data": overpass, "extent": 150}));
+    assert_eq!(out["layers"]["buildings"], 1);
+    assert_eq!(out["layers"]["streets"], 1);
+    assert_eq!(out["layers"]["names"], 1);
+    assert!(out["attribution"].as_str().unwrap().contains("OpenStreetMap"));
+    let masses = out["masses"].as_array().unwrap();
+    assert_eq!(masses.len(), 1);
+    let mass = run(&mut s, "element_get", json!({"id": masses[0]}));
+    assert!((mass["params"]["height"].as_f64().unwrap() - 9.0).abs() < 1e-9, "{mass}");
+    assert!(mass["comments"].as_str().unwrap().contains("Bloco A"));
+    // The footprint starts at the project origin: the site's point.
+    let outline = mass["params"]["outline"].as_array().unwrap();
+    assert!(outline.iter().any(|p| p[0].as_f64().unwrap().abs() < 0.01 && p[1].as_f64().unwrap().abs() < 0.01));
+    let drawing = run(&mut s, "element_get", json!({"id": out["drawing"]}));
+    assert_eq!(drawing["category"], "cadimport");
+    // One undo step removes both.
+    run(&mut s, "undo", json!({}));
+    assert!(run(&mut s, "elements_list", json!({"category": "mass"})).as_array().unwrap().is_empty());
+    // Without masses, only the drawing; data with nothing to draw is refused.
+    let out = run(&mut s, "site_context_import", json!({"data": overpass, "masses": false}));
+    assert!(out["masses"].as_array().unwrap().is_empty());
+    assert_eq!(
+        fails(&mut s, "site_context_import", json!({"data": "{\"elements\": []}"})),
+        ErrorCode::InvalidArguments
+    );
+    assert_eq!(fails(&mut s, "site_context_import", json!({"data": "nonsense"})), ErrorCode::InvalidArguments);
+}
+
+/// `component_create` with a `kind` and no `def` starts the component from
+/// the kind's own parameters: sizes for furniture, a diameter for lighting,
+/// the opening's for doors and windows, none for a generic one.
+#[test]
+fn component_create_starts_from_a_kind() {
+    let mut s = Session::default();
+    let params = |v: &Value| -> Vec<String> {
+        v["params"]["def"]["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let counts = [
+        ("Furniture", 3),
+        ("Casework", 3),
+        ("Plumbing", 3),
+        ("Electrical", 3),
+        ("Lighting", 2),
+        ("Generic", 0),
+        ("Door", 2),
+        ("window", 3),
+    ];
+    for (kind, count) in counts {
+        let ty = run(&mut s, "component_create", json!({"name": format!("New {kind}"), "kind": kind}));
+        assert_eq!(params(&ty).len(), count, "{kind}: {:?}", params(&ty));
+        assert!(ty["params"]["def"]["kind"].as_str().unwrap().eq_ignore_ascii_case(kind), "{kind}");
+        assert!(!ty["params"]["def"]["items"].as_array().unwrap().is_empty(), "{kind}");
+    }
+    // Doors and windows cut their opening: they are types of those categories.
+    let door = run(&mut s, "component_create", json!({"name": "Door 2", "kind": "Door"}));
+    assert_eq!(door["category"], "door");
+    // No kind and no definition: a generic component.
+    let plain = run(&mut s, "component_create", json!({"name": "Plain"}));
+    assert_eq!(plain["params"]["def"]["kind"], "Generic");
+    for bad in [json!({"name": "X", "kind": "Chair"}), json!({"name": "X", "kind": "TitleBlock"})] {
+        assert_eq!(fails(&mut s, "component_create", bad), ErrorCode::InvalidArguments);
+    }
+    let both = json!({"name": "X", "kind": "Door", "def": plain["params"]["def"]});
+    assert_eq!(fails(&mut s, "component_create", both), ErrorCode::InvalidArguments);
 }

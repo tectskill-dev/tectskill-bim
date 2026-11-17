@@ -94,10 +94,15 @@ pub enum Pattern {
     Sand,
     /// Zig-zag batt insulation.
     Insulation,
+    /// Earth: blocks of short strokes, alternately at 45° and 135° (a weave).
+    Earth,
+    /// One of the project's own patterns (`Project::fill_patterns`).
+    Custom(crate::FillPatternId),
 }
 
 impl Pattern {
-    pub const ALL: [Pattern; 12] = [
+    /// The built-in patterns (custom ones live in the project).
+    pub const ALL: [Pattern; 13] = [
         Pattern::None,
         Pattern::Solid,
         Pattern::Diagonal,
@@ -110,6 +115,7 @@ impl Pattern {
         Pattern::Concrete,
         Pattern::Sand,
         Pattern::Insulation,
+        Pattern::Earth,
     ];
 
     pub fn key(self) -> &'static str {
@@ -126,6 +132,8 @@ impl Pattern {
             Pattern::Concrete => "pattern-concrete",
             Pattern::Sand => "pattern-sand",
             Pattern::Insulation => "pattern-insulation",
+            Pattern::Earth => "pattern-earth",
+            Pattern::Custom(_) => "pattern-custom",
         }
     }
 }
@@ -224,6 +232,81 @@ impl Finish {
     }
 }
 
+/// Largest texture image file kept, bytes.
+pub const MAX_TEXTURE_BYTES: usize = 16 << 20;
+/// Most pixels a texture image may have (width × height).
+pub const MAX_TEXTURE_PIXELS: u64 = 4096 * 4096;
+/// Smallest and largest real-world size of one repeat of a texture, meters.
+pub const MIN_TEXTURE_SIZE: f64 = 0.001;
+pub const MAX_TEXTURE_SIZE: f64 = 1000.0;
+
+fn one() -> f64 {
+    1.0
+}
+
+/// An image laid on a material's surfaces in the textures style: one repeat
+/// covers `width` × `height` meters, moved by `offset` and turned by
+/// `rotation_deg` in the face's plane coordinates (see [`Self::map`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaterialTexture {
+    /// The image file (shared: undo steps and copies do not copy the bytes).
+    pub image: std::sync::Arc<crate::raster::RasterImage>,
+    #[serde(default = "one")]
+    pub width: f64,
+    #[serde(default = "one")]
+    pub height: f64,
+    /// Where a repeat starts, meters along the face's plane axes.
+    #[serde(default)]
+    pub offset: [f64; 2],
+    #[serde(default)]
+    pub rotation_deg: f64,
+}
+
+impl MaterialTexture {
+    /// A texture of `image` repeating every `width` × `height` meters.
+    pub fn new(image: crate::raster::RasterImage, width: f64, height: f64) -> Self {
+        Self { image: std::sync::Arc::new(image), width, height, offset: [0.0, 0.0], rotation_deg: 0.0 }
+    }
+
+    /// Whether the image is one a texture may hold (valid, within the size limits).
+    pub fn image_ok(&self) -> bool {
+        self.image.is_valid()
+            && self.image.data.len() <= MAX_TEXTURE_BYTES
+            && u64::from(self.image.width) * u64::from(self.image.height) <= MAX_TEXTURE_PIXELS
+    }
+
+    /// Replace sizes, offsets and angles that are not finite or out of
+    /// range; returns the number of fixes (the image is checked by the caller).
+    pub fn repair(&mut self) -> usize {
+        let mut fixes = 0;
+        for v in [&mut self.width, &mut self.height] {
+            if !(v.is_finite() && (MIN_TEXTURE_SIZE..=MAX_TEXTURE_SIZE).contains(v)) {
+                *v = if v.is_finite() { v.clamp(MIN_TEXTURE_SIZE, MAX_TEXTURE_SIZE) } else { 1.0 };
+                fixes += 1;
+            }
+        }
+        for v in self.offset.iter_mut().chain([&mut self.rotation_deg]) {
+            if !(v.is_finite() && v.abs() <= 1e6) {
+                *v = 0.0;
+                fixes += 1;
+            }
+        }
+        fixes
+    }
+
+    /// Texture coordinates (in repeats, `v` up the image) of a point with
+    /// plane coordinates `uv` in meters: moved by the offset, turned by the
+    /// rotation and scaled by the size.
+    pub fn map(&self, uv: [f64; 2]) -> [f64; 2] {
+        let (x, y) = (uv[0] - self.offset[0], uv[1] - self.offset[1]);
+        let (s, c) = (-self.rotation_deg).to_radians().sin_cos();
+        let (x, y) = (x * c - y * s, x * s + y * c);
+        let w = if self.width.abs() > 1e-9 { self.width } else { 1.0 };
+        let h = if self.height.abs() > 1e-9 { self.height } else { 1.0 };
+        [x / w, y / h]
+    }
+}
+
 /// Render appearance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -231,11 +314,15 @@ pub struct MaterialAppearance {
     pub color: [u8; 3],
     pub finish: Finish,
     pub description: String,
+    /// An image mapped on the faces in the textures style (the color shows
+    /// where it cannot be drawn).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub texture: Option<MaterialTexture>,
 }
 
 impl Default for MaterialAppearance {
     fn default() -> Self {
-        Self { color: [200, 200, 200], finish: Finish::Matte, description: String::new() }
+        Self { color: [200, 200, 200], finish: Finish::Matte, description: String::new(), texture: None }
     }
 }
 
@@ -347,6 +434,14 @@ impl Material {
                 fixes += 1;
             }
         }
+        if let Some(texture) = &mut self.appearance.texture {
+            if texture.image_ok() {
+                fixes += texture.repair();
+            } else {
+                self.appearance.texture = None;
+                fixes += 1;
+            }
+        }
         fixes
     }
 }
@@ -399,6 +494,14 @@ pub fn template_properties(m: &mut Material, class: MaterialClass) {
             set(30.0, 0.035, 1030.0);
             Pattern::Insulation
         }
+        MaterialClass::Metal => {
+            set(7850.0, 50.0, 490.0);
+            Pattern::None
+        }
+        MaterialClass::Earth => {
+            set(1800.0, 1.5, 1000.0);
+            Pattern::Earth
+        }
         _ => Pattern::None,
     };
     m.identity.class = class;
@@ -423,6 +526,32 @@ mod tests {
         assert_eq!(m.repair(), 3);
         assert_eq!(m.graphics.transparency, 0.0);
         assert_eq!(m.physical.density, None);
+    }
+
+    #[test]
+    fn textures_map_and_repair() {
+        let png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let image =
+            crate::raster::RasterImage { format: crate::raster::RasterFormat::Png, width: 2, height: 2, data: png };
+        let mut t = MaterialTexture::new(image, 2.0, 0.5);
+        assert_eq!(t.map([1.0, 1.0]), [0.5, 2.0]);
+        t.offset = [1.0, 0.0];
+        t.rotation_deg = 90.0;
+        let [u, v] = t.map([1.0, 1.0]);
+        // (0, 1) turned back a quarter: (1, 0), then scaled.
+        assert!((u - 0.5).abs() < 1e-9 && v.abs() < 1e-9, "{u} {v}");
+        let mut m = Material::new("X", [1, 2, 3]);
+        t.width = f64::NAN;
+        t.offset[1] = f64::INFINITY;
+        m.appearance.texture = Some(t.clone());
+        assert_eq!(m.repair(), 2);
+        assert_eq!(m.appearance.texture.as_ref().map(|t| t.width), Some(1.0));
+        // An image that is not what it says is dropped.
+        let mut bad = (*t.image).clone();
+        bad.data = b"not a picture".to_vec();
+        m.appearance.texture = Some(MaterialTexture { image: std::sync::Arc::new(bad), ..t });
+        assert_eq!(m.repair(), 1);
+        assert!(m.appearance.texture.is_none());
     }
 
     #[test]

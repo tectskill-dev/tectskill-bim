@@ -10,7 +10,8 @@ use crate::registry::{Command, CommandKind};
 use crate::session::Session;
 use crate::t;
 use cc_core::{
-    Category, ElementId, ElementKind, Railing, Stair, StairLayout, StairRailing, StairShape, StairSide, Turn, WallTop,
+    Category, ElementId, ElementKind, PostAt, Railing, Stair, StairLayout, StairRailing, StairShape, StairSide, Turn,
+    TypeData, WallTop,
 };
 use glam::DVec2;
 use schemars::JsonSchema;
@@ -18,11 +19,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Names of the stair shapes in commands.
-pub const SHAPES: [(&str, StairShape); 5] = [
+pub const SHAPES: [(&str, StairShape); 6] = [
     ("straight", StairShape::Straight),
     ("straight_landing", StairShape::StraightLanding),
     ("l_shaped", StairShape::LShaped),
     ("u_shaped", StairShape::UShaped),
+    ("three_flight", StairShape::ThreeFlight),
     ("spiral", StairShape::Spiral),
 ];
 
@@ -30,9 +32,12 @@ const TURNS: [(&str, Turn); 2] = [("left", Turn::Left), ("right", Turn::Right)];
 
 /// Create a stair starting at `start` (the middle of its first riser) and
 /// rising along `direction` up to the level above (or `height`). Risers and
-/// treads follow the type: the fewest risers within its maximum, and a fixed
-/// tread or one from Blondel's formula (`2 × riser + tread`). `shape` lays it
-/// out straight, with a landing, L- or U-shaped, or around a center.
+/// treads follow the type (the fewest risers within its maximum, and a fixed
+/// tread or one from Blondel's formula `2 × riser + tread`) unless `risers`
+/// or `tread` set them: the riser height is then the height over the risers.
+/// `shape` lays it out straight, with a landing, L- or U-shaped, in three
+/// flights round two landings, or around a center. The top floor is the last
+/// step: a stair ends with a riser, not a tread.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct StairCreate {
@@ -47,46 +52,89 @@ pub struct StairCreate {
     /// Type id or name (default: the category's default type).
     #[serde(default, rename = "type")]
     pub type_ref: Option<Ref>,
-    /// Height when there is no level above (default 3).
+    /// Height when there is no level above (default 3; 10'-0" in imperial projects).
     #[serde(default)]
     pub height: Option<f64>,
     /// Level the stair rises to (default: the level above).
     #[serde(default)]
     pub top_level: Option<Ref>,
-    /// Plan shape: `straight` (default), `straight_landing`, `l_shaped`, `u_shaped` or `spiral`.
+    /// Plan shape: `straight` (default), `straight_landing`, `l_shaped`,
+    /// `u_shaped`, `three_flight` (up, across and back, with a landing at
+    /// each corner) or `spiral`.
     #[serde(default)]
     pub shape: Option<String>,
     /// Side the stair turns to, walking up: `left` (default) or `right`.
     #[serde(default)]
     pub turn: Option<String>,
-    /// Risers of the first flight (default: half of them).
+    /// Riser count (default: the fewest within the type's maximum riser).
+    #[serde(default)]
+    pub risers: Option<u32>,
+    /// Tread depth, meters (default: the type's).
+    #[serde(default)]
+    pub tread: Option<f64>,
+    /// Risers of the first flight (default: half of them; a third on a three-flight stair).
     #[serde(default)]
     pub split: Option<u32>,
+    /// Risers of the middle flight of a three-flight stair (default: half of those left).
+    #[serde(default)]
+    pub split2: Option<u32>,
     /// Landing depth along the first flight, meters (default: the stair width).
     #[serde(default)]
     pub landing: Option<f64>,
-    /// Clear gap between the flights of a U-shaped stair, meters (default 0.1).
+    /// Clear gap between the flights of a U-shaped stair, meters (default 0.1; 4" in imperial projects).
     #[serde(default)]
     pub gap: Option<f64>,
     /// Winder treads in the corner of an L-shaped stair instead of a landing (2 to 6).
     #[serde(default)]
     pub winders: Option<u32>,
-    /// Radius of the inner edge of a spiral stair, meters (default 0.15).
+    /// Radius of the inner edge of a spiral stair, meters (default 0.15; 6" in imperial projects).
     #[serde(default)]
     pub inner_radius: Option<f64>,
+    /// Posts under the landings of an assembled stair, down to its base: a
+    /// list per landing (up the stair) of places round its edge, named
+    /// walking onto it (front: where the stair arrives; inner: the side it
+    /// turns to): `front_outer`, `front`, `front_inner`, `inner`,
+    /// `back_inner`, `back`, `back_outer`, `outer`. Only places its beams
+    /// reach take a post (see `stair_check`); none by default.
+    #[serde(default)]
+    pub posts: Option<Vec<Vec<String>>>,
+    /// Number the steps in plans: the treads (winders included, landings
+    /// not) and the floor the stair arrives at (default false).
+    #[serde(default)]
+    pub numbers: Option<bool>,
+    /// Number of the first tread (default 1), from -9999 to 9999: another
+    /// value continues the count of a stair below, for instance.
+    #[serde(default)]
+    pub number_start: Option<i32>,
 }
 
 impl StairCreate {
     /// The plan layout these parameters ask for.
-    pub fn layout(&self) -> Result<StairLayout> {
-        let mut layout = StairLayout::default();
+    pub fn layout(&self, defaults: &cc_core::Defaults) -> Result<StairLayout> {
+        let (gap, inner_radius, _) = defaults.flights;
+        let mut layout = StairLayout { gap, inner_radius, ..Default::default() };
         if let Some(shape) = justification(self.shape.as_deref(), &SHAPES, "shape")? {
             layout.shape = shape;
         }
         if let Some(turn) = justification(self.turn.as_deref(), &TURNS, "turn")? {
             layout.turn = turn;
         }
-        layout.split = self.split.unwrap_or(0).min(200);
+        let max = cc_core::stair::MAX_RISERS;
+        layout.split = self.split.unwrap_or(0).min(max);
+        layout.split2 = self.split2.unwrap_or(0).min(max);
+        if let Some(n) = self.risers {
+            if n == 0 || n > max {
+                return Err(EngineError::invalid(format!("risers must be from 1 to {max}")));
+            }
+            layout.risers = n;
+        }
+        if let Some(v) = self.tread {
+            let v = positive(v, "tread")?;
+            if v > 2.0 {
+                return Err(EngineError::invalid("tread must be at most 2 m"));
+            }
+            layout.tread = v;
+        }
         if let Some(v) = self.landing {
             layout.landing = positive(v, "landing")?;
         }
@@ -102,6 +150,28 @@ impl StairCreate {
         if let Some(v) = self.inner_radius {
             layout.inner_radius = finite(v, "inner_radius")?.max(0.0);
         }
+        if let Some(lists) = &self.posts {
+            if lists.len() > layout.posts.len() {
+                return Err(EngineError::invalid("a stair has at most two landings"));
+            }
+            for (posts, names) in layout.posts.iter_mut().zip(lists) {
+                for name in names {
+                    let at = PostAt::from_name(name).ok_or_else(|| {
+                        let all: Vec<&str> = PostAt::ALL.iter().map(|p| p.name()).collect();
+                        EngineError::invalid(format!("no post place '{name}' (one of {})", all.join(", ")))
+                    })?;
+                    posts.set(at, true);
+                }
+            }
+        }
+        layout.numbers = self.numbers.unwrap_or(false);
+        if let Some(n) = self.number_start {
+            let max = cc_core::stair::MAX_STEP_NUMBER;
+            if !(-max..=max).contains(&n) {
+                return Err(EngineError::invalid(format!("number_start must be from -{max} to {max}")));
+            }
+            layout.number_start = n;
+        }
         Ok(layout)
     }
 }
@@ -115,7 +185,7 @@ impl Command for StairCreate {
         let top = top(p, self.top_level.as_ref(), None)?.unwrap_or_else(|| default_top(p, level));
         let height = match top {
             WallTop::Level { level: t, .. } => p.level_elevation(t) - p.level_elevation(level),
-            WallTop::Unconnected => self.height.unwrap_or(3.0),
+            WallTop::Unconnected => self.height.unwrap_or(p.defaults().story),
         };
         let stair = Stair {
             start: point(self.start)?,
@@ -123,7 +193,7 @@ impl Command for StairCreate {
             base_offset: 0.0,
             height: positive(height, "height")?,
             top,
-            layout: self.layout()?,
+            layout: self.layout(p.defaults())?,
         };
         create(s, t!("tx-create-stair"), level, Category::Stair, self.type_ref.as_ref(), ElementKind::Stair(stair))
     }
@@ -131,7 +201,10 @@ impl Command for StairCreate {
 
 /// Check a stair's steps: riser count and height, tread on the walking line,
 /// Blondel's step `2 × riser + tread` and the rules of its type they break
-/// (riser out of range, short tread, step out of the Blondel range, short landing).
+/// (riser out of range, short tread, step out of the Blondel range, short
+/// landing). `landings` lists each landing's elevation and the places round
+/// its edge where a post can stand under an assembled stair (where its
+/// beams reach the edge), with their plan points and whether one stands there.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StairCheck {
@@ -148,6 +221,27 @@ impl Command for StairCheck {
         let g = cc_geom::stair_geom(p, el, st).ok_or_else(|| EngineError::invalid("the stair has no stair type"))?;
         let issues: Vec<Value> =
             g.check.issues.iter().map(|i| json!({"message": issue_text(i), "detail": i})).collect();
+        let build = match p.element_type(el.type_id).map(|t| &t.data) {
+            Some(TypeData::Stair { build, .. }) => *build,
+            _ => cc_core::StairBuild::default(),
+        };
+        let landings: Vec<Value> = g
+            .landings
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let placed = st.layout.posts.get(i).copied().unwrap_or_default();
+                let spots: Vec<Value> = l
+                    .post_spots(build.stringers, build.landing_beams)
+                    .into_iter()
+                    .map(|(at, spot)| {
+                        let q = l.point(spot);
+                        json!({"place": at.name(), "at": [q.x, q.y], "post": placed.get(at)})
+                    })
+                    .collect();
+                json!({"z": l.z, "posts": spots})
+            })
+            .collect();
         Ok(json!({
             "risers": g.risers,
             "riser": g.riser,
@@ -156,6 +250,7 @@ impl Command for StairCheck {
             "run": g.run(),
             "ok": g.check.ok(),
             "issues": issues,
+            "landings": landings,
         }))
     }
 }
@@ -163,6 +258,9 @@ impl Command for StairCheck {
 /// A broken stair rule in words.
 pub fn issue_text(issue: &cc_core::StairIssue) -> String {
     use cc_core::StairIssue as I;
+    if cc_views::format::imperial() {
+        return imperial_issue_text(issue);
+    }
     let cm = |v: f64| format!("{:.1}", v * 100.0);
     match *issue {
         I::RiserTooHigh { riser, max } => t!("stair-issue-riser-high", "riser" => cm(riser), "limit" => cm(max)),
@@ -173,6 +271,24 @@ pub fn issue_text(issue: &cc_core::StairIssue) -> String {
         }
         I::LandingTooShort { landing, min } => {
             t!("stair-issue-landing-short", "landing" => cm(landing), "limit" => cm(min))
+        }
+    }
+}
+
+/// A broken stair rule in words, in inches.
+fn imperial_issue_text(issue: &cc_core::StairIssue) -> String {
+    use cc_core::StairIssue as I;
+    let i = cc_views::format::inch_size;
+    match *issue {
+        I::RiserTooHigh { riser, max } => t!("stair-imp-issue-riser-high", "riser" => i(riser), "limit" => i(max)),
+        I::RiserTooLow { riser, min } => t!("stair-imp-issue-riser-low", "riser" => i(riser), "limit" => i(min)),
+        I::TreadTooShort { tread, min } => t!("stair-imp-issue-tread-short", "tread" => i(tread), "limit" => i(min)),
+        I::BlondelOutOfRange { step, min, max } => {
+            t!("stair-imp-issue-blondel", "step" => i(step), "min" => i(min), "max" => i(max))
+        }
+        I::LandingTooShort { landing, min } => {
+            let l = cc_views::format::meters;
+            t!("stair-imp-issue-landing-short", "landing" => l(landing), "limit" => l(min))
         }
     }
 }
@@ -204,6 +320,51 @@ pub struct StairRailingsAdd {
     /// Distance in from the edge of the stair, meters (default 0.05).
     #[serde(default)]
     pub inset: Option<f64>,
+    /// A point `[x, y]` in plan: without `side`, the railing goes on the
+    /// side nearest it (where a click picked the stair).
+    #[serde(default)]
+    pub near: Option<Point>,
+}
+
+/// The plan path of a railing along `side` of stair or ramp `el`, `inset` in from its edge.
+fn host_path(p: &cc_core::Project, el: &cc_core::Element, side: StairSide, inset: f64) -> Result<Vec<DVec2>> {
+    let no_type = || EngineError::invalid("the element has no type of its category");
+    let path = match &el.kind {
+        ElementKind::Stair(st) => cc_geom::stair_geom(p, el, st).ok_or_else(no_type)?.railing_path(side, inset),
+        ElementKind::Ramp(r) => cc_geom::ramp_geom(p, el, r).ok_or_else(no_type)?.railing_path(side, inset),
+        _ => return Err(EngineError::invalid(format!("element {} is not a stair or a ramp", el.id.0))),
+    };
+    Ok(path.iter().map(|q| q.truncate()).collect())
+}
+
+/// Distance from `q` to a polyline.
+fn distance_to(path: &[DVec2], q: DVec2) -> f64 {
+    path.windows(2)
+        .map(|w| cc_geom::polygon::closest_on_segment(w[0], w[1], q).0.distance(q))
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// The side of stair or ramp `el` whose railing path passes nearest `q`.
+fn nearest_side(p: &cc_core::Project, el: &cc_core::Element, inset: f64, q: DVec2) -> Result<StairSide> {
+    let left = distance_to(&host_path(p, el, StairSide::Left, inset)?, q);
+    let right = distance_to(&host_path(p, el, StairSide::Right, inset)?, q);
+    Ok(if right < left { StairSide::Right } else { StairSide::Left })
+}
+
+fn parse_side(side: &str) -> Result<StairSide> {
+    match side {
+        "left" => Ok(StairSide::Left),
+        "right" => Ok(StairSide::Right),
+        other => Err(EngineError::invalid(format!("side must be left or right, not '{other}'"))),
+    }
+}
+
+fn check_inset(inset: f64) -> Result<f64> {
+    let inset = finite(inset, "inset")?;
+    if inset.abs() >= 1.0 {
+        return Err(EngineError::invalid("inset must be under 1 m"));
+    }
+    Ok(inset)
 }
 
 impl Command for StairRailingsAdd {
@@ -214,33 +375,20 @@ impl Command for StairRailingsAdd {
         let Some(el) = p.element(ElementId(self.id)) else {
             return Err(EngineError::not_found(format!("no element {}", self.id)));
         };
-        let sides = match self.side.as_deref() {
-            None | Some("both") => vec![StairSide::Left, StairSide::Right],
-            Some("left") => vec![StairSide::Left],
-            Some("right") => vec![StairSide::Right],
-            Some(other) => {
-                return Err(EngineError::invalid(format!("side must be left, right or both, not '{other}'")));
-            }
+        let inset = check_inset(self.inset.unwrap_or(0.05))?;
+        let sides = match (self.side.as_deref(), self.near) {
+            (None, Some(q)) => vec![nearest_side(p, el, inset, point(q)?)?],
+            (None | Some("both"), _) => vec![StairSide::Left, StairSide::Right],
+            (Some(side), _) => vec![
+                parse_side(side)
+                    .map_err(|_| EngineError::invalid(format!("side must be left, right or both, not '{side}'")))?,
+            ],
         };
-        let inset = finite(self.inset.unwrap_or(0.05), "inset")?;
-        if inset.abs() >= 1.0 {
-            return Err(EngineError::invalid("inset must be under 1 m"));
-        }
         let type_id = refs::type_of(p, Category::Railing, self.type_ref.as_ref())?;
-        let no_type = || EngineError::invalid("the element has no type of its category");
-        let path = |side: StairSide| -> Result<Vec<glam::DVec3>> {
-            match &el.kind {
-                ElementKind::Stair(st) => {
-                    Ok(cc_geom::stair_geom(p, el, st).ok_or_else(no_type)?.railing_path(side, inset))
-                }
-                ElementKind::Ramp(r) => Ok(cc_geom::ramp_geom(p, el, r).ok_or_else(no_type)?.railing_path(side, inset)),
-                _ => Err(EngineError::invalid(format!("element {} is not a stair or a ramp", el.id.0))),
-            }
-        };
         let (host, level) = (el.id, el.level);
         let mut railings: Vec<(StairSide, Vec<DVec2>)> = Vec::new();
         for side in sides {
-            let plan: Vec<DVec2> = path(side)?.iter().map(|q| q.truncate()).collect();
+            let plan = host_path(p, el, side, inset)?;
             if plan.len() >= 2 {
                 railings.push((side, plan));
             }
@@ -258,5 +406,97 @@ impl Command for StairRailingsAdd {
                 .collect::<Vec<_>>())
         })?;
         Ok(json!({ "ids": ids.iter().map(|id| id.0).collect::<Vec<_>>() }))
+    }
+}
+
+/// Put a railing on a stair or ramp (`host`), or take it off (`detach`).
+/// On a host it follows the host's `side` (default: the side its path runs
+/// nearest), `inset` in from the edge, and moves, turns and goes with it;
+/// taken off, it keeps the path it had in plan, at its level plus
+/// `base_offset`. A hosted railing can also change only its side or inset.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RailingHostSet {
+    /// Railing element id.
+    pub id: u64,
+    /// Stair or ramp element id to follow.
+    #[serde(default)]
+    pub host: Option<u64>,
+    /// Take the railing off its host.
+    #[serde(default)]
+    pub detach: bool,
+    /// `left` or `right`, walking up.
+    #[serde(default)]
+    pub side: Option<String>,
+    /// Distance in from the edge of the host, meters (default 0.05, or the railing's own).
+    #[serde(default)]
+    pub inset: Option<f64>,
+}
+
+impl Command for RailingHostSet {
+    const NAME: &'static str = "railing_host_set";
+    const KIND: CommandKind = CommandKind::Edit;
+    fn run(self, s: &mut Session) -> Result<Value> {
+        let p = s.project();
+        let id = ElementId(self.id);
+        let (railing_el, railing) = match p.element(id) {
+            Some(e) => match &e.kind {
+                ElementKind::Railing(r) => (e, r.clone()),
+                _ => return Err(EngineError::invalid(format!("element {} is not a railing", self.id))),
+            },
+            None => return Err(EngineError::not_found(format!("no element {}", self.id))),
+        };
+        if self.detach && self.host.is_some() {
+            return Err(EngineError::invalid("give host or detach, not both"));
+        }
+        // The path as it runs now (on its host, if any): what a detached railing keeps.
+        let current: Vec<DVec2> = cc_geom::railing_path(p, railing_el, &railing).iter().map(|q| q.truncate()).collect();
+        if self.detach {
+            if railing.stair.is_none() {
+                return Err(EngineError::invalid("the railing has no host"));
+            }
+            edit(s, t!("tx-modify"), |e| {
+                if let Some(ElementKind::Railing(r)) = e.element_mut(id).map(|el| &mut el.kind) {
+                    r.stair = None;
+                    r.path = current.clone();
+                }
+                Ok(())
+            })?;
+            return Ok(json!({ "id": self.id, "host": Value::Null }));
+        }
+        let host_id = match (self.host, railing.stair) {
+            (Some(h), _) => ElementId(h),
+            (None, Some(h)) => h.host,
+            (None, None) => return Err(EngineError::invalid("give the stair or ramp to put the railing on")),
+        };
+        let host = p.element(host_id).ok_or_else(|| EngineError::not_found(format!("no element {}", host_id.0)))?;
+        let inset = check_inset(self.inset.or(railing.stair.map(|h| h.inset)).unwrap_or(0.05))?;
+        let side = match (self.side.as_deref(), railing.stair) {
+            (Some(side), _) => parse_side(side)?,
+            (None, Some(h)) if h.host == host_id => h.side,
+            // The side its path runs nearest: the middle of its path.
+            (None, _) => {
+                let mid = current.get(current.len() / 2).copied().unwrap_or_default();
+                nearest_side(p, host, inset, mid)?
+            }
+        };
+        let path = host_path(p, host, side, inset)?;
+        if path.len() < 2 {
+            return Err(EngineError::invalid("the element has no side for a railing"));
+        }
+        let level = host.level;
+        edit(s, t!("tx-modify"), |e| {
+            if let Some(el) = e.element_mut(id) {
+                el.level = level;
+                if let ElementKind::Railing(r) = &mut el.kind {
+                    r.stair = Some(StairRailing { host: host_id, side, inset });
+                    r.path = path.clone();
+                    r.base_offset = 0.0;
+                }
+            }
+            Ok(())
+        })?;
+        let side = if side == StairSide::Left { "left" } else { "right" };
+        Ok(json!({ "id": self.id, "host": host_id.0, "side": side, "inset": inset }))
     }
 }

@@ -78,6 +78,10 @@ impl Element {
     /// under a mirror.
     pub fn transform(&mut self, t: &PlanTransform) {
         let p = |v: &mut DVec2| *v = t.apply(*v);
+        if let Some(Some(sketch)) = self.drawn_sketch_mut() {
+            sketch.transform(t);
+        }
+        self.paints.iter_mut().for_each(|paint| paint.transform(t));
         match &mut self.kind {
             ElementKind::Wall(w) => {
                 p(&mut w.start);
@@ -86,9 +90,11 @@ impl Element {
                 if t.mirror {
                     std::mem::swap(&mut w.start, &mut w.end);
                     std::mem::swap(&mut w.join_start, &mut w.join_end);
+                    let length = w.length();
+                    w.curtain.reverse(length);
                 }
             }
-            ElementKind::Door(h) | ElementKind::Window(h) => {
+            ElementKind::Door(h) | ElementKind::Window(h) | ElementKind::Niche(h) => {
                 if t.mirror {
                     h.flip_hand = !h.flip_hand;
                 }
@@ -104,15 +110,28 @@ impl Element {
                 }
             }
             ElementKind::Room(r) => p(&mut r.position),
-            // Bars follow their host.
-            ElementKind::Rebar(_) => {}
-            ElementKind::Pipe(s) | ElementKind::Conduit(s) => {
+            ElementKind::ShapedRebar(r) => r.points_mut().for_each(|q| {
+                let plan = t.apply(q.truncate());
+                (q.x, q.y) = (plan.x, plan.y);
+            }),
+            // Bars, valves and connections follow their host.
+            ElementKind::Rebar(_) | ElementKind::Valve(_) | ElementKind::Connection(_) => {}
+            ElementKind::Pipe(s) | ElementKind::Conduit(s) | ElementKind::CableTray(s) => {
                 p(&mut s.start);
                 p(&mut s.end);
             }
+            ElementKind::LightningConductor(c) => {
+                p(&mut c.run.start);
+                p(&mut c.run.end);
+            }
             ElementKind::Foundation(f) => {
-                if let crate::FoundationShape::Pad { rotation_deg, .. } = &mut f.shape {
-                    *rotation_deg = t.apply_angle_deg(*rotation_deg);
+                match &mut f.shape {
+                    crate::FoundationShape::Pad { rotation_deg, .. } => {
+                        *rotation_deg = t.apply_angle_deg(*rotation_deg);
+                    }
+                    // A mirror turns an arc strip the other way.
+                    crate::FoundationShape::Strip { bulge, .. } if t.mirror => *bulge = -*bulge,
+                    _ => {}
                 }
                 f.shape.points_mut().into_iter().for_each(p);
             }
@@ -126,13 +145,34 @@ impl Element {
                 match &mut d.kind {
                     crate::DimensionKind::Angular { vertex, .. } => p(vertex),
                     // Directions turn (and mirror) without the translation.
-                    crate::DimensionKind::Linear { dir } => {
+                    crate::DimensionKind::Linear { dir } | crate::DimensionKind::Ordinate { dir } => {
                         *dir = (t.apply(*dir) - t.apply(DVec2::ZERO)).normalize_or(DVec2::X);
                     }
                     _ => {}
                 }
                 if t.mirror {
                     d.offset = -d.offset;
+                }
+            }
+            ElementKind::Pile(pile) => {
+                p(&mut pile.position);
+                pile.rotation_deg = t.apply_angle_deg(pile.rotation_deg);
+            }
+            ElementKind::BarTag(tag) => {
+                p(&mut tag.position);
+                if let Some(l) = &mut tag.leader {
+                    p(l);
+                }
+                // The text stays readable: it turns with a rotation but is not mirrored.
+                if !t.mirror {
+                    tag.rotation_deg = t.apply_angle_deg(tag.rotation_deg);
+                }
+            }
+            ElementKind::LevelMark(m) => {
+                p(&mut m.position);
+                // The values stay readable: a mirror moves them to the other side.
+                if t.mirror {
+                    m.flip = !m.flip;
                 }
             }
             ElementKind::Text(note) => {
@@ -152,12 +192,20 @@ impl Element {
                 p(&mut c.position);
                 c.rotation_deg = t.apply_angle_deg(c.rotation_deg);
             }
+            ElementKind::CadImport(c) => c.transform(t),
+            ElementKind::DetailLine(l) => l.curve.transform(t),
+            ElementKind::DetailComponent(c) => c.transform(t),
+            ElementKind::FilledRegion(r) | ElementKind::MaskingRegion(r) => r.points_mut().for_each(p),
+            ElementKind::Mass(m) => {
+                m.outline.iter_mut().chain(m.top.iter_mut().flatten()).for_each(p);
+            }
             ElementKind::Beam(b) => {
                 p(&mut b.start);
                 p(&mut b.end);
                 // The line keeps its direction, so a face justification changes sides.
                 if t.mirror {
                     b.lateral = b.lateral.mirrored();
+                    b.bulge = -b.bulge;
                 }
             }
             ElementKind::Stair(s) => {
@@ -173,6 +221,28 @@ impl Element {
                 r.direction_deg = t.apply_angle_deg(r.direction_deg);
                 if t.mirror {
                     r.layout.turn = r.layout.turn.flipped();
+                }
+            }
+            ElementKind::Shaft(s) => s.outline.iter_mut().for_each(p),
+            ElementKind::SteelBuilding(b) => b.transform(t),
+            ElementKind::Truss(tr) => tr.transform(t),
+            ElementKind::Bracing(b) => b.transform(t),
+            // Placed by its wall.
+            ElementKind::WallFraming(_) => {}
+            ElementKind::Pad(pad) => pad.outline.iter_mut().for_each(p),
+            ElementKind::Topography(topo) => {
+                topo.boundary.iter_mut().for_each(p);
+                for q in &mut topo.points {
+                    let mut xy = q.truncate();
+                    p(&mut xy);
+                    *q = xy.extend(q.z);
+                }
+            }
+            ElementKind::Sweep(s) => {
+                s.path.iter_mut().for_each(p);
+                // A mirror keeps the profile on the same side of the wall it follows.
+                if t.mirror {
+                    s.flip = !s.flip;
                 }
             }
             ElementKind::Railing(r) => {
@@ -216,6 +286,7 @@ impl crate::EditCtx<'_> {
             .filter_map(|id| project.element(*id).and_then(|e| e.as_wall()).map(|w| (*id, w.length(), w.direction())))
             .collect();
         let mut changed = Vec::new();
+        let mut mirrored = std::collections::BTreeSet::new();
         for id in ids {
             let Some(el) = self.element_mut(*id) else { continue };
             if el.as_hosted().is_some() {
@@ -231,6 +302,7 @@ impl crate::EditCtx<'_> {
                     }
                 }
             }
+            mirrored.insert(*id);
             changed.push(*id);
         }
         for (id, with_wall) in hosted {
@@ -245,19 +317,68 @@ impl crate::EditCtx<'_> {
                 {
                     h.offset = len - h.offset;
                 }
+                mirrored.insert(id);
             } else if let (Some(dir), Some(h)) = (host_dir, el.as_hosted_mut()) {
                 h.offset += t.translation.dot(dir);
             }
             changed.push(id);
         }
+        // The pads of transformed terrains go with them.
+        let pads: Vec<ElementId> = self
+            .project()
+            .elements
+            .values()
+            .filter(|e| !set.contains(&e.id))
+            .filter(|e| matches!(&e.kind, ElementKind::Pad(p) if set.contains(&p.host)))
+            .map(|e| e.id)
+            .collect();
+        for id in pads {
+            if let Some(el) = self.element_mut(id) {
+                el.transform(t);
+                mirrored.insert(id);
+                changed.push(id);
+            }
+        }
+        if t.mirror {
+            self.mirror_dimension_refs(&mirrored);
+        }
         changed
+    }
+
+    /// Point the dimension ends on `mirrored` elements at the mirror images
+    /// of the points they measured, so they keep measuring them.
+    fn mirror_dimension_refs(&mut self, mirrored: &std::collections::BTreeSet<ElementId>) {
+        let project = self.project();
+        let updates: Vec<(ElementId, Box<crate::Dimension>)> = project
+            .elements
+            .values()
+            .filter_map(|e| {
+                let ElementKind::Dimension(d) = &e.kind else { return None };
+                let mut n = d.clone();
+                let mut hit = false;
+                for r in n.all_refs_mut().flatten() {
+                    let Some(target) = r.element().filter(|id| mirrored.contains(id)) else { continue };
+                    let Some(target) = project.element(target) else { continue };
+                    *r = r.mirrored(&target.kind);
+                    hit = true;
+                }
+                hit.then_some((e.id, n))
+            })
+            .collect();
+        for (id, n) in updates {
+            if let Some(ElementKind::Dimension(d)) = self.element_mut(id).map(|e| &mut e.kind) {
+                *d = n;
+            }
+        }
     }
 }
 
 impl crate::Project {
     /// The elements a copy of `ids` takes: the non-hosted ones, plus the
-    /// doors and windows of copied walls, the railings of copied stairs and
-    /// any selected hosted element.
+    /// doors and windows of copied walls, the railings of copied stairs, the
+    /// pads of copied terrains, the valves of copied pipes and any selected
+    /// hosted element. Connections are never copied: they belong to their
+    /// member's end.
     /// The snapshot stays valid after the originals are deleted (cut).
     pub fn copy_set(&self, ids: &[ElementId]) -> Vec<Element> {
         let set: std::collections::BTreeSet<ElementId> = ids.iter().copied().collect();
@@ -278,6 +399,40 @@ impl crate::Project {
                 )
                 .cloned(),
         );
+        out.extend(
+            self.elements
+                .values()
+                .filter(|e| !set.contains(&e.id))
+                .filter(|e| matches!(&e.kind, ElementKind::Pad(p) if set.contains(&p.host)))
+                .cloned(),
+        );
+        out.extend(
+            self.elements
+                .values()
+                .filter(|e| !set.contains(&e.id))
+                .filter(|e| matches!(&e.kind, ElementKind::Valve(v) if set.contains(&v.host)))
+                .cloned(),
+        );
+        // A copied pile cap takes its piles along.
+        out.extend(
+            self.elements
+                .values()
+                .filter(|e| !set.contains(&e.id))
+                .filter(|e| matches!(&e.kind, ElementKind::Pile(p) if p.cap.is_some_and(|c| set.contains(&c.cap))))
+                .cloned(),
+        );
+        // A copied wall takes its framing along.
+        out.extend(
+            self.elements
+                .values()
+                .filter(|e| !set.contains(&e.id))
+                .filter(|e| matches!(&e.kind, ElementKind::WallFraming(f) if set.contains(&f.wall)))
+                .cloned(),
+        );
+        // A copied member host makes its own members: its originals are not copied.
+        let managed: std::collections::BTreeSet<ElementId> =
+            out.iter().flat_map(|e| self.host_members_of(e.id)).collect();
+        out.retain(|e| !managed.contains(&e.id) && !matches!(e.kind, ElementKind::Connection(_)));
         out
     }
 
@@ -307,13 +462,36 @@ impl crate::Project {
     fn accepts(&self, e: &Element, set: &[Element]) -> bool {
         let type_ok = self.element_type(e.type_id).is_some_and(|t| t.category() == e.category());
         let other_ok = match &e.kind {
-            ElementKind::Door(h) | ElementKind::Window(h) => set
+            ElementKind::Door(h) | ElementKind::Window(h) | ElementKind::Niche(h) => set
                 .iter()
                 .find(|w| w.id == h.host)
                 .or_else(|| self.element(h.host))
                 .is_some_and(|w| w.as_wall().is_some()),
             ElementKind::Dimension(d) => self.view(d.view).is_some(),
             ElementKind::Text(t) => self.view(t.view).is_some(),
+            ElementKind::LevelMark(m) => self.view(m.view).is_some(),
+            ElementKind::BarTag(tag) => {
+                self.view(tag.view).is_some()
+                    && self
+                        .element(tag.set)
+                        .is_some_and(|r| matches!(r.kind, ElementKind::Rebar(_) | ElementKind::ShapedRebar(_)))
+            }
+            ElementKind::DetailComponent(c) => self.view(c.view).is_some(),
+            ElementKind::CadImport(c) => self.view(c.view).is_some(),
+            ElementKind::DetailLine(l) => self.view(l.view).is_some(),
+            ElementKind::FilledRegion(r) | ElementKind::MaskingRegion(r) => self.view(r.view).is_some(),
+            ElementKind::Pad(p) => set
+                .iter()
+                .find(|t| t.id == p.host)
+                .or_else(|| self.element(p.host))
+                .is_some_and(|t| matches!(t.kind, ElementKind::Topography(_))),
+            ElementKind::Valve(v) => set
+                .iter()
+                .find(|t| t.id == v.host)
+                .or_else(|| self.element(v.host))
+                .is_some_and(|t| matches!(t.kind, ElementKind::Pipe(_))),
+            // Only with its wall: the wall it came from has a framing already.
+            ElementKind::WallFraming(f) => set.iter().any(|w| w.id == f.wall && w.as_wall().is_some()),
             _ => true,
         };
         type_ok && other_ok && self.level(e.level).is_some()
@@ -335,7 +513,9 @@ impl crate::EditCtx<'_> {
     /// copied stay on that wall's level). Elements whose type, level, view
     /// or wall no longer exist are skipped, and walls attached to a missing
     /// level become unconnected. Copies are built in the creation phase
-    /// (see [`crate::phase`]). Returns the new ids.
+    /// (see [`crate::phase`]). A copied dimension measures the copies of
+    /// what it measured; pasted in place (no move, no level) it keeps
+    /// measuring what was not copied. Returns the new ids.
     pub fn paste_elements(
         &mut self,
         set: &[Element],
@@ -345,6 +525,8 @@ impl crate::EditCtx<'_> {
         let accepted: Vec<&Element> = set.iter().filter(|e| self.project().accepts(e, set)).collect();
         let mut created = Vec::new();
         for t in transforms {
+            // This transform's copies (arrays pass several).
+            let first = created.len();
             let mut remap = std::collections::BTreeMap::new();
             for el in accepted.iter().filter(|el| el.as_hosted().is_none()) {
                 let mut c = (*el).clone();
@@ -354,27 +536,46 @@ impl crate::EditCtx<'_> {
                 (c.phase_created, c.phase_demolished) = (Default::default(), None);
                 c.transform(t);
                 if let Some(level) = level {
+                    self.project().move_top_with_base(&mut c, level);
                     c.level = level;
                 }
                 self.detach_missing_top(&mut c);
                 remap.insert(el.id, c.id);
                 created.push(self.add_element(c));
             }
+            // Copied pads grade the copies of their terrains, else the terrain they came from.
+            for id in &created[first..] {
+                let Some(ElementKind::Pad(p)) = self.element_mut(*id).map(|e| &mut e.kind) else { continue };
+                if let Some(n) = remap.get(&p.host) {
+                    p.host = *n;
+                }
+            }
+            // Copied piles belong to the copies of their caps; copied alone, they are free.
+            for id in &created[first..] {
+                let Some(ElementKind::Pile(p)) = self.element_mut(*id).map(|e| &mut e.kind) else { continue };
+                if let Some(r) = p.cap {
+                    p.cap = remap.get(&r.cap).map(|n| crate::pile::PileCapRef { cap: *n, ..r });
+                }
+            }
+            // Copied valves sit on the copies of their pipes, else on the pipe they came from.
+            for id in &created[first..] {
+                let Some(ElementKind::Valve(v)) = self.element_mut(*id).map(|e| &mut e.kind) else { continue };
+                if let Some(n) = remap.get(&v.host) {
+                    v.host = *n;
+                }
+            }
+            // Copied framings frame the copies of their walls.
+            for id in &created[first..] {
+                let Some(ElementKind::WallFraming(f)) = self.element_mut(*id).map(|e| &mut e.kind) else { continue };
+                if let Some(n) = remap.get(&f.wall) {
+                    f.wall = *n;
+                }
+            }
             // Copied railings follow the copies of their stairs, or become free.
-            for id in &created {
+            for id in &created[first..] {
                 let Some(ElementKind::Railing(r)) = self.element_mut(*id).map(|e| &mut e.kind) else { continue };
                 if let Some(h) = r.stair {
                     r.stair = remap.get(&h.host).map(|n| crate::StairRailing { host: *n, ..h });
-                }
-            }
-            // Copied dimensions follow the copies of what they measure, or nothing.
-            for id in &created {
-                let Some(ElementKind::Dimension(d)) = self.element_mut(*id).map(|e| &mut e.kind) else { continue };
-                for r in d.all_refs_mut() {
-                    *r = r.and_then(|r| match r.element() {
-                        Some(e) => remap.get(&e).map(|n| crate::DimRef { target: crate::RefTarget::Element(*n), ..r }),
-                        None => Some(r),
-                    });
                 }
             }
             for el in accepted.iter().filter(|el| el.as_hosted().is_some()) {
@@ -403,6 +604,7 @@ impl crate::EditCtx<'_> {
                                 ch.offset = len - ch.offset;
                             }
                         }
+                        remap.insert(el.id, c.id);
                     }
                     // A lone copy goes into the wall where it lands on the
                     // target level; on its own level it may also slide along its wall.
@@ -429,6 +631,24 @@ impl crate::EditCtx<'_> {
                     _ => continue,
                 }
                 created.push(self.add_element(c));
+            }
+            // Copied dimensions follow the copies of what they measure; pasted
+            // in place (into another view), they keep measuring the originals.
+            let in_place = *t == PlanTransform::IDENTITY && level.is_none();
+            for id in &created[first..] {
+                let Some(ElementKind::Dimension(d)) = self.element_mut(*id).map(|e| &mut e.kind) else { continue };
+                for r in d.all_refs_mut() {
+                    *r = r.and_then(|r| match r.element() {
+                        Some(e) => match remap.get(&e) {
+                            Some(n) => Some(crate::DimRef { target: crate::RefTarget::Element(*n), ..r }),
+                            None => in_place.then_some(r),
+                        },
+                        None => Some(r),
+                    });
+                }
+            }
+            if t.mirror {
+                self.mirror_dimension_refs(&remap.values().copied().collect());
             }
         }
         created

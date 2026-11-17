@@ -184,6 +184,8 @@ mod tests {
                     kind,
                     phase_created: Default::default(),
                     phase_demolished: None,
+                    design_option: None,
+                    paints: Vec::new(),
                 });
                 id
             };
@@ -196,8 +198,14 @@ mod tests {
             }
         });
         let geom = cc_geom::ModelGeometry::build(&doc.project);
-        let mut d =
-            crate::projected::section(&doc.project, &geom, DVec2::new(4.0, 7.0), DVec2::new(4.0, -1.0), 2.0, 50);
+        let mut d = crate::projected::section(
+            &doc.project,
+            &geom,
+            (DVec2::new(4.0, 7.0), DVec2::new(4.0, -1.0)),
+            2.0,
+            50,
+            crate::Look::plain(),
+        );
         merge(&doc.project, &mut d);
         let slab = geom.volume(floor) / 48.0;
         (d, floor, beam, slab)

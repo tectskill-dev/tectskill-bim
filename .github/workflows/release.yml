@@ -1,7 +1,10 @@
 name: Release
 
-# TectSkill BIM: Windows only (ZIP + MSI installer). Push a tag such as v0.7.0
-# (CHANGELOG.md must have a section for that version).
+# TectSkill BIM: Windows only (portable ZIP + MSI installer). Publish a release
+# on GitHub with a new tag such as v0.12.0 (CHANGELOG.md must have a section for
+# that version); this workflow builds the files and attaches them.
+# The file names end the way Update Now looks for them
+# (`-x86_64.msi`, `-x86_64-pc-windows-msvc.zip`, see update_install.rs).
 
 on:
   push:
@@ -21,16 +24,17 @@ jobs:
     name: Build (Windows x64)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
+          toolchain: stable
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --release --locked -p cc_app -p cc_cli --target x86_64-pc-windows-msvc
       - name: ZIP (portable)
         shell: bash
         run: |
-          name="tectskill-bim-${GITHUB_REF_NAME}-windows-x64"
+          name="tectskill-bim-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc"
           bin="target/x86_64-pc-windows-msvc/release"
           mkdir -p "dist/$name/fonts" "dist/$name/examples"
           cp README.th.md README.md LICENSE CHANGELOG.md "dist/$name/"
@@ -55,8 +59,8 @@ jobs:
             -d "Version=${version%%[-+]*}" \
             -d "BinDir=target/x86_64-pc-windows-msvc/release" \
             -d "LicenseRtf=$RUNNER_TEMP/License.rtf" \
-            -o "dist/tectskill-bim-${GITHUB_REF_NAME}-windows-x64.msi"
-      - uses: actions/upload-artifact@v7
+            -o "dist/tectskill-bim-${GITHUB_REF_NAME}-x86_64.msi"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-x64
           if-no-files-found: error
@@ -72,8 +76,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
@@ -89,11 +93,11 @@ jobs:
             exit 1
           fi
           {
-            echo "TectSkill BIM $GITHUB_REF_NAME — BIM ภาษาไทย ใช้ฟรีและเปิดซอร์สโค้ด พัฒนาต่อจาก ConstructCAD ของ Francis Rebouças"
+            echo "TectSkill BIM $GITHUB_REF_NAME — BIM ภาษาไทย ใช้ฟรีและเปิดซอร์สโค้ด พัฒนาต่อจาก ConstructCraft (เดิมชื่อ ConstructCAD) ของ Francis Rebouças"
             echo
             echo "ดาวน์โหลดไฟล์ .msi เพื่อติดตั้งบน Windows หรือไฟล์ .zip เพื่อใช้งานโดยไม่ต้องติดตั้ง"
             echo
-            echo "## การเปลี่ยนแปลงของ ConstructCAD $version"
+            echo "## การเปลี่ยนแปลงของ ConstructCraft $version"
             echo
             cat notes.md
           } > release-notes.md

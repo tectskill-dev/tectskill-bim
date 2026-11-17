@@ -1,0 +1,20 @@
+[package]
+name = "cc_cad"
+description = "ConstructCraft DWG/DXF import: an in-house DXF reader and DWG through acadrust, into the neutral CAD drawing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+cc_core.workspace = true
+glam.workspace = true
+thiserror.workspace = true
+encoding_rs.workspace = true
+acadrust.workspace = true
+# SVG drawings, through the parser the workspace already uses for raster export.
+resvg.workspace = true
+
+[lints]
+workspace = true

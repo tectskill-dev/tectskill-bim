@@ -107,7 +107,7 @@ pub fn analytical_model(project: &Project, geom: &ModelGeometry) -> AnalyticalMo
             // Onto the column's axis, at the beam's height there.
             BeamEnd::Column(c) => match column_axes.iter().find(|(id, _)| *id == c) {
                 Some((_, axis)) => {
-                    let uc = (*axis - g.origin).dot(g.dir);
+                    let uc = g.locate(*axis);
                     let (z0, z1) = g.z_at(uc);
                     axis.extend((z0 + z1) * 0.5)
                 }
@@ -209,6 +209,8 @@ mod tests {
                     uid,
                     phase_created: Default::default(),
                     phase_demolished: None,
+                    design_option: None,
+                    paints: Vec::new(),
                 });
                 ids.push(id);
             };

@@ -10,7 +10,7 @@ Fixes #
 
 ## Checklist
 
-- [ ] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` pass.
+- [ ] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo nextest run --workspace` pass.
 - [ ] New interface text is in `assets/i18n/*.ftl` for every language.
 - [ ] Model changes go through `Document::edit`, and older `.ccad` files still load.
 - [ ] Commits are signed off (`git commit -s`) under the DCO.

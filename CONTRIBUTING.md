@@ -1,21 +1,21 @@
-# Contributing to ConstructCAD
+# Contributing to ConstructCraft
 
-Thank you for your interest in ConstructCAD! Bug reports, feature ideas, translations, documentation and code are all welcome.
+Thank you for your interest in ConstructCraft! Bug reports, feature ideas, translations, documentation and code are all welcome.
 
 By participating you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Ways to contribute
 
-- **Report a bug** or **request a feature** using the [issue templates](https://github.com/francisreboucas/constructcad/issues/new/choose).
+- **Report a bug** or **request a feature** using the [issue templates](https://github.com/francisreboucas/constructcraft/issues/new/choose).
 - **Translate** the interface: see [Translations](#translations).
 - **Improve documentation**: README, code comments, examples.
 - **Write code**: issues labeled `good first issue` and `help wanted` are a good start. For larger changes, open an issue first so the design can be discussed before you invest time.
 
-Questions and ideas that are not bugs belong in [Discussions](https://github.com/francisreboucas/constructcad/discussions) when they are enabled, or in an issue otherwise.
+Questions and ideas that are not bugs belong in [Discussions](https://github.com/francisreboucas/constructcraft/discussions) when they are enabled, or in an issue otherwise.
 
 ## Clean-room policy
 
-ConstructCAD is an independent implementation. To keep it that way, every contribution must follow these rules:
+ConstructCraft is an independent implementation. To keep it that way, every contribution must follow these rules:
 
 - **Do not** submit code, data, assets or text copied or derived from proprietary software, including decompiled or disassembled binaries, leaked source code or documents, and SDK samples whose license does not allow redistribution under the GPL.
 - **Do not** submit content obtained in violation of an EULA, NDA or employment agreement.
@@ -38,7 +38,7 @@ This appends a line like `Signed-off-by: Your Name <you@example.com>` to the com
 **Forgot to sign off?** The *DCO sign-off* check on your pull request lists the commits without it. Sign off the commits in your branch and update the pull request:
 
 ```sh
-git fetch https://github.com/francisreboucas/constructcad.git main
+git fetch https://github.com/francisreboucas/constructcraft.git main
 git rebase --signoff FETCH_HEAD   # adds the line to every commit since main
 git push --force-with-lease
 ```
@@ -66,7 +66,7 @@ Run the same checks as CI. All of them must pass:
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo nextest run --workspace   # install once: cargo install cargo-nextest --locked
 ```
 
 ## Project rules
@@ -94,7 +94,7 @@ cargo test --workspace
 1. Copy `assets/i18n/en.ftl` to `assets/i18n/<locale>.ftl` (for example `nl.ftl`).
 2. Translate the values, keeping keys and `{ $placeholders }` unchanged.
 3. Register the language in `Language` in `crates/cc_engine/src/i18n.rs` (`ALL`, `code`, `native_name`, `from_code`, `source`, and `decimal_comma` if it uses a decimal point).
-4. Run `cargo test --workspace` to verify keys and placeholders.
+4. Run `cargo nextest run --workspace` to verify keys and placeholders.
 
 ## License
 

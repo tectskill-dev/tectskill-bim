@@ -121,8 +121,56 @@ pub fn leader_symbol(
 ) {
     let len = size.max(2.0) * 0.9 * scale as f64 / 1000.0;
     let u = (end - from).try_normalize().unwrap_or(DVec2::X);
+    symbol_at(d, symbol, u, end, len, SymbolPens::default(), id);
+}
+
+/// Pens of a symbol's strokes and of a tick, and the color of its fills.
+#[derive(Debug, Clone, Copy)]
+pub struct SymbolPens {
+    pub stroke: (LineStyle, Option<crate::Pen>),
+    pub tick: (LineStyle, Option<crate::Pen>),
+    pub fill: [u8; 4],
+}
+
+impl Default for SymbolPens {
+    fn default() -> Self {
+        SymbolPens { stroke: (LineStyle::Annotation, None), tick: (LineStyle::Annotation, None), fill: SYMBOL_FILL }
+    }
+}
+
+/// The fill of filled symbols drawn in `color` (the default symbol fill for none).
+pub fn symbol_fill(color: Option<[u8; 3]>) -> [u8; 4] {
+    color.map_or(SYMBOL_FILL, |[r, g, b]| [r, g, b, 255])
+}
+
+/// Strokes from point to point (back to the first when `closed`).
+fn strokes(
+    d: &mut Drawing2D,
+    pts: &[DVec2],
+    closed: bool,
+    pen: (LineStyle, Option<crate::Pen>),
+    id: Option<ElementId>,
+) {
+    for w in pts.windows(2) {
+        d.line_pen(w[0], w[1], pen.0, pen.1, id);
+    }
+    if let (true, [first, .., last]) = (closed, pts) {
+        d.line_pen(*last, *first, pen.0, pen.1, id);
+    }
+}
+
+/// `symbol` at `end` of a line arriving along `u` (a unit vector), `len`
+/// drawing units long.
+pub fn symbol_at(
+    d: &mut Drawing2D,
+    symbol: LeaderSymbol,
+    u: DVec2,
+    end: DVec2,
+    len: f64,
+    pens: SymbolPens,
+    id: Option<ElementId>,
+) {
     let v = u.perp();
-    let style = LineStyle::Annotation;
     let circle = |r: f64| -> Vec<DVec2> {
         (0..24).map(|i| end + DVec2::from_angle(i as f64 / 24.0 * std::f64::consts::TAU) * r).collect()
     };
@@ -132,19 +180,16 @@ pub fn leader_symbol(
         vec![end + (u + v) * h, end + (-u + v) * h, end + (-u - v) * h, end + (u - v) * h]
     };
     match symbol {
-        LeaderSymbol::Arrow => d.fill(head.to_vec(), SYMBOL_FILL, id),
-        LeaderSymbol::OpenArrow => {
-            d.line(end, head[1], style, id);
-            d.line(end, head[2], style, id);
-        }
-        LeaderSymbol::Triangle => d.polyline(&head, true, style, id),
-        LeaderSymbol::Dot => d.fill(circle(len * 0.25), SYMBOL_FILL, id),
-        LeaderSymbol::Circle => d.polyline(&circle(len * 0.35), true, style, id),
-        LeaderSymbol::Square => d.polyline(&square, true, style, id),
-        LeaderSymbol::FilledSquare => d.fill(square, SYMBOL_FILL, id),
+        LeaderSymbol::Arrow => d.fill(head.to_vec(), pens.fill, id),
+        LeaderSymbol::OpenArrow => strokes(d, &[head[1], end, head[2]], false, pens.stroke, id),
+        LeaderSymbol::Triangle => strokes(d, &head, true, pens.stroke, id),
+        LeaderSymbol::Dot => d.fill(circle(len * 0.25), pens.fill, id),
+        LeaderSymbol::Circle => strokes(d, &circle(len * 0.35), true, pens.stroke, id),
+        LeaderSymbol::Square => strokes(d, &square, true, pens.stroke, id),
+        LeaderSymbol::FilledSquare => d.fill(square, pens.fill, id),
         LeaderSymbol::Tick => {
             let t = (u + v).normalize() * len * 0.5;
-            d.line(end - t, end + t, style, id);
+            strokes(d, &[end - t, end + t], false, pens.tick, id);
         }
         LeaderSymbol::None => {}
     }

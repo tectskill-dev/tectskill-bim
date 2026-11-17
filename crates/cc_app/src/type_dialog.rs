@@ -7,7 +7,9 @@ use crate::state::AppState;
 use crate::t;
 use crate::table::{readonly_row, row, section};
 use crate::theme::{self, PALETTE};
-use cc_core::{ElementType, ElementTypeId, Layer, LayerFunction, TypeData, TypeInfo, WallFunction};
+use cc_core::{
+    ElementType, ElementTypeId, Layer, LayerFunction, ProfileId, ProfileMaterial, TypeData, TypeInfo, WallFunction,
+};
 use cc_views::format;
 use egui::{Context, DragValue, RichText, Ui};
 use std::hash::{Hash, Hasher};
@@ -106,14 +108,15 @@ fn header(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
             None => {
                 let mut selected = tid;
                 let types: Vec<_> = state.project().types_of(category).map(|t| (t.id, t.name.clone())).collect();
-                egui::ComboBox::from_id_salt("type-switch").width(field_w).selected_text(ty.name.clone()).show_ui(
-                    ui,
-                    |ui| {
+                egui::ComboBox::from_id_salt("type-switch")
+                    .width(field_w)
+                    .truncate()
+                    .selected_text(ty.name.clone())
+                    .show_ui(ui, |ui| {
                         for (id, name) in types {
                             ui.selectable_value(&mut selected, id, name);
                         }
-                    },
-                );
+                    });
                 if selected != tid {
                     state.dialogs.type_editor = Some(selected);
                 }
@@ -172,6 +175,24 @@ fn length_row(
     finish(state, &r);
 }
 
+/// A row editing a small size of a type (see [`crate::properties::size_drag`]).
+fn size_row(
+    ui: &mut Ui,
+    state: &mut AppState,
+    label: &str,
+    tid: ElementTypeId,
+    field: &str,
+    value: f64,
+    set: impl FnOnce(&mut TypeData, f64),
+) {
+    let mut v = value;
+    let r = row(ui, label, |ui| ui.add(crate::properties::size_drag(&mut v).range(0.001..=20.0)));
+    if r.changed() {
+        update(state, tid, field, |t| set(&mut t.data, v));
+    }
+    finish(state, &r);
+}
+
 /// Component name and kind, the editor button and this type's parameter values.
 fn component_parameters(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
     let TypeData::Component { component, def } = &ty.data else { return };
@@ -179,30 +200,35 @@ fn component_parameters(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
     section(ui, "type-component", t!("section-component"), |ui| {
         readonly_row(ui, &t!("col-component"), component.clone());
         readonly_row(ui, &t!("col-component-kind"), tr(def.kind.key()));
-        let (edit, save) = row(ui, &t!("comp-definition"), |ui| {
-            ui.horizontal(|ui| {
-                (ui.button(t!("action-edit-component")).clicked(), ui.button(t!("action-save-component")).clicked())
-            })
-            .inner
+        let (edit, save) = crate::table::button_row(ui, |ui| {
+            (ui.button(t!("action-edit-component")).clicked(), ui.button(t!("action-save-component")).clicked())
         });
         if edit {
-            state.dialogs.component_editor = crate::component_editor::Editor::open(state, tid);
+            crate::component_env::open(state, tid);
         }
         if save {
             actions::save_component(state, component);
         }
     });
+    let materials: Vec<String> = state.project().materials.iter().map(|m| m.name.clone()).collect();
     section(ui, "type-comp-params", t!("comp-params"), |ui| {
         for (i, p) in def.params.iter().enumerate() {
-            let mut v = p.value;
-            let label = if p.instance { format!("{} ({})", p.name, t!("comp-param-instance")) } else { p.name.clone() };
-            let r = row(ui, &label, |ui| ui.add(crate::properties::param_value(&mut v, p.kind)));
-            if r.changed() {
+            let label = if p.instance {
+                format!("{} ({})", p.display(), t!("comp-param-instance"))
+            } else {
+                p.display().to_string()
+            };
+            let (r, changed) =
+                row(ui, &label, |ui| crate::properties::param_editor(ui, p, p.value, &p.text, &materials));
+            if let Some(value) = changed {
                 update(state, tid, &format!("comp-param-{i}"), |t| {
                     if let TypeData::Component { def, .. } = &mut t.data
                         && let Some(p) = def.params.get_mut(i)
                     {
-                        p.value = v;
+                        match value {
+                            crate::properties::ParamEdit::Number(v) => p.value = v,
+                            crate::properties::ParamEdit::Text(t) => p.text = t,
+                        }
                     }
                 });
             }
@@ -250,7 +276,7 @@ fn parameters(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
         }
         match ty.data {
             TypeData::Ceiling { thickness, .. } => {
-                length_row(ui, state, &t!("prop-thickness"), tid, "thk", thickness, |d, v| {
+                size_row(ui, state, &t!("prop-thickness"), tid, "thk", thickness, |d, v| {
                     if let TypeData::Ceiling { thickness, .. } = d {
                         *thickness = v;
                     }
@@ -263,6 +289,7 @@ fn parameters(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
         }
     });
 
+    crate::curtain_ui::type_sections(ui, state, ty);
     structure_parameters(ui, state, ty);
 
     if let TypeData::Door { width, height, .. } | TypeData::Window { width, height, .. } = ty.data {
@@ -297,7 +324,12 @@ fn parameters(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
     | TypeData::Ramp { material, .. }
     | TypeData::Pipe { material, .. }
     | TypeData::Conduit { material, .. }
-    | TypeData::Railing { material, .. } = &ty.data
+    | TypeData::CableTray { material, .. }
+    | TypeData::Valve { material, .. }
+    | TypeData::LightningConductor { material, .. }
+    | TypeData::Railing { material, .. }
+    | TypeData::Topography { material, .. }
+    | TypeData::Sweep { material, .. } = &ty.data
     {
         section(ui, "type-materials", t!("section-materials"), |ui| {
             let mut m = material.clone();
@@ -315,11 +347,66 @@ fn parameters(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
                     | TypeData::Ramp { material, .. }
                     | TypeData::Pipe { material, .. }
                     | TypeData::Conduit { material, .. }
-                    | TypeData::Railing { material, .. } => *material = m,
+                    | TypeData::CableTray { material, .. }
+                    | TypeData::Valve { material, .. }
+                    | TypeData::LightningConductor { material, .. }
+                    | TypeData::Railing { material, .. }
+                    | TypeData::Topography { material, .. }
+                    | TypeData::Sweep { material, .. } => *material = m,
                     _ => {}
                 });
             }
         });
+    }
+
+    if let TypeData::Topography { contour_interval, major_every, .. } = ty.data {
+        section(ui, "type-contours", t!("section-contours"), |ui| {
+            length_row(ui, state, &t!("prop-contour-interval"), tid, "contour", contour_interval, |d, v| {
+                if let TypeData::Topography { contour_interval, .. } = d {
+                    *contour_interval = v.max(cc_core::topography::MIN_CONTOUR_INTERVAL);
+                }
+            });
+            let mut k = major_every;
+            let r = row(ui, &t!("prop-major-every"), |ui| ui.add(egui::DragValue::new(&mut k).range(1..=100)));
+            if r.changed() {
+                update(state, tid, "major", |t| {
+                    if let TypeData::Topography { major_every, .. } = &mut t.data {
+                        *major_every = k.max(1);
+                    }
+                });
+            }
+            finish(state, &r);
+        });
+    }
+
+    crate::level_mark_ui::type_rows(ui, state, tid, &ty.data);
+    crate::dim_type_ui::type_sections(ui, state, ty);
+
+    if let TypeData::Pad { cut_slope, fill_slope } = ty.data {
+        section(ui, "type-slopes", t!("section-slopes"), |ui| {
+            for (label, field, value) in
+                [(t!("prop-cut-slope"), "cut", cut_slope), (t!("prop-fill-slope"), "fill", fill_slope)]
+            {
+                let mut v = value;
+                let range = cc_core::pad::MIN_SLOPE..=cc_core::pad::MAX_SLOPE;
+                let r =
+                    row(ui, &label, |ui| ui.add(egui::DragValue::new(&mut v).speed(0.05).range(range).prefix("1:")));
+                if r.changed() {
+                    update(state, tid, field, |t| {
+                        if let TypeData::Pad { cut_slope, fill_slope } = &mut t.data {
+                            *(if field == "cut" { cut_slope } else { fill_slope }) = v;
+                        }
+                    });
+                }
+                finish(state, &r);
+            }
+        });
+    }
+
+    crate::region_ui::type_section(ui, state, ty);
+
+    if let TypeData::Roof { covering, framing, .. } = &ty.data {
+        section(ui, "type-roofing", t!("section-roofing"), |ui| roofing(ui, state, tid, *covering, framing));
     }
 
     section(ui, "type-identity", t!("section-identity"), |ui| identity(ui, state, tid, &ty.info));
@@ -327,6 +414,117 @@ fn parameters(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
     section(ui, "type-ifc", t!("section-ifc"), |ui| {
         readonly_row(ui, &t!("prop-ifc-guid"), cc_ifc::guid::encode(ty.uid.0));
     });
+}
+
+/// A roof type's covering (from the catalog, with its least slope and
+/// weight) and framing: the system, material, and the members' sizes and
+/// spacings (rafters and battens only for timber).
+fn roofing(
+    ui: &mut Ui,
+    state: &mut AppState,
+    tid: ElementTypeId,
+    covering: Option<cc_core::roofing::TileKind>,
+    framing: &cc_core::roofing::RoofFraming,
+) {
+    use cc_core::roofing::{FramingSystem, MemberSize, RoofFraming, TileKind};
+    let set = |state: &mut AppState, field: &str, f: &dyn Fn(&mut Option<TileKind>, &mut RoofFraming)| {
+        update(state, tid, field, |t| {
+            if let TypeData::Roof { covering, framing, .. } = &mut t.data {
+                f(covering, framing);
+            }
+        });
+    };
+    let mut c = covering;
+    let name = |c: Option<TileKind>| c.map_or_else(|| t!("tile-none"), |k| tr(k.key()));
+    row(ui, &t!("prop-covering"), |ui| {
+        egui::ComboBox::from_id_salt(("covering", tid.0)).selected_text(name(c)).show_ui(ui, |ui| {
+            ui.selectable_value(&mut c, None, name(None));
+            for k in TileKind::ALL {
+                ui.selectable_value(&mut c, Some(k), name(Some(k)));
+            }
+        });
+    });
+    if c != covering {
+        // `type_set` brings the framing the covering usually lies on, if none was chosen.
+        set(state, "covering", &|cov, _| *cov = c);
+    }
+    if let Some(spec) = covering.map(TileKind::spec) {
+        readonly_row(ui, &t!("prop-min-slope"), format::slope(spec.min_slope));
+        readonly_row(ui, &t!("prop-covering-weight"), format::quantity(format::Quantity::AreaMass, spec.weight, 0));
+        if let Some(n) = spec.per_m2 {
+            if format::imperial() {
+                let foot = cc_core::units::FOOT;
+                readonly_row(ui, &t!("prop-imp-tiles-per-ft2"), format::number(n * foot * foot, 1));
+            } else {
+                readonly_row(ui, &t!("prop-tiles-per-m2"), format!("{n:.1}"));
+            }
+        }
+    }
+    let mut system = framing.system;
+    row(ui, &t!("prop-framing"), |ui| {
+        egui::ComboBox::from_id_salt(("framing", tid.0)).selected_text(tr(system.key())).show_ui(ui, |ui| {
+            for s in FramingSystem::ALL {
+                ui.selectable_value(&mut system, s, tr(s.key()));
+            }
+        });
+    });
+    if system != framing.system {
+        set(state, "framing", &|_, fr| fr.system = system);
+    }
+    if framing.system == FramingSystem::None {
+        return;
+    }
+    let mut m = framing.material.clone();
+    if row(ui, &t!("prop-material"), |ui| crate::dialogs::material_combo(ui, state, ("framing-mat", tid.0), &mut m)) {
+        set(state, "framing-mat", &|_, fr| fr.material = m.clone());
+    }
+    type Pick = fn(&mut RoofFraming) -> &mut MemberSize;
+    let timber = matches!(framing.system, FramingSystem::Timber | FramingSystem::TimberTrusses);
+    let trusses = framing.system == FramingSystem::TimberTrusses;
+    let mut members: Vec<(&str, Pick)> = Vec::new();
+    if trusses {
+        members.push(("prop-truss", |f| &mut f.truss));
+    }
+    members.push(("prop-purlin", |f| &mut f.purlin));
+    if timber {
+        members.push(("prop-rafter", |f| &mut f.rafter));
+        members.push(("prop-batten", |f| &mut f.batten));
+    }
+    for (label, pick) in members {
+        let size = *pick(&mut framing.clone());
+        for (axis, value) in [("w", size.width), ("h", size.height)] {
+            let caption = format!("{} ({})", tr(label), if axis == "w" { t!("col-width") } else { t!("col-height") });
+            size_row(ui, state, &caption, tid, &format!("{label}-{axis}"), value, |d, v| {
+                if let TypeData::Roof { framing, .. } = d {
+                    let s = pick(framing);
+                    if axis == "w" {
+                        s.width = v.max(0.005);
+                    } else {
+                        s.height = v.max(0.005);
+                    }
+                }
+            });
+        }
+    }
+    if trusses {
+        length_row(ui, state, &t!("prop-truss-spacing"), tid, "truss-sp", framing.truss_spacing, |d, v| {
+            if let TypeData::Roof { framing, .. } = d {
+                framing.truss_spacing = v.max(0.3);
+            }
+        });
+    }
+    length_row(ui, state, &t!("prop-purlin-spacing"), tid, "purlin-sp", framing.purlin_spacing, |d, v| {
+        if let TypeData::Roof { framing, .. } = d {
+            framing.purlin_spacing = v.max(0.1);
+        }
+    });
+    if timber {
+        length_row(ui, state, &t!("prop-rafter-spacing"), tid, "rafter-sp", framing.rafter_spacing, |d, v| {
+            if let TypeData::Roof { framing, .. } = d {
+                framing.rafter_spacing = v.max(0.1);
+            }
+        });
+    }
 }
 
 /// Text fields of the type information.
@@ -345,7 +543,9 @@ fn identity(ui: &mut Ui, state: &mut AppState, tid: ElementTypeId, info: &TypeIn
     ];
     for (label, field) in fields {
         let mut text = field(&mut info.clone()).clone();
-        let r = row(ui, &tr(label), |ui| ui.text_edit_singleline(&mut text));
+        let r = row(ui, &tr(label), |ui| {
+            crate::table::live_text(ui, ("type-info", tid, label), &mut text, |ui, t| ui.text_edit_singleline(t))
+        });
         if r.changed() {
             update(state, tid, label, |t| *field(&mut t.info) = text);
         }
@@ -367,7 +567,7 @@ fn layers_editor(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
     let layers = ty.layers().to_vec();
     let set_layers = |state: &mut AppState, field: &str, layers: Vec<Layer>| {
         update(state, tid, field, |t| match &mut t.data {
-            TypeData::Wall { layers: l, .. } | TypeData::Floor { layers: l } | TypeData::Roof { layers: l } => {
+            TypeData::Wall { layers: l, .. } | TypeData::Floor { layers: l } | TypeData::Roof { layers: l, .. } => {
                 *l = layers
             }
             _ => {}
@@ -407,7 +607,7 @@ fn layers_editor(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
                     state.session.doc.break_merge();
                 }
                 let mut thk = layer.thickness;
-                let r = ui.add(crate::properties::length_drag(&mut thk).speed(0.002).range(0.001..=2.0));
+                let r = ui.add(crate::properties::size_drag(&mut thk).range(0.001..=2.0));
                 if r.changed() {
                     let mut l = layers.clone();
                     l[i].thickness = thk;
@@ -452,17 +652,91 @@ fn layers_editor(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
     });
 }
 
+/// A pile cap type's piles: the layout (read only), spacing, edge distance,
+/// and the piles' length and embedment.
+fn pile_cap_rows(ui: &mut Ui, state: &mut AppState, tid: ElementTypeId, cap: &cc_core::pile::PileCap) {
+    fn set(d: &mut TypeData) -> Option<&mut cc_core::pile::PileCap> {
+        match d {
+            TypeData::Foundation { pile_cap: Some(cap), .. } => Some(cap),
+            _ => None,
+        }
+    }
+    readonly_row(ui, &t!("prop-pile-layout"), format!("{} ({})", tr(cap.layout.key()), cap.layout.count()));
+    if !matches!(cap.layout, cc_core::pile::PileLayout::Single | cc_core::pile::PileLayout::Circle { .. }) {
+        length_row(ui, state, &t!("prop-pile-spacing"), tid, "pcs", cap.spacing, |d, v| {
+            if let Some(c) = set(d) {
+                c.spacing = v.clamp(cc_core::pile::MIN_SPACING, cc_core::pile::MAX_SPACING);
+            }
+        });
+    }
+    if !matches!(cap.layout, cc_core::pile::PileLayout::Circle { ring_width: Some(_), .. }) {
+        length_row(ui, state, &t!("prop-edge-distance"), tid, "pce", cap.edge_distance, |d, v| {
+            if let Some(c) = set(d) {
+                c.edge_distance = v.clamp(cc_core::pile::MIN_EDGE_DISTANCE, cc_core::pile::MAX_EDGE_DISTANCE);
+            }
+        });
+    }
+    length_row(ui, state, &t!("prop-pile-length"), tid, "pcl", cap.pile_length, |d, v| {
+        if let Some(c) = set(d) {
+            c.pile_length = v.clamp(cc_core::pile::MIN_PILE_LENGTH, cc_core::pile::MAX_PILE_LENGTH);
+        }
+    });
+    length_row(ui, state, &t!("prop-embedment"), tid, "pcm", cap.embedment, |d, v| {
+        if let Some(c) = set(d) {
+            c.embedment = v.clamp(0.0, cc_core::pile::MAX_EMBEDMENT);
+        }
+    });
+}
+
 /// Section and layout parameters of columns, beams, stairs, ramps and railings.
+/// A strip footing type's beam on top (an inverted T): a checkbox, and with
+/// it the edge thickness of the footing and the beam's width and height.
+fn strip_haunch_rows(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
+    let tid = ty.id;
+    let TypeData::Foundation { width, thickness, haunch, .. } = ty.data else { return };
+    crate::table::section(ui, "type-haunch", t!("section-strip-beam"), |ui| {
+        let mut on = haunch.is_some();
+        if row(ui, &t!("prop-strip-beam"), |ui| crate::table::checkbox(ui, &mut on)).changed() {
+            update(state, tid, "fh", |t| {
+                if let TypeData::Foundation { haunch, .. } = &mut t.data {
+                    // A beam a third of the strip wide and as high as the footing is thick.
+                    let beam = cc_core::StripHaunch {
+                        edge_thickness: thickness,
+                        beam_width: width / 3.0,
+                        beam_height: thickness,
+                    };
+                    *haunch = on.then_some(beam);
+                }
+            });
+            state.session.doc.break_merge();
+        }
+        let Some(h) = haunch else { return };
+        type Set = fn(&mut cc_core::StripHaunch, f64);
+        let rows: [(String, &str, f64, Set); 3] = [
+            (t!("prop-strip-edge"), "fhe", h.edge_thickness, |h, v| h.edge_thickness = v),
+            (t!("prop-strip-beam-width"), "fhw", h.beam_width, |h, v| h.beam_width = v),
+            (t!("prop-strip-beam-height"), "fhh", h.beam_height, |h, v| h.beam_height = v),
+        ];
+        for (label, key, value, set) in rows {
+            size_row(ui, state, &label, tid, key, value, move |d, v| {
+                if let TypeData::Foundation { width, thickness, haunch: Some(h), .. } = d {
+                    // Kept within what makes a section.
+                    let mut next = *h;
+                    set(&mut next, v.max(0.0));
+                    if next.fits(*width, *thickness) {
+                        *h = next;
+                    }
+                }
+            });
+        }
+    });
+}
+
 fn structure_parameters(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
     let tid = ty.id;
     match ty.data {
-        TypeData::Column { section, .. } => {
-            section_rows(ui, state, tid, section, false);
-        }
-        TypeData::Beam { width, height, shape, .. } => {
-            section_rows(ui, state, tid, cc_core::ColumnSection::Profile { width, depth: height, shape }, true);
-        }
-        TypeData::Foundation { kind, width, length, thickness, .. } => {
+        TypeData::Column { .. } | TypeData::Beam { .. } => profile_rows(ui, state, ty),
+        TypeData::Foundation { kind, width, length, thickness, ref pile_cap, .. } => {
             crate::table::section(ui, "type-dimensions", t!("section-dimensions"), |ui| {
                 let mut k = kind;
                 row(ui, &t!("prop-foundation-kind"), |ui| {
@@ -477,13 +751,17 @@ fn structure_parameters(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
                 });
                 if k != kind {
                     update(state, tid, "fk", |t| {
-                        if let TypeData::Foundation { kind, .. } = &mut t.data {
+                        if let TypeData::Foundation { kind, pile_cap, .. } = &mut t.data {
                             *kind = k;
+                            // A pile cap holds its piles' layout; other kinds none.
+                            *pile_cap =
+                                (k == cc_core::FoundationKind::PileCap).then(|| pile_cap.clone().unwrap_or_default());
                         }
                     });
                     state.session.doc.break_merge();
                 }
-                if kind != cc_core::FoundationKind::Slab {
+                // A pile cap's size follows from its layout.
+                if !matches!(kind, cc_core::FoundationKind::Slab | cc_core::FoundationKind::PileCap) {
                     length_row(ui, state, &t!("col-width"), tid, "fw", width, |d, v| {
                         if let TypeData::Foundation { width, .. } = d {
                             *width = v.max(0.05);
@@ -497,12 +775,26 @@ fn structure_parameters(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
                         }
                     });
                 }
-                length_row(ui, state, &t!("col-thickness"), tid, "ft", thickness, |d, v| {
-                    if let TypeData::Foundation { thickness, .. } = d {
-                        *thickness = v.max(0.05);
-                    }
-                });
+                size_row(
+                    ui,
+                    state,
+                    &crate::properties::field_label(cc_core::ScheduleField::Thickness),
+                    tid,
+                    "ft",
+                    thickness,
+                    |d, v| {
+                        if let TypeData::Foundation { thickness, .. } = d {
+                            *thickness = v.max(0.05);
+                        }
+                    },
+                );
+                if let Some(cap) = pile_cap {
+                    pile_cap_rows(ui, state, tid, cap);
+                }
             });
+            if kind == cc_core::FoundationKind::Strip {
+                strip_haunch_rows(ui, state, ty);
+            }
         }
         TypeData::Stair { width, max_riser, tread, build, rules, .. } => {
             crate::table::section(ui, "type-dimensions", t!("section-dimensions"), |ui| {
@@ -511,12 +803,12 @@ fn structure_parameters(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
                         *width = v.max(0.3);
                     }
                 });
-                length_row(ui, state, &t!("prop-max-riser"), tid, "sr", max_riser, |d, v| {
+                size_row(ui, state, &t!("prop-max-riser"), tid, "sr", max_riser, |d, v| {
                     if let TypeData::Stair { max_riser, .. } = d {
                         *max_riser = v.clamp(0.05, 0.5);
                     }
                 });
-                length_row(ui, state, &t!("col-tread"), tid, "st", tread, |d, v| {
+                size_row(ui, state, &t!("col-tread"), tid, "st", tread, |d, v| {
                     if let TypeData::Stair { tread, .. } = d {
                         *tread = v.clamp(0.1, 1.0);
                     }
@@ -553,11 +845,69 @@ fn structure_parameters(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
         }
         TypeData::Pipe { diameter, .. } | TypeData::Conduit { diameter, .. } => {
             crate::table::section(ui, "type-dimensions", t!("section-dimensions"), |ui| {
-                length_row(ui, state, &t!("col-diameter"), tid, "pd", diameter, |d, v| {
+                size_row(ui, state, &t!("col-diameter"), tid, "pd", diameter, |d, v| {
                     if let TypeData::Pipe { diameter, .. } | TypeData::Conduit { diameter, .. } = d {
                         *diameter = v.clamp(0.005, 2.0);
                     }
                 });
+            });
+        }
+        TypeData::LightningConductor { diameter, .. } => {
+            crate::table::section(ui, "type-dimensions", t!("section-dimensions"), |ui| {
+                use cc_core::lightning::{MAX_CONDUCTOR_DIAMETER, MIN_CONDUCTOR_DIAMETER};
+                size_row(ui, state, &t!("col-diameter"), tid, "cd", diameter, |d, v| {
+                    if let TypeData::LightningConductor { diameter, .. } = d {
+                        *diameter = v.clamp(MIN_CONDUCTOR_DIAMETER, MAX_CONDUCTOR_DIAMETER);
+                    }
+                });
+            });
+        }
+        TypeData::CableTray { width, height, style, .. } => {
+            crate::table::section(ui, "type-dimensions", t!("section-dimensions"), |ui| {
+                size_row(ui, state, &t!("col-width"), tid, "tw", width, |d, v| {
+                    if let TypeData::CableTray { width, .. } = d {
+                        *width = v.clamp(0.02, cc_core::mep::MAX_TRAY_WIDTH);
+                    }
+                });
+                size_row(ui, state, &t!("col-height"), tid, "th", height, |d, v| {
+                    if let TypeData::CableTray { height, .. } = d {
+                        *height = v.clamp(0.01, cc_core::mep::MAX_TRAY_HEIGHT);
+                    }
+                });
+                let mut s = style;
+                row(ui, &t!("prop-tray-style"), |ui| {
+                    egui::ComboBox::from_id_salt(("tray-style", tid.0)).selected_text(tr(s.key())).show_ui(ui, |ui| {
+                        for option in cc_core::TrayStyle::ALL {
+                            ui.selectable_value(&mut s, option, tr(option.key()));
+                        }
+                    });
+                });
+                if s != style {
+                    update(state, tid, "tray-style", |t| {
+                        if let TypeData::CableTray { style, .. } = &mut t.data {
+                            *style = s;
+                        }
+                    });
+                }
+            });
+        }
+        TypeData::Valve { kind, .. } => {
+            crate::table::section(ui, "type-valve", t!("section-mep"), |ui| {
+                let mut k = kind;
+                row(ui, &t!("prop-valve-kind"), |ui| {
+                    egui::ComboBox::from_id_salt(("valve-kind", tid.0)).selected_text(tr(k.key())).show_ui(ui, |ui| {
+                        for option in cc_core::ValveKind::ALL {
+                            ui.selectable_value(&mut k, option, tr(option.key()));
+                        }
+                    });
+                });
+                if k != kind {
+                    update(state, tid, "valve-kind", |t| {
+                        if let TypeData::Valve { kind, .. } = &mut t.data {
+                            *kind = k;
+                        }
+                    });
+                }
             });
         }
         TypeData::Ramp { width, thickness, rules, .. } => {
@@ -567,11 +917,19 @@ fn structure_parameters(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
                         *width = v.clamp(0.3, 50.0);
                     }
                 });
-                length_row(ui, state, &t!("col-thickness"), tid, "rt", thickness, |d, v| {
-                    if let TypeData::Ramp { thickness, .. } = d {
-                        *thickness = v.clamp(0.01, 5.0);
-                    }
-                });
+                size_row(
+                    ui,
+                    state,
+                    &crate::properties::field_label(cc_core::ScheduleField::Thickness),
+                    tid,
+                    "rt",
+                    thickness,
+                    |d, v| {
+                        if let TypeData::Ramp { thickness, .. } = d {
+                            *thickness = v.clamp(0.01, 5.0);
+                        }
+                    },
+                );
             });
             crate::table::section(ui, "type-ramp-rules", t!("section-ramp-rules"), |ui| {
                 let mut r = rules;
@@ -585,6 +943,29 @@ fn structure_parameters(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
                 }
                 if edited.done {
                     state.session.doc.break_merge();
+                }
+            });
+        }
+        TypeData::Sweep { ref profile, .. } => {
+            // The profile's extent; *Edit Profile* draws it in a sketch.
+            crate::table::section(ui, "type-dimensions", t!("section-dimensions"), |ui| {
+                let (lo, hi) = profile
+                    .iter()
+                    .fold((glam::DVec2::splat(f64::INFINITY), glam::DVec2::splat(f64::NEG_INFINITY)), |(lo, hi), p| {
+                        (lo.min(*p), hi.max(*p))
+                    });
+                if lo.is_finite() && hi.is_finite() {
+                    crate::table::readonly_row(ui, &t!("col-width"), cc_views::format::length(hi.x - lo.x));
+                    crate::table::readonly_row(ui, &t!("col-height"), cc_views::format::length(hi.y - lo.y));
+                }
+                crate::table::readonly_row(ui, &t!("prop-sweep-points"), profile.len().to_string());
+                ui.add_space(4.0);
+                if ui.button(t!("edit-profile")).on_hover_text(t!("cmd-desc-edit-profile")).clicked() {
+                    // The dialog's edits are kept; the profile opens in the sketch.
+                    crate::dialog::session::commit(state);
+                    state.dialogs.type_editor = None;
+                    state.dialogs.type_rename = None;
+                    crate::profile_sketch::open(state, tid);
                 }
             });
         }
@@ -605,182 +986,120 @@ fn structure_parameters(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
         _ => {}
     }
 }
-
-/// The kinds of section a type can choose; beams take all but the round ones.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum SectionKind {
-    Rectangular,
-    Round,
-    I,
-    Channel,
-    Angle,
-    Tube,
-    Pipe,
-}
-
-impl SectionKind {
-    const ALL: [SectionKind; 7] = [
-        SectionKind::Rectangular,
-        SectionKind::Round,
-        SectionKind::I,
-        SectionKind::Channel,
-        SectionKind::Angle,
-        SectionKind::Tube,
-        SectionKind::Pipe,
-    ];
-
-    fn key(self) -> &'static str {
-        match self {
-            SectionKind::Rectangular => "section-solid",
-            SectionKind::Round => "section-round",
-            SectionKind::I => "section-i",
-            SectionKind::Channel => "section-channel",
-            SectionKind::Angle => "section-angle",
-            SectionKind::Tube => "section-tube",
-            SectionKind::Pipe => "section-pipe",
-        }
-    }
-
-    fn of(section: cc_core::ColumnSection) -> Self {
-        use cc_core::{ColumnSection as C, SectionShape as S};
-        match section {
-            C::Rectangular { .. } | C::Profile { shape: S::Solid, .. } => SectionKind::Rectangular,
-            C::Round { .. } => SectionKind::Round,
-            C::Pipe { .. } => SectionKind::Pipe,
-            C::Profile { shape: S::I { .. }, .. } => SectionKind::I,
-            C::Profile { shape: S::Channel { .. }, .. } => SectionKind::Channel,
-            C::Profile { shape: S::Angle { .. }, .. } => SectionKind::Angle,
-            C::Profile { shape: S::Tube { .. }, .. } => SectionKind::Tube,
-        }
-    }
-
-    /// `section` turned into this kind, keeping its size; thicknesses start
-    /// at typical proportions.
-    fn convert(self, section: cc_core::ColumnSection) -> cc_core::ColumnSection {
-        use cc_core::{ColumnSection as C, SectionShape as S};
-        let (w, d) = section.size();
-        let profile = |shape| C::Profile { width: w, depth: d, shape };
-        match self {
-            SectionKind::Rectangular => C::Rectangular { width: w, depth: d },
-            SectionKind::Round => C::Round { diameter: w.max(d) },
-            SectionKind::Pipe => C::Pipe { diameter: w.max(d), wall: w.max(d) * 0.05 },
-            SectionKind::I => profile(S::I { web: w * 0.05, flange: d * 0.075 }),
-            SectionKind::Channel => profile(S::Channel { web: w * 0.1, flange: d * 0.075 }),
-            SectionKind::Angle => profile(S::Angle { thickness: w.min(d) * 0.1 }),
-            SectionKind::Tube => profile(S::Tube { wall: w.min(d) * 0.05 }),
-        }
-    }
-}
-
-/// The section of a column type, or a beam type's as a profile.
-fn type_section(d: &TypeData) -> Option<cc_core::ColumnSection> {
-    match *d {
-        TypeData::Column { section, .. } => Some(section),
-        TypeData::Beam { width, height, shape, .. } => {
-            Some(cc_core::ColumnSection::Profile { width, depth: height, shape })
+/// The profile a column or beam type uses, how it is turned and mirrored.
+fn profile_of(data: &TypeData) -> Option<(Option<ProfileId>, f64, bool)> {
+    match data {
+        TypeData::Column { profile, profile_rotation_deg, profile_mirror, .. }
+        | TypeData::Beam { profile, profile_rotation_deg, profile_mirror, .. } => {
+            Some((*profile, *profile_rotation_deg, *profile_mirror))
         }
         _ => None,
     }
 }
 
-fn set_type_section(d: &mut TypeData, s: cc_core::ColumnSection) {
-    use cc_core::ColumnSection as C;
-    match d {
-        TypeData::Column { section, .. } => *section = s,
-        TypeData::Beam { width, height, shape, .. } => match s {
-            C::Profile { width: w, depth: h, shape: p } => (*width, *height, *shape) = (w, h, p),
-            C::Rectangular { width: w, depth: h } => (*width, *height, *shape) = (w, h, cc_core::SectionShape::Solid),
-            C::Round { .. } | C::Pipe { .. } => {}
-        },
-        _ => {}
+/// Change the profile fields of a column or beam type as `f` does.
+fn set_profile(t: &mut ElementType, f: impl FnOnce(&mut Option<ProfileId>, &mut f64, &mut bool)) {
+    if let TypeData::Column { profile, profile_rotation_deg, profile_mirror, .. }
+    | TypeData::Beam { profile, profile_rotation_deg, profile_mirror, .. } = &mut t.data
+    {
+        f(profile, profile_rotation_deg, profile_mirror);
     }
 }
 
-/// Kind and dimensions of a column's section, or a beam's (`beam`: the
-/// depth is its height and round sections are not offered).
-fn section_rows(ui: &mut Ui, state: &mut AppState, tid: ElementTypeId, section: cc_core::ColumnSection, beam: bool) {
-    use cc_core::{ColumnSection as C, SectionShape as S};
-    crate::table::section(ui, "type-dimensions", t!("section-dimensions"), |ui| {
-        let current = SectionKind::of(section);
-        let mut kind = current;
-        row(ui, &t!("prop-section-kind"), |ui| {
-            egui::ComboBox::from_id_salt(("section-kind", tid.0)).selected_text(tr(kind.key())).show_ui(ui, |ui| {
-                for option in SectionKind::ALL {
-                    if beam && matches!(option, SectionKind::Round | SectionKind::Pipe) {
-                        continue;
-                    }
-                    ui.selectable_value(&mut kind, option, tr(option.key()));
+/// A profile's depth and width (`d × bf`) in millimeters (in inches in
+/// imperial projects), unturned.
+fn profile_size(project: &cc_core::Project, id: ProfileId) -> Option<String> {
+    let outline = project.profile(id)?.shape.outline().ok()?;
+    let (lo, hi) = outline.bbox();
+    if format::imperial() {
+        let i = format::inch_size;
+        return Some(format!("{} × {}", i(hi.y - lo.y), i(hi.x - lo.x)));
+    }
+    let mm = |v: f64| {
+        let v = v * 1000.0;
+        format::number(v, if (v - v.round()).abs() < 0.05 { 0 } else { 1 })
+    };
+    Some(format!("{} × {} mm", mm(hi.y - lo.y), mm(hi.x - lo.x)))
+}
+
+/// The project's profiles grouped by material with a search box; returns
+/// the one clicked.
+fn profile_combo(
+    ui: &mut Ui,
+    project: &cc_core::Project,
+    tid: ElementTypeId,
+    current: Option<ProfileId>,
+) -> Option<ProfileId> {
+    let name = current.and_then(|id| project.profile(id)).map_or_else(|| "—".to_string(), |p| p.name.clone());
+    let search_id = egui::Id::new(("type-profile-search", tid.0));
+    let mut picked = None;
+    let combo = egui::ComboBox::from_id_salt(("type-profile", tid.0)).selected_text(name).width(200.0).height(360.0);
+    combo.show_ui(ui, |ui| {
+        let mut search = ui.ctx().data(|d| d.get_temp::<String>(search_id)).unwrap_or_default();
+        ui.add(egui::TextEdit::singleline(&mut search).hint_text(t!("profiles-search")).desired_width(180.0));
+        let needle = search.trim().to_lowercase();
+        for m in ProfileMaterial::ALL {
+            let mut rows: Vec<(ProfileId, &str)> = project
+                .profiles
+                .values()
+                .filter(|p| p.material == m && p.name.to_lowercase().contains(&needle))
+                .map(|p| (p.id, p.name.as_str()))
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            rows.sort_by_key(|(_, n)| n.to_lowercase());
+            ui.label(theme::muted(tr(m.key())).size(11.0));
+            for (id, name) in rows {
+                if ui.selectable_label(current == Some(id), name).clicked() {
+                    picked = Some(id);
                 }
-            });
+            }
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(search_id, search));
+    });
+    picked
+}
+
+/// A column's or beam's section: its profile (picked from the project's;
+/// *Manage…* opens the Profile Manager), turned and mirrored, and the
+/// profile's size.
+fn profile_rows(ui: &mut Ui, state: &mut AppState, ty: &ElementType) {
+    let tid = ty.id;
+    let Some((profile, rotation, mirror)) = profile_of(&ty.data) else { return };
+    crate::table::section(ui, "type-dimensions", t!("section-dimensions"), |ui| {
+        let mut picked = None;
+        let manage = row(ui, &t!("col-profile"), |ui| {
+            ui.horizontal(|ui| {
+                picked = profile_combo(ui, state.project(), tid, profile);
+                ui.button(t!("type-profile-manage")).clicked()
+            })
+            .inner
         });
-        if kind != current {
-            update(state, tid, "skind", |t| set_type_section(&mut t.data, kind.convert(section)));
+        if let Some(id) = picked.filter(|id| Some(*id) != profile) {
+            update(state, tid, "profile", |t| set_profile(t, |p, _, _| *p = Some(id)));
             state.session.doc.break_merge();
         }
-        // Each dimension: label, field key, value and how to set it.
-        type Setter = fn(&mut C, f64);
-        let depth_label = if beam { t!("col-height") } else { t!("prop-depth-section") };
-        let mut rows: Vec<(String, &str, f64, Setter)> = Vec::new();
-        match section {
-            C::Rectangular { width, depth } | C::Profile { width, depth, .. } => {
-                rows.push((t!("col-width"), "sw", width, |s, v| match s {
-                    C::Rectangular { width, .. } | C::Profile { width, .. } => *width = v.max(0.01),
-                    _ => {}
-                }));
-                rows.push((depth_label, "sd", depth, |s, v| match s {
-                    C::Rectangular { depth, .. } | C::Profile { depth, .. } => *depth = v.max(0.01),
-                    _ => {}
-                }));
-            }
-            C::Round { diameter } | C::Pipe { diameter, .. } => {
-                rows.push((t!("prop-diameter"), "sdia", diameter, |s, v| match s {
-                    C::Round { diameter } | C::Pipe { diameter, .. } => *diameter = v.max(0.01),
-                    _ => {}
-                }));
+        if manage {
+            crate::profiles_dialog::open(state);
+            if let Some(d) = state.dialogs.profiles.as_mut() {
+                d.selected = profile;
             }
         }
-        match section {
-            C::Profile { shape: S::I { web, flange } | S::Channel { web, flange }, .. } => {
-                rows.push((t!("prop-web"), "sweb", web, |s, v| {
-                    if let C::Profile { shape: S::I { web, .. } | S::Channel { web, .. }, .. } = s {
-                        *web = v.max(0.001);
-                    }
-                }));
-                rows.push((t!("prop-flange"), "sfl", flange, |s, v| {
-                    if let C::Profile { shape: S::I { flange, .. } | S::Channel { flange, .. }, .. } = s {
-                        *flange = v.max(0.001);
-                    }
-                }));
-            }
-            C::Profile { shape: S::Angle { thickness }, .. } => {
-                rows.push((t!("col-thickness"), "sth", thickness, |s, v| {
-                    if let C::Profile { shape: S::Angle { thickness }, .. } = s {
-                        *thickness = v.max(0.001);
-                    }
-                }));
-            }
-            C::Profile { shape: S::Tube { wall }, .. } | C::Pipe { wall, .. } => {
-                rows.push((t!("prop-wall-thickness"), "swall", wall, |s, v| match s {
-                    C::Profile { shape: S::Tube { wall }, .. } | C::Pipe { wall, .. } => *wall = v.max(0.001),
-                    _ => {}
-                }));
-            }
-            _ => {}
+        let mut r = rotation;
+        let resp = row(ui, &t!("prop-rotation"), |ui| {
+            ui.add(DragValue::new(&mut r).speed(1.0).range(-180.0..=180.0).max_decimals(2).suffix("°"))
+        });
+        if resp.changed() {
+            update(state, tid, "profile-rotation", |t| set_profile(t, |_, angle, _| *angle = r));
         }
-        for (label, field, value, set) in rows {
-            length_row(ui, state, &label, tid, field, value, |d, v| {
-                if let Some(mut s) = type_section(d) {
-                    set(&mut s, v);
-                    // Thicknesses stay within the section's box.
-                    if let C::Profile { width, depth, shape } = &mut s {
-                        *shape = shape.fitted(*width, *depth);
-                    }
-                    if let C::Pipe { diameter, wall } = &mut s {
-                        *wall = wall.min(*diameter * 0.5);
-                    }
-                    set_type_section(d, s);
-                }
-            });
+        finish(state, &resp);
+        let mut m = mirror;
+        if row(ui, &t!("prop-mirrored"), |ui| ui.checkbox(&mut m, "")).changed() {
+            update(state, tid, "profile-mirror", |t| set_profile(t, |_, _, flip| *flip = m));
+            state.session.doc.break_merge();
         }
+        let size = profile.and_then(|id| profile_size(state.project(), id)).unwrap_or_else(|| "—".to_string());
+        readonly_row(ui, &t!("type-profile-size"), size);
     });
 }

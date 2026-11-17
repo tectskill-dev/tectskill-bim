@@ -17,6 +17,10 @@ pub enum RibbonTab {
     Structure,
     /// Building services: plumbing and electrical.
     Mep,
+    /// Conceptual masses and the terrain.
+    MassingSite,
+    /// Importing and exporting files, loading components.
+    Insert,
     Modify,
     Annotate,
     View,
@@ -26,7 +30,8 @@ pub enum RibbonTab {
 /// An action that discards unsaved changes, waiting for confirmation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PendingAction {
-    New,
+    /// A new project from the template of this measurement system.
+    New(cc_core::MeasurementSystem),
     Open,
     OpenPath(std::path::PathBuf),
     OpenSample(&'static str),
@@ -43,8 +48,8 @@ pub struct Dialogs {
     pub levels: bool,
     pub materials: bool,
     pub type_editor: Option<ElementTypeId>,
-    /// Open component editor (above the type dialog when opened from it).
-    pub component_editor: Option<crate::component_editor::Editor>,
+    /// The New Component dialog: the name typed and the kind picked.
+    pub new_component: Option<crate::new_component_dialog::NewComponent>,
     /// Type name being edited by "Rename" in the type dialog.
     pub type_rename: Option<String>,
     /// The rename field takes the focus on its next frame.
@@ -53,17 +58,30 @@ pub struct Dialogs {
     pub type_layers_open: bool,
     /// Undo depth when the open data dialog started editing (see `dialog::session`).
     pub edit_start: Option<usize>,
+    /// Level picked in the levels dialog: the one a level is added above or below.
+    pub level_selected: Option<LevelId>,
     /// Level waiting for delete confirmation.
     pub delete_level: Option<LevelId>,
-    /// Schedule whose definition dialog is open.
+    /// Schedule whose definition dialog is open, and the page it shows.
     pub schedule_def: Option<ViewId>,
+    pub schedule_tab: crate::schedule_ui::Tab,
     pub confirm: Option<PendingAction>,
+    /// The New Project dialog, with the template picked in it.
+    pub new_project: Option<cc_core::MeasurementSystem>,
     pub error: Option<String>,
     pub about: bool,
     /// Plumbing systems and electrical circuits.
     pub systems: bool,
     /// Sizing of the pipes and circuits.
     pub sizing: bool,
+    /// The lightning protection coverage check, with the class it checks
+    /// and its last result (class, document revision, `lps_check` output).
+    pub lps_check: bool,
+    pub lps_class: cc_core::LpsClass,
+    pub lps_result: Option<(cc_core::LpsClass, u64, serde_json::Value)>,
+    /// The structured cabling per rack, with its last result (document revision, `cabling_list` output).
+    pub cabling: bool,
+    pub cabling_result: Option<(u64, serde_json::Value)>,
     /// Visibility/Graphics of a view or view template.
     pub graphics: Option<crate::graphics_dialog::GraphicsDialog>,
     /// Graphic overrides of the selected elements in a view.
@@ -74,13 +92,53 @@ pub struct Dialogs {
     pub templates: Option<crate::graphics_dialog::TemplateManager>,
     /// Phases, phase filters and phase graphics.
     pub phases: Option<crate::phases_dialog::PhasesDialog>,
+    /// Design option sets and their options.
+    pub design_options: Option<crate::design_options_ui::OptionsDialog>,
+    /// The project browser's organization schemes.
+    pub browser_org: Option<crate::browser_org_dialog::BrowserOrgDialog>,
+    /// The project's line styles.
+    pub line_styles: Option<crate::line_styles_dialog::LineStylesDialog>,
+    /// The Sun Settings of a view.
+    pub sun: Option<crate::sun_ui::SunDialog>,
+    /// The render window of a 3D view (*View → Render*).
+    pub render: Option<crate::render_ui::RenderWindow>,
+    /// The render window waiting for Sun Settings, opened from it, to close.
+    pub render_resume: Option<crate::render_ui::Resume>,
+    /// The fill pattern manager.
+    pub fill_patterns: Option<crate::fill_patterns_dialog::FillPatternsDialog>,
+    /// The Profile Manager.
+    pub profiles: Option<crate::profiles_dialog::ProfilesDialog>,
+    /// *Structure → Grid Frame*.
+    pub grid_frame: Option<crate::grid_frame_ui::GridFrameDialog>,
+    /// *Structure → Steel Building*.
+    pub steel_building: Option<crate::steel_building_ui::SteelBuildingDialog>,
+    /// *Structure → Light Steel Frame / Wood Frame*.
+    pub wall_framing: Option<crate::wall_framing_ui::WallFramingDialog>,
+    /// The Profile Manager's edits while one of its profiles is in a
+    /// sketch (*Edit sketch*): Finish and Cancel open it again with them, so
+    /// its Cancel still undoes everything.
+    pub profiles_resume: Option<crate::graphics_dialog::Edits>,
     /// The component library window.
     pub library: Option<crate::library::Library>,
+    /// The .obj file whose import options are being asked.
+    pub obj_import: Option<std::path::PathBuf>,
+    /// The last choices of the OBJ import dialog.
+    pub obj_options: crate::obj_ui::ObjOptions,
+    /// The Preferences window.
+    pub preferences: Option<crate::preferences::PreferencesDialog>,
 }
 
 pub struct AppState {
     /// The engine session: document, derived geometry, drawings and sheets.
     pub session: Session,
+    /// The multi-selection rows' copy of the selected elements, per revision and selection.
+    pub multi_summary: Option<std::sync::Arc<crate::properties::MultiSummary>>,
+    /// The 2D views' drawings as painted, kept between frames.
+    pub paint_cache: crate::paint_cache::PaintCache,
+    /// The model's snap candidates (document revision, level, candidates).
+    pub snap_cache: Option<(u64, Option<LevelId>, std::sync::Arc<crate::tools::ModelSnaps>)>,
+    /// Each imported drawing's snap index, kept while its drawing stays the same.
+    pub cad_snap_index: std::collections::HashMap<ElementId, crate::tools::CadIndexEntry>,
     pub selection: BTreeSet<ElementId>,
     pub tool: Tool,
     pub interaction: Interaction,
@@ -90,26 +148,37 @@ pub struct AppState {
     pub dim_continuous: bool,
     /// Options of the truss tool.
     pub truss: crate::tools::TrussOptions,
+    /// Options of the bracing tool.
+    pub bracing: crate::tools::BracingOptions,
     /// Options of the pipe, conduit and device tools.
     pub mep: crate::tools::MepOptions,
+    /// Options of the Curtain Grid tool.
+    pub curtain: crate::curtain_ui::CurtainOptions,
+    /// The material of the Paint tool.
+    pub paint_material: String,
     pub active_view: Option<ViewId>,
     pub view2d: HashMap<ViewId, View2DState>,
     pub view3d: HashMap<ViewId, View3DState>,
     /// Views the dock should open (or focus) this frame.
     pub open_requests: Vec<ViewId>,
+    /// View tabs open (kept by the dock each frame).
+    pub open_tabs: usize,
+    /// Close every view tab but this one on the next frame.
+    pub close_others_than: Option<ViewId>,
     pub dialogs: Dialogs,
     pub ribbon_tab: RibbonTab,
     /// The ribbon shows only its tabs; clicking one shows its panel over the views (`ribbon_peek`).
     pub ribbon_collapsed: bool,
     pub ribbon_peek: bool,
-    /// The interface theme the user chose (light, dark or the system's).
-    pub theme: crate::theme::ThemeChoice,
     /// The open command palette.
     pub palette: Option<crate::palette::Palette>,
     /// Browser inline rename in progress.
     pub rename: Option<(ViewId, String)>,
     /// Selected viewport on a sheet: (sheet, viewport index).
     pub sheet_selection: Option<(ViewId, usize)>,
+    /// View whose mark is selected: a section's in a plan (see
+    /// [`crate::section_mark`]) or a callout's (see [`crate::callout_ui`]).
+    pub section_selection: Option<ViewId>,
     /// Status bar message.
     pub message: String,
     /// Cursor position in the active 2D view's coordinates.
@@ -120,14 +189,25 @@ pub struct AppState {
     pub typed: crate::tools::TypedInput,
     /// Default height for new walls.
     pub wall_height: f64,
+    /// The measurement system the tools' sizes were last set for (see
+    /// [`AppState::follow_system`]).
+    pub tool_system: cc_core::MeasurementSystem,
     /// Location line for new walls.
     pub wall_location_line: cc_core::LocationLine,
     /// Plan layout for new stairs (shape, turn, landing, winders, radius).
     pub stair_layout: cc_core::StairLayout,
+    /// Options for new swept profiles (height, closed path, side).
+    pub sweep: crate::tools::SweepOptions,
+    /// Railings on a picked stair or ramp instead of a drawn path.
+    pub railing_host: crate::tools::RailingHostOptions,
     /// Plan layout for new ramps (shape, turn, slope, landing, radius).
     pub ramp_layout: cc_core::RampLayout,
     /// The wall tool draws arcs (start, end, then a point on the arc).
     pub wall_arc: bool,
+    /// The footing tool, with a strip type, draws arc strips as the wall tool draws arcs.
+    pub strip_arc: bool,
+    /// The beam tool draws arc beams the same way.
+    pub beam_arc: bool,
     /// Level new walls rise to (`None`: unconnected, `wall_height` tall).
     pub wall_top_level: Option<LevelId>,
     /// Allow the window to close after the user confirmed.
@@ -143,11 +223,17 @@ pub struct AppState {
     pub project_open: bool,
     /// Recently opened or saved projects, most recent first.
     pub recent: Vec<std::path::PathBuf>,
-    /// Folders of the component library (saved with the preferences).
-    pub library_folders: Vec<std::path::PathBuf>,
+    /// The app preferences (saved with eframe; see `preferences.rs`).
+    pub prefs: crate::preferences::Preferences,
     /// Update checks and the notice of a newer release.
     pub updates: crate::update::Updates,
+    /// The plugins of the plugins folder and the Plugins window.
+    pub plugins: crate::plugins_ui::Plugins,
+    /// The open Site Location window.
+    pub site: Option<crate::site_ui::SiteDialog>,
     pub thumbnail_jobs: Vec<crate::thumbnails::Job>,
+    /// The file being opened or imported on a worker thread (see `jobs.rs`).
+    pub job: Option<crate::jobs::Job>,
     /// Samples whose thumbnail was already requested this session.
     pub requested_samples: std::collections::BTreeSet<&'static str>,
     /// Cut or copied elements of this document.
@@ -156,10 +242,24 @@ pub struct AppState {
     pub zoom_default: crate::canvas::ZoomCommand,
     /// Value field open over a view (dimension values).
     pub value_edit: Option<crate::dim_edit::ValueEdit>,
+    /// The component modeling environment, when open (it replaces the views).
+    pub component_env: Option<crate::component_env::Env>,
+    /// The open sketch of an outline (see [`crate::sketch_mode`]).
+    pub sketch: Option<crate::sketch_mode::Session>,
     /// Text editor open over a view (text notes).
     pub text_edit: Option<crate::text_tool::TextEditor>,
     /// Options of the text tools.
     pub text_options: crate::text_tool::TextOptions,
+    /// Options of the Detail Line tool (mode and line style).
+    pub detail: crate::detail_ui::DetailOptions,
+    /// Detail lines being drawn (the picks of the curve in progress).
+    pub detail_draw: Option<crate::detail_ui::DetailDraw>,
+    /// Options of the Detail Component tool (rotation, scale, mirror).
+    pub detail_component: crate::detail_component_ui::PlaceOptions,
+    /// Options of the Callout tool (scale, drafting view pointed to).
+    pub callout: crate::callout_ui::CalloutOptions,
+    /// The visual programming editor (see [`crate::graph_ui`]).
+    pub graph: crate::graph_ui::GraphEditor,
     /// Selection seen last frame (see [`AppState::follow_selection`]).
     seen_selection: BTreeSet<ElementId>,
 }
@@ -171,33 +271,47 @@ impl AppState {
         Self {
             session,
             selection: BTreeSet::new(),
+            multi_summary: None,
+            paint_cache: Default::default(),
+            snap_cache: None,
+            cad_snap_index: std::collections::HashMap::new(),
             tool: Tool::Select,
             interaction: Interaction::default(),
             modify: Default::default(),
             dim_continuous: false,
             truss: Default::default(),
+            bracing: Default::default(),
             mep: Default::default(),
+            curtain: Default::default(),
+            paint_material: String::new(),
             active_view: None,
             view2d: HashMap::new(),
             view3d: HashMap::new(),
             open_requests: Vec::new(),
+            open_tabs: 0,
+            close_others_than: None,
             dialogs: Dialogs::default(),
             ribbon_tab: RibbonTab::default(),
             ribbon_collapsed: false,
-            theme: Default::default(),
             ribbon_peek: false,
             palette: None,
             rename: None,
             sheet_selection: None,
+            section_selection: None,
             message: String::new(),
             cursor: None,
             key_buffer: String::new(),
             typed: Default::default(),
             wall_height: 3.0,
+            tool_system: cc_core::MeasurementSystem::Metric,
             wall_location_line: Default::default(),
             stair_layout: Default::default(),
+            sweep: Default::default(),
+            railing_host: Default::default(),
             ramp_layout: Default::default(),
             wall_arc: false,
+            strip_arc: false,
+            beam_arc: false,
             wall_top_level: None,
             quit_confirmed: false,
             textures_to_free: Vec::new(),
@@ -205,33 +319,61 @@ impl AppState {
             show_home: false,
             project_open: true,
             recent: Vec::new(),
-            library_folders: Vec::new(),
+            prefs: Default::default(),
             updates: Default::default(),
+            plugins: Default::default(),
+            site: None,
             thumbnail_jobs: Vec::new(),
+            job: None,
             requested_samples: Default::default(),
             clipboard: Default::default(),
             zoom_default: Default::default(),
             seen_selection: Default::default(),
+            graph: Default::default(),
             value_edit: None,
+            component_env: None,
+            sketch: None,
             text_edit: None,
             text_options: Default::default(),
+            detail: Default::default(),
+            detail_draw: None,
+            detail_component: Default::default(),
+            callout: Default::default(),
         }
     }
 
     /// Replace the document (new/open), resetting view state.
     pub fn replace_document(&mut self, doc: Document) {
         let message = std::mem::take(&mut self.message);
-        let wall_height = self.wall_height;
+        // Kept, as the tools' other sizes are reset to the metric defaults
+        // (`follow_system` then sets them for the new project).
+        let imperial_default = 10.0 * cc_core::units::FOOT;
+        let wall_height = if self.tool_system == cc_core::MeasurementSystem::Imperial
+            && (self.wall_height - imperial_default).abs() < 1e-9
+        {
+            3.0
+        } else {
+            self.wall_height
+        };
         let mut textures: Vec<_> = self.view3d.values().filter_map(|v| v.texture).collect();
         textures.append(&mut self.textures_to_free);
         let generation = self.generation + 1;
         let recent = std::mem::take(&mut self.recent);
         let updates = std::mem::take(&mut self.updates);
+        let plugins = std::mem::take(&mut self.plugins);
+        // The loaded plugins stay with the new document.
+        let extension = self.session.set_extension(None);
+        let prefs = std::mem::take(&mut self.prefs);
+        let ribbon_collapsed = self.ribbon_collapsed;
         let jobs = std::mem::take(&mut self.thumbnail_jobs);
         let requested = std::mem::take(&mut self.requested_samples);
         *self = Self::new(doc);
         self.recent = recent;
         self.updates = updates;
+        self.plugins = plugins;
+        self.session.set_extension(extension);
+        self.prefs = prefs;
+        self.ribbon_collapsed = ribbon_collapsed;
         self.thumbnail_jobs = jobs;
         self.requested_samples = requested;
         self.textures_to_free = textures;
@@ -240,10 +382,45 @@ impl AppState {
         self.wall_height = wall_height;
     }
 
+    /// Tool sizes still at one measurement system's default take the other
+    /// system's when the project's changes (a new imperial project, or its
+    /// units switched): new walls 3 m or 10'-0" tall, offsets and truss
+    /// depths 1 m or 3'-0", the gaps and spiral radii of new stairs and
+    /// ramps (see [`cc_core::Defaults::flights`]). Sizes the user typed stay.
+    pub fn follow_system(&mut self) {
+        use cc_core::units::FOOT;
+        let system = self.session.doc.project.measurement_system();
+        if system == self.tool_system {
+            return;
+        }
+        let imperial = system == cc_core::MeasurementSystem::Imperial;
+        let (metric_flights, us_flights) = (
+            cc_core::Defaults::of(cc_core::MeasurementSystem::Metric).flights,
+            cc_core::Defaults::of(cc_core::MeasurementSystem::Imperial).flights,
+        );
+        for (value, metric, us) in [
+            (&mut self.wall_height, 3.0, 10.0 * FOOT),
+            (&mut self.modify.offset, 1.0, 3.0 * FOOT),
+            (&mut self.truss.height, 1.0, 3.0 * FOOT),
+            (&mut self.bracing.height, 3.0, 10.0 * FOOT),
+            (&mut self.stair_layout.gap, metric_flights.0, us_flights.0),
+            (&mut self.stair_layout.inner_radius, metric_flights.1, us_flights.1),
+            (&mut self.ramp_layout.gap, metric_flights.0, us_flights.0),
+            (&mut self.ramp_layout.inner_radius, metric_flights.2, us_flights.2),
+        ] {
+            let (from, to) = if imperial { (metric, us) } else { (us, metric) };
+            if (*value - from).abs() < 1e-9 {
+                *value = to;
+            }
+        }
+        self.tool_system = system;
+    }
+
     /// Rebuild derived geometry after model changes and drop stale selection.
     pub fn sync(&mut self) {
         // Drawings, schedules and fields format quantities with the project units.
         cc_views::format::set_units(&self.session.doc.project.units);
+        self.follow_system();
         // New elements are built in the active view's phase.
         let project = &self.session.doc.project;
         let view = self.active_view.and_then(|v| project.view(v)).filter(|v| v.kind.is_phased());
@@ -252,6 +429,8 @@ impl AppState {
             let phase = phase.map(|p| cc_engine::Ref::Id(p.0));
             let _ = self.session.run(cc_engine::commands::phases::PhaseCreationSet { phase, view: None });
         }
+        // Macros record and play steps on the active plan's level.
+        self.session.set_active_level(self.active_level());
         if self.session.sync() {
             let project = &self.session.doc.project;
             self.selection.retain(|id| project.elements.contains_key(id));
@@ -259,6 +438,9 @@ impl AppState {
                 && project.view(sheet).is_none()
             {
                 self.sheet_selection = None;
+            }
+            if self.section_selection.is_some_and(|v| project.view(v).is_none()) {
+                self.section_selection = None;
             }
         }
     }
@@ -304,13 +486,43 @@ impl AppState {
         }
     }
 
-    /// A segment is being drawn with typed input (wall, move, copy, array).
+    /// A segment is being drawn with typed input (wall, grid, move, copy,
+    /// array), or a door or window placed at a typed distance (issue #250).
     pub fn typing_segment(&self) -> bool {
-        matches!(self.tool, Tool::Wall { .. } | Tool::Move | Tool::Copy | Tool::Array)
-            && self.interaction.anchor.is_some()
+        let segment = matches!(
+            self.tool,
+            Tool::Wall { .. } | Tool::Grid { .. } | Tool::Move | Tool::Copy | Tool::Array | Tool::PushPull
+        ) && self.interaction.anchor.is_some();
+        segment || self.typing_two_lengths()
+    }
+
+    /// The tool takes two typed lengths (Tab switches between them): a door
+    /// or window's distances from the start and from the end of its wall.
+    pub fn typing_two_lengths(&self) -> bool {
+        matches!(self.tool, Tool::Hosted { .. })
     }
 
     pub fn set_tool(&mut self, tool: Tool) {
+        // Sketch tools open a sketch (an outline being edited keeps its own); others close it.
+        match &tool {
+            Tool::Sketch { category, type_id } => {
+                let editing =
+                    self.sketch.as_ref().is_some_and(|s| matches!(s.target, crate::sketch_mode::Target::Edit { .. }));
+                if !editing {
+                    let target = crate::sketch_mode::Target::New { category: *category, type_id: *type_id };
+                    match self.sketch.as_mut() {
+                        Some(s) if matches!(s.target, crate::sketch_mode::Target::New { category: c, .. } if c == *category) => {
+                            s.target = target
+                        }
+                        _ => self.sketch = Some(crate::sketch_mode::Session::new(target, Vec::new())),
+                    }
+                }
+            }
+            _ => self.sketch = None,
+        }
+        // A profile's sketch dropped by another tool ends the manager's edits.
+        crate::profiles_dialog::settle_abandoned(self);
+        self.detail_draw = None;
         self.tool = tool;
         self.interaction = Interaction::default();
         self.typed.clear();
@@ -331,7 +543,7 @@ impl AppState {
                 let count = |k: &str| out[k].as_array().map_or(0, Vec::len);
                 let (deleted, pinned) = (count("deleted"), count("pinned_skipped"));
                 self.message = if deleted == 0 {
-                    crate::t!("msg-pinned-skipped", "count" => pinned)
+                    crate::t!("msg-pinned-not-deleted", "count" => pinned)
                 } else {
                     crate::t!("msg-deleted", "count" => deleted)
                 };
@@ -363,14 +575,17 @@ impl AppState {
             kind: kind.clone(),
             phase_created: Default::default(),
             phase_demolished: None,
+            design_option: None,
+            paints: Vec::new(),
         }
         .category();
         let id = self.session.doc.edit(name, |e| {
-            let mark = if matches!(category, cc_core::Category::Door | cc_core::Category::Window) {
-                e.project().next_mark(category)
-            } else {
-                String::new()
-            };
+            let mark =
+                if matches!(category, cc_core::Category::Door | cc_core::Category::Window | cc_core::Category::Niche) {
+                    e.project().next_mark(category)
+                } else {
+                    String::new()
+                };
             let id = ElementId(e.alloc_id());
             e.add_element(cc_core::Element {
                 id,
@@ -382,6 +597,8 @@ impl AppState {
                 uid: Default::default(),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             })
         });
         self.selection = BTreeSet::from([id]);

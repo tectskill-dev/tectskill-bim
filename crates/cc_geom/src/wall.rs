@@ -14,6 +14,36 @@ pub struct Opening {
     pub z1: f64,
 }
 
+/// A recess in one face of a wall (a niche): the wall is open from that
+/// face `depth` in, between `u0` and `u1` along it and `z0` and `z1` in
+/// height, and whole behind it. Unlike an [`Opening`] it does not split the
+/// wall into columns: the wall stands there for joins, rooms and bars.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Recess {
+    pub element: ElementId,
+    pub u0: f64,
+    pub u1: f64,
+    pub z0: f64,
+    pub z1: f64,
+    /// The face it is in: +1 the left one, -1 the right one.
+    pub side: f64,
+    pub depth: f64,
+}
+
+impl Recess {
+    /// Offsets across a wall `half` thick of the face it opens and of its back.
+    pub fn across(&self, half: f64) -> (f64, f64) {
+        (self.side * half, self.side * (half - self.depth))
+    }
+
+    fn overlaps(&self, u: (f64, f64), z: (f64, f64)) -> bool {
+        self.u0 < u.1 - 1e-9 && u.0 < self.u1 - 1e-9 && self.z0 < z.1 - 1e-9 && z.0 < self.z1 - 1e-9
+    }
+}
+
+/// The least a recess leaves of its wall behind it, meters.
+pub const RECESS_MIN_BACK: f64 = 0.01;
+
 /// A vertical slice of a wall between opening boundaries.
 ///
 /// Its footprint is a quad whose left (+v) edge spans `left` and right (-v)
@@ -60,14 +90,60 @@ pub struct WallGeom {
     pub start_joined: bool,
     pub end_joined: bool,
     pub openings: Vec<Opening>,
+    /// Recesses in its faces (niches), apart from each other and from the openings.
+    pub recesses: Vec<Recess>,
     pub columns: Vec<Column>,
     /// Layer boundaries as `(v_from, v_to, material)`, from the left face inward.
     pub layers: Vec<(f64, f64, String)>,
     /// Stretches of a face where another wall meets it in a T, as
     /// `(side, u0, u1)` with side +1 for the left face and -1 for the right.
     pub face_gaps: Vec<(f64, f64, f64)>,
+    /// Offsets `(left, right)` of the core's faces, when the type has a
+    /// structure core with other layers beside it.
+    pub core: Option<(f64, f64)>,
+    /// At an end met in a T (`[start, end]`), where the core layers end
+    /// instead: the `u` of the core's left and right faces, through the
+    /// other wall's outer layers to its core.
+    pub core_ends: [Option<(f64, f64)>; 2],
+    /// Where the cores of walls met in a T pass through this wall's outer layers.
+    pub layer_gaps: Vec<LayerGap>,
     /// The body centerline of an arc wall.
     pub arc: Option<Arc>,
+    /// A top that follows what the wall is attached to: segments
+    /// `(u0, u1, z0, z1)` along the centerline, the top running straight
+    /// from `z0` to `z1` (empty: the flat `top_z`).
+    pub top_profile: Vec<(f64, f64, f64, f64)>,
+    /// The panels and mullions of a curtain wall (its body instead of layers).
+    pub curtain: Option<crate::curtain::CurtainGeom>,
+}
+
+/// Where the core of a wall met in a T runs through the outer layers of the
+/// wall it meets (layer cleanup): those layers open between the core's faces.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerGap {
+    /// Offsets of this wall's face and of its core's face on that side.
+    pub v_face: f64,
+    pub v_core: f64,
+    /// Along this wall, where the joining core's faces cross the face and
+    /// the core's face (each sorted).
+    pub at_face: (f64, f64),
+    pub at_core: (f64, f64),
+    /// The cores are of one material: no line between them along the core's face.
+    pub merge: bool,
+}
+
+impl LayerGap {
+    /// The opening along the wall at offset `v`; `None` outside the outer layers.
+    pub fn at(&self, v: f64) -> Option<(f64, f64)> {
+        let (lo, hi) = (self.v_face.min(self.v_core), self.v_face.max(self.v_core));
+        let span = self.v_core - self.v_face;
+        if v < lo - 1e-9 || v > hi + 1e-9 || span.abs() < 1e-9 {
+            return None;
+        }
+        let t = (v - self.v_face) / span;
+        let lerp = |a: f64, b: f64| a + (b - a) * t;
+        Some((lerp(self.at_face.0, self.at_core.0), lerp(self.at_face.1, self.at_core.1)))
+    }
 }
 
 /// How one end of a wall is cut by a neighbor.
@@ -91,6 +167,10 @@ pub(crate) struct WallLine {
     pub join_end: bool,
     /// Bulge of the centerline (0 for a straight wall; see [`cc_core::arc`]).
     pub bulge: f64,
+    /// The ends of the line the wall was drawn on (its location line): ends
+    /// meet where these coincide, even when the body centerlines, shifted
+    /// across by the location line, do not.
+    pub drawn: [DVec2; 2],
 }
 
 /// A wall face (or any line parallel to a wall's centerline) in plan.
@@ -255,6 +335,53 @@ fn t_join(walls: &[WallLine], me: usize, at_start: bool, host: usize) -> Option<
     Some(EndJoin { ray_left: clamp(left), ray_right: clamp(right), host: Some(host) })
 }
 
+/// Layer cleanup at a T: the end of `walls[me]` (core faces at offsets
+/// `core`) runs its core on through the outer layers of `walls[host]` on its
+/// side, to the host's core (faces at `host_core`). Returns the `u` of the
+/// core's left and right faces' ends and the host's gap (`merge` unset).
+pub(crate) fn core_through(
+    walls: &[WallLine],
+    me: usize,
+    at_start: bool,
+    host: usize,
+    core: (f64, f64),
+    host_core: (f64, f64),
+) -> Option<((f64, f64), LayerGap)> {
+    let a = *walls.get(me)?;
+    let b = *walls.get(host)?;
+    let (p, da) = a.end_ray(at_start);
+    let max_ext = 10.0 * a.half.max(0.05);
+    let (ub, _) = b.locate(p);
+    let db = b.tangent_at(ub);
+    let side = if da.dot(db.perp()) >= 0.0 { 1.0 } else { -1.0 };
+    let v_face = side * b.half;
+    let v_core = if side > 0.0 { host_core.0 } else { host_core.1 };
+    if (v_face - v_core).abs() < 1e-6 {
+        return None;
+    }
+    let depth = |va: f64, vb: f64| {
+        let fallback = (b.locate_point(ub, vb), db);
+        face_depth(&a, at_start, va, b.face(vb), fallback, p, da).filter(|d| d.abs() <= max_ext)
+    };
+    let (core_l, core_r) = (depth(core.0, v_core)?, depth(core.1, v_core)?);
+    let (face_l, face_r) = (depth(core.0, v_face)?, depth(core.1, v_face)?);
+    // Seen from this wall, the host's core lies beyond its face.
+    if core_l > face_l - 1e-6 || core_r > face_r - 1e-6 {
+        return None;
+    }
+    let to_u = |d: f64| if at_start { d } else { a.length() - d };
+    let along = |d: f64, v: f64| b.locate(a.locate_point(to_u(d), v)).0;
+    let sorted = |x: f64, y: f64| (x.min(y), x.max(y));
+    let gap = LayerGap {
+        v_face,
+        v_core,
+        at_face: sorted(along(face_l, core.0), along(face_r, core.1)),
+        at_core: sorted(along(core_l, core.0), along(core_r, core.1)),
+        merge: false,
+    };
+    Some(((to_u(core_l), to_u(core_r)), gap))
+}
+
 impl WallLine {
     /// The point `u` along the centerline and `v` to its left.
     fn locate_point(&self, u: f64, v: f64) -> DVec2 {
@@ -266,6 +393,20 @@ impl WallLine {
             }
         }
     }
+}
+
+/// Where a straight wall (a curtain wall) lies inside another straight
+/// wall `host`, parallel to it and within its faces: the span `(u0, u1)`
+/// along the host it takes up.
+pub(crate) fn embedded_in(wall: &WallLine, host: &WallLine) -> Option<(f64, f64)> {
+    if wall.arc().is_some() || host.arc().is_some() || wall.chord_dir().perp_dot(host.chord_dir()).abs() > 1e-6 {
+        return None;
+    }
+    let (a, b) = (host.locate(wall.start), host.locate(wall.end));
+    let (lo, hi) = (a.0.min(b.0), a.0.max(b.0));
+    let tol = 1e-6;
+    let inside = a.1.abs().max(b.1.abs()) <= host.half + tol && lo >= -tol && hi <= host.length() + tol;
+    (inside && hi - lo > tol).then_some((lo, hi))
 }
 
 /// Resolve the join at one end of `walls[me]` (`at_start` selects the end).
@@ -281,15 +422,16 @@ pub(crate) fn resolve_join(walls: &[WallLine], me: usize, at_start: bool) -> Opt
     let clamp = |t: f64| t.clamp(-max_ext, max_ext);
     let square = || Some(EndJoin { ray_left: 0.0, ray_right: 0.0, host: None });
 
-    // Other wall ends at the same point (that allow joining), as rays into each wall.
+    // Other wall ends at the same drawn point (that allow joining), as rays into each wall.
+    let q = a.drawn[if at_start { 0 } else { 1 }];
     let ends: Vec<(usize, DVec2, bool)> = walls
         .iter()
         .enumerate()
         .filter(|&(i, _)| i != me)
         .filter_map(|(i, b)| {
-            if b.start.distance(p) < JOIN_TOL && b.join_start {
+            if b.drawn[0].distance(q) < JOIN_TOL && b.join_start {
                 Some((i, b.end_ray(true).1, true))
-            } else if b.end.distance(p) < JOIN_TOL && b.join_end {
+            } else if b.drawn[1].distance(q) < JOIN_TOL && b.join_end {
                 Some((i, b.end_ray(false).1, false))
             } else {
                 None
@@ -306,11 +448,13 @@ pub(crate) fn resolve_join(walls: &[WallLine], me: usize, at_start: bool) -> Opt
             return if (a.half - b.half).abs() < 1e-4 && da.dot(db) < 0.0 { square() } else { None };
         }
         let nb = db.perp();
+        // The neighbor's body end: away from `p` when the location lines are off center.
+        let pb = b.end_ray(b_start).0;
         // Pair this wall's ray-left face with the neighbor's ray-right face, and vice versa.
         let (vl, vr) = a.ray_faces(at_start);
         let (bl, br) = b.ray_faces(b_start);
-        let left = face_depth(&a, at_start, vl, b.face(br), (p - nb * b.half, db), p, da)?;
-        let right = face_depth(&a, at_start, vr, b.face(bl), (p + nb * b.half, db), p, da)?;
+        let left = face_depth(&a, at_start, vl, b.face(br), (pb - nb * b.half, db), p, da)?;
+        let right = face_depth(&a, at_start, vr, b.face(bl), (pb + nb * b.half, db), p, da)?;
         return Some(EndJoin { ray_left: clamp(left), ray_right: clamp(right), host: None });
     }
 
@@ -356,6 +500,26 @@ pub(crate) fn resolve_join(walls: &[WallLine], me: usize, at_start: bool) -> Opt
         }
     }
     best.and_then(|(i, _)| t_join(walls, me, at_start, i))
+}
+
+/// Exact plan area of the band `half` either side of the arc `a` whose left
+/// side spans `left` and right side `right` along the arc, its ends cut
+/// straight across.
+pub(crate) fn arc_band_area(a: &Arc, half: f64, left: (f64, f64), right: (f64, f64)) -> f64 {
+    let h = half;
+    // Green's theorem: an arc of radius r from p0 to p1 turning by dφ adds
+    // (r² dφ + c × (p1 - p0)) / 2; a segment p → q adds (p × q) / 2.
+    let arc_part = |u0: f64, u1: f64, v: f64| {
+        let r = a.radius_at(v);
+        let (p0, p1) = (a.at(u0, v), a.at(u1, v));
+        (r * r * (a.angle_at(u1) - a.angle_at(u0)) + a.center.perp_dot(p1 - p0)) * 0.5
+    };
+    let seg = |p: DVec2, q: DVec2| p.perp_dot(q) * 0.5;
+    let sum = arc_part(right.0, right.1, -h)
+        + seg(a.at(right.1, -h), a.at(left.1, h))
+        + arc_part(left.1, left.0, h)
+        + seg(a.at(left.0, h), a.at(right.0, -h));
+    sum.abs()
 }
 
 /// Subtract `cut` from the sorted disjoint `intervals`.
@@ -407,11 +571,59 @@ impl WallGeom {
             start_joined: start.is_some(),
             end_joined: end.is_some(),
             openings: Vec::new(),
+            recesses: Vec::new(),
             columns: Vec::new(),
             layers,
             face_gaps: Vec::new(),
+            core: None,
+            core_ends: [None, None],
+            layer_gaps: Vec::new(),
             arc,
+            top_profile: Vec::new(),
+            curtain: None,
         }
+    }
+
+    /// The top of the profile segment that holds `mid`, carried on to `u`
+    /// (the corners of a mitered end lie a little beyond); `None` with a
+    /// flat top.
+    pub fn profile_top(&self, mid: f64, u: f64) -> Option<f64> {
+        let (u0, u1, z0, z1) =
+            *self.top_profile.iter().find(|s| s.0 - 1e-9 <= mid && mid <= s.1 + 1e-9).or_else(|| {
+                if mid < self.top_profile.first()?.0 { self.top_profile.first() } else { self.top_profile.last() }
+            })?;
+        let t = if (u1 - u0).abs() > 1e-12 { (u - u0) / (u1 - u0) } else { 0.0 };
+        Some(z0 + (z1 - z0) * t)
+    }
+
+    /// Follow a top profile: the columns split where its segments meet, so
+    /// each one's top is a single plane.
+    pub(crate) fn set_top_profile(&mut self, profile: Vec<(f64, f64, f64, f64)>) {
+        let cuts: Vec<f64> = profile.iter().skip(1).map(|s| s.0).collect();
+        let mut columns = Vec::with_capacity(self.columns.len() + cuts.len());
+        for c in std::mem::take(&mut self.columns) {
+            let mut c = c;
+            for &u in &cuts {
+                let (lo, hi) = (c.left.0.max(c.right.0), c.left.1.min(c.right.1));
+                if u > lo + 1e-6 && u < hi - 1e-6 {
+                    columns.push(Column { left: (c.left.0, u), right: (c.right.0, u), solid: c.solid.clone() });
+                    c = Column { left: (u, c.left.1), right: (u, c.right.1), solid: c.solid };
+                }
+            }
+            columns.push(c);
+        }
+        self.columns = columns;
+        self.top_profile = profile;
+    }
+
+    /// The solid intervals of column `c` at `u`, its top following the profile.
+    fn intervals_at(&self, c: &Column, u: f64) -> Vec<(f64, f64)> {
+        let mut out = c.solid.clone();
+        let mid = (c.left.0.max(c.right.0) + c.left.1.min(c.right.1)) * 0.5;
+        if let (Some(last), Some(z)) = (out.last_mut(), self.profile_top(mid, u)) {
+            last.1 = z.max(last.0 + 0.01);
+        }
+        out
     }
 
     /// World plan position of wall-local `(u, v)`.
@@ -487,6 +699,85 @@ impl WallGeom {
         parts
     }
 
+    /// [`Self::face_segments`] of the wall cut at height `z`: also open where
+    /// a recess in that face is cut.
+    pub fn face_segments_at(&self, side: f64, u0: f64, u1: f64, z: f64) -> Vec<(f64, f64)> {
+        let mut parts = self.face_segments(side, u0, u1);
+        for r in self.recesses_at(z).filter(|r| r.side == side) {
+            parts = subtract(&parts, (r.u0, r.u1));
+        }
+        parts.retain(|(a, b)| b - a > 1e-6);
+        parts
+    }
+
+    /// The parts from `u0` to `u1` of the layer boundary at offset `v` that
+    /// no joining core passes through.
+    pub fn boundary_segments(&self, v: f64, u0: f64, u1: f64) -> Vec<(f64, f64)> {
+        let mut parts = vec![(u0.min(u1), u0.max(u1))];
+        for gap in &self.layer_gaps {
+            // Cores of different materials keep the line between them.
+            if (v - gap.v_core).abs() < 1e-9 && !gap.merge {
+                continue;
+            }
+            if let Some(cut) = gap.at(v) {
+                parts = subtract(&parts, cut);
+            }
+        }
+        parts.retain(|(a, b)| b - a > 1e-6);
+        parts
+    }
+
+    /// The ends along the wall of the layer offset `v` in column `i` (of
+    /// `count`): the column's edges interpolated across the wall, with the
+    /// core reaching on through a T-joined wall's outer layers at the ends.
+    pub fn layer_span(&self, c: &Column, i: usize, count: usize, v: f64) -> (f64, f64) {
+        let h = self.half;
+        let s = if h > 1e-12 { (v + h) / (2.0 * h) } else { 0.5 };
+        let mut span = (c.right.0 + (c.left.0 - c.right.0) * s, c.right.1 + (c.left.1 - c.right.1) * s);
+        if let Some((cl, cr)) = self.core
+            && v <= cl + 1e-9
+            && v >= cr - 1e-9
+            && cl - cr > 1e-9
+        {
+            let t = (v - cr) / (cl - cr);
+            let across = |(ul, ur): (f64, f64)| ur + (ul - ur) * t;
+            if let (0, Some(ends)) = (i, self.core_ends[0]) {
+                span.0 = across(ends);
+            }
+            if let (true, Some(ends)) = (i + 1 == count, self.core_ends[1]) {
+                span.1 = across(ends);
+            }
+        }
+        span
+    }
+
+    /// A layer strip from `v0` to `v1`, spanning `a` along the wall at `v0`
+    /// and `b` at `v1`, split where joining cores pass through it: the
+    /// pieces as `(a, b)` pairs.
+    pub fn layer_pieces(&self, v0: f64, v1: f64, a: (f64, f64), b: (f64, f64)) -> Vec<((f64, f64), (f64, f64))> {
+        let mut pieces = vec![(a, b)];
+        for gap in &self.layer_gaps {
+            let (Some(x), Some(y)) = (gap.at(v0), gap.at(v1)) else { continue };
+            let mut next = Vec::with_capacity(pieces.len() + 1);
+            for (pa, pb) in pieces {
+                if (x.1 <= pa.0 && y.1 <= pb.0) || (x.0 >= pa.1 && y.0 >= pb.1) {
+                    next.push((pa, pb));
+                    continue;
+                }
+                let before = ((pa.0, pa.1.min(x.0)), (pb.0, pb.1.min(y.0)));
+                let after = ((pa.0.max(x.1), pa.1), (pb.0.max(y.1), pb.1));
+                for piece in [before, after] {
+                    let (w0, w1) = (piece.0.1 - piece.0.0, piece.1.1 - piece.1.0);
+                    if w0 > -1e-9 && w1 > -1e-9 && w0.max(w1) > 1e-6 {
+                        next.push(piece);
+                    }
+                }
+            }
+            pieces = next;
+        }
+        pieces
+    }
+
     /// Plan outline, counter-clockwise, of the part of the wall whose left
     /// face spans `left` and right face spans `right`.
     pub fn outline(&self, left: (f64, f64), right: (f64, f64)) -> Vec<DVec2> {
@@ -498,21 +789,10 @@ impl WallGeom {
 
     /// Exact plan area of [`Self::outline`] (arcs included).
     pub fn outline_area(&self, left: (f64, f64), right: (f64, f64)) -> f64 {
-        let Some(a) = &self.arc else { return crate::polygon::area(&self.outline(left, right)) };
-        let h = self.half;
-        // Green's theorem: an arc of radius r from p0 to p1 turning by dφ adds
-        // (r² dφ + c × (p1 - p0)) / 2; a segment p → q adds (p × q) / 2.
-        let arc_part = |u0: f64, u1: f64, v: f64| {
-            let r = a.radius_at(v);
-            let (p0, p1) = (a.at(u0, v), a.at(u1, v));
-            (r * r * (a.angle_at(u1) - a.angle_at(u0)) + a.center.perp_dot(p1 - p0)) * 0.5
-        };
-        let seg = |p: DVec2, q: DVec2| p.perp_dot(q) * 0.5;
-        let sum = arc_part(right.0, right.1, -h)
-            + seg(a.at(right.1, -h), a.at(left.1, h))
-            + arc_part(left.1, left.0, h)
-            + seg(a.at(left.0, h), a.at(right.0, -h));
-        sum.abs()
+        match &self.arc {
+            Some(a) => arc_band_area(a, self.half, left, right),
+            None => crate::polygon::area(&self.outline(left, right)),
+        }
     }
 
     /// Plan footprint of a column, counter-clockwise.
@@ -562,17 +842,116 @@ impl WallGeom {
         self.openings = openings;
     }
 
-    /// Net volume: each column's plan area times its solid height. Computed
-    /// analytically because the body solid omits end caps at joins (and
-    /// meshes arcs with chords).
+    /// Recess the faces (niches): each is kept inside the wall's faces and
+    /// height and no deeper than leaves [`RECESS_MIN_BACK`] behind it; one
+    /// that overlaps an opening or an earlier recess is left out. Call after
+    /// [`Self::set_openings`].
+    pub(crate) fn set_recesses(&mut self, recesses: Vec<Recess>) {
+        let (lo, hi) = self.inner_range();
+        let eps = 1e-4;
+        let mut kept: Vec<Recess> = Vec::new();
+        for mut r in recesses {
+            if !(r.u0.is_finite() && r.u1.is_finite() && r.z0.is_finite() && r.z1.is_finite() && r.depth.is_finite()) {
+                continue;
+            }
+            r.u0 = r.u0.max(lo + eps);
+            r.u1 = r.u1.min(hi - eps);
+            r.z0 = r.z0.max(self.base_z);
+            r.z1 = r.z1.min(self.top_z);
+            r.depth = r.depth.min(2.0 * self.half - RECESS_MIN_BACK);
+            r.side = if r.side < 0.0 { -1.0 } else { 1.0 };
+            if r.u1 - r.u0 <= eps || r.z1 - r.z0 <= eps || r.depth <= eps {
+                continue;
+            }
+            let (u, z) = ((r.u0, r.u1), (r.z0, r.z1));
+            let taken = self.openings.iter().any(|o| o.u0 < u.1 && u.0 < o.u1 && o.z0 < z.1 && z.0 < o.z1)
+                || kept.iter().any(|k| k.overlaps(u, z));
+            if !taken {
+                kept.push(r);
+            }
+        }
+        self.recesses = kept;
+    }
+
+    /// Exact plan area of a recess (between its face and its back).
+    pub fn recess_area(&self, r: &Recess) -> f64 {
+        let (face, back) = r.across(self.half);
+        match &self.arc {
+            Some(a) if a.radius > 1e-9 => {
+                let turn = (r.u1 - r.u0) / a.radius;
+                ((a.radius_at(face).powi(2) - a.radius_at(back).powi(2)) * 0.5 * turn).abs()
+            }
+            _ => (r.u1 - r.u0) * r.depth,
+        }
+    }
+
+    /// The volume a recess takes out of the wall.
+    pub fn recess_volume(&self, r: &Recess) -> f64 {
+        self.recess_area(r) * (r.z1 - r.z0)
+    }
+
+    /// The recess of `element`, if it made one.
+    pub fn recess_of(&self, element: ElementId) -> Option<&Recess> {
+        self.recesses.iter().find(|r| r.element == element)
+    }
+
+    /// The recesses cut by a horizontal plane at `z`.
+    pub fn recesses_at(&self, z: f64) -> impl Iterator<Item = &Recess> {
+        self.recesses.iter().filter(move |r| r.z0 <= z && z <= r.z1)
+    }
+
+    /// Net volume: each column's plan area times its solid height, less the
+    /// recesses. Computed analytically because the body solid omits end caps
+    /// at joins (and meshes arcs with chords).
     pub fn volume(&self) -> f64 {
-        self.columns
+        let body: f64 = self
+            .columns
             .iter()
             .map(|c| {
-                let height: f64 = c.solid.iter().map(|(z0, z1)| z1 - z0).sum();
+                let mid = (c.left.0.max(c.right.0) + c.left.1.min(c.right.1)) * 0.5;
+                let height: f64 = self.intervals_at(c, mid).iter().map(|(z0, z1)| z1 - z0).sum();
                 self.outline_area(c.left, c.right) * height
             })
-            .sum()
+            .sum();
+        let recessed: f64 = self.recesses.iter().map(|r| self.recess_volume(r)).sum();
+        (body - recessed).max(0.0)
+    }
+
+    /// The pieces `(u0, u1, z0, top at u0, top at u1)` of the face on `side`
+    /// from `ua` to `ub`, from `z0` up to a top running from `za` to `zb`,
+    /// that no recess opens.
+    fn face_pieces(&self, side: f64, (ua, ub): (f64, f64), z0: f64, (za, zb): (f64, f64)) -> Vec<[f64; 5]> {
+        let (lo, hi) = (ua.min(ub), ua.max(ub));
+        let top = |u: f64| if (ub - ua).abs() > 1e-12 { za + (zb - za) * (u - ua) / (ub - ua) } else { za };
+        let zmax = za.max(zb);
+        let holes: Vec<&Recess> =
+            self.recesses.iter().filter(|r| r.side == side && r.overlaps((lo, hi), (z0, zmax))).collect();
+        if holes.is_empty() {
+            return vec![[lo, hi, z0, top(lo), top(hi)]];
+        }
+        let mut cuts = vec![lo, hi];
+        cuts.extend(holes.iter().flat_map(|r| [r.u0, r.u1]).filter(|u| *u > lo + 1e-9 && *u < hi - 1e-9));
+        cuts.sort_by(f64::total_cmp);
+        cuts.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        let mut out = Vec::new();
+        for w in cuts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let mid = (a + b) * 0.5;
+            let mut over: Vec<(f64, f64)> =
+                holes.iter().filter(|r| r.u0 <= mid && mid <= r.u1).map(|r| (r.z0, r.z1)).collect();
+            over.sort_by(|x, y| x.0.total_cmp(&y.0));
+            let mut from = z0;
+            for (h0, h1) in over {
+                if h0 > from + 1e-9 {
+                    out.push([a, b, from, h0, h0]);
+                }
+                from = from.max(h1);
+            }
+            if top(a) > from + 1e-9 || top(b) > from + 1e-9 {
+                out.push([a, b, from, top(a).max(from), top(b).max(from)]);
+            }
+        }
+        out
     }
 
     pub fn column_at(&self, u: f64) -> Option<&Column> {
@@ -610,45 +989,87 @@ impl WallGeom {
             f.smooth = curved;
             f
         };
+        // A quad whose top runs from `za` (at u0) to `zb` (at u1).
+        let slanted = |u0: f64, v0: f64, u1: f64, v1: f64, z0: f64, za: f64, zb: f64, n: DVec3| {
+            let verts = vec![
+                self.world3(u0, v0, z0),
+                self.world3(u1, v1, z0),
+                self.world3(u1, v1, zb),
+                self.world3(u0, v0, za),
+            ];
+            Face::new(verts, n)
+        };
         for (ci, c) in self.columns.iter().enumerate() {
             let n = self.segments(c);
             let at = |range: (f64, f64), i: usize| range.0 + (range.1 - range.0) * i as f64 / n as f64;
-            for &(z0, z1) in &c.solid {
+            let last = c.solid.len().saturating_sub(1);
+            for (k, &(z0, z1)) in c.solid.iter().enumerate() {
+                // The top interval follows the profile; others are level.
+                let top = |u: f64| if k == last { self.intervals_at(c, u).last().map_or(z1, |iv| iv.1) } else { z1 };
                 for i in 0..n {
                     let (l0, l1) = (at(c.left, i), at(c.left, i + 1));
                     let (r0, r1) = (at(c.right, i), at(c.right, i + 1));
                     let poly = [self.world(r0, -h), self.world(r1, -h), self.world(l1, h), self.world(l0, h)];
-                    s.faces.push(Face::new(poly.iter().map(|p| DVec3::new(p.x, p.y, z1)).collect(), DVec3::Z));
+                    let tops = [top(r0), top(r1), top(l1), top(l0)];
+                    let upper: Vec<DVec3> = poly.iter().zip(tops).map(|(p, z)| DVec3::new(p.x, p.y, z)).collect();
+                    let up = (upper[1] - upper[0]).cross(upper[2] - upper[0]).try_normalize().unwrap_or(DVec3::Z);
+                    s.faces.push(Face::new(upper, up));
                     s.faces.push(Face::new(poly.iter().rev().map(|p| DVec3::new(p.x, p.y, z0)).collect(), -DVec3::Z));
                     let right_n = -flat(self.normal_at((r0 + r1) * 0.5));
                     let left_n = flat(self.normal_at((l0 + l1) * 0.5));
-                    s.faces.push(side(quad(r0, -h, r1, -h, z0, z1, right_n)));
-                    s.faces.push(side(quad(l1, h, l0, h, z0, z1, left_n)));
+                    // The faces, open where a recess is.
+                    for [a, b, from, ta, tb] in self.face_pieces(-1.0, (r0, r1), z0, (tops[0], tops[1])) {
+                        s.faces.push(side(slanted(a, -h, b, -h, from, ta, tb, right_n)));
+                    }
+                    for [a, b, from, ta, tb] in self.face_pieces(1.0, (l0, l1), z0, (tops[3], tops[2])) {
+                        s.faces.push(side(slanted(b, h, a, h, from, tb, ta, left_n)));
+                    }
                 }
             }
             // Faces on the boundary with the next column where only one side is solid.
             if let Some(next) = self.columns.get(ci + 1) {
                 let u = c.left.1;
                 let along = flat(self.tangent(u));
-                for &iv in &c.solid {
-                    let exposed = next
-                        .solid
+                let (mine, theirs) = (self.intervals_at(c, u), self.intervals_at(next, u));
+                for &iv in &mine {
+                    let exposed = theirs
                         .iter()
                         .fold(vec![iv], |acc, &cut| acc.iter().flat_map(|&i| subtract(&[i], cut)).collect());
                     for (z0, z1) in exposed {
                         s.faces.push(quad(u, -h, u, h, z0, z1, along));
                     }
                 }
-                for &iv in &next.solid {
-                    let exposed = c
-                        .solid
-                        .iter()
-                        .fold(vec![iv], |acc, &cut| acc.iter().flat_map(|&i| subtract(&[i], cut)).collect());
+                for &iv in &theirs {
+                    let exposed =
+                        mine.iter().fold(vec![iv], |acc, &cut| acc.iter().flat_map(|&i| subtract(&[i], cut)).collect());
                     for (z0, z1) in exposed {
                         s.faces.push(quad(u, h, u, -h, z0, z1, -along));
                     }
                 }
             }
+        }
+        // Inside each recess: its back, its two sides, its bottom and its top.
+        for r in &self.recesses {
+            let (face, back) = r.across(h);
+            let (lo, hi) = (face.min(back), face.max(back));
+            let n = match &self.arc {
+                Some(a) => segments((r.u1 - r.u0) / a.radius.max(1e-9), ARC_STEP),
+                None => 1,
+            };
+            for i in 0..n {
+                let at = |i: usize| r.u0 + (r.u1 - r.u0) * i as f64 / n as f64;
+                let (a, b) = (at(i), at(i + 1));
+                let out = flat(self.normal_at((a + b) * 0.5)) * r.side;
+                // Seen from the open side the back runs the way that face of the wall does.
+                let (from, to) = if r.side > 0.0 { (b, a) } else { (a, b) };
+                s.faces.push(side(quad(from, back, to, back, r.z0, r.z1, out)));
+            }
+            s.faces.push(quad(r.u0, lo, r.u0, hi, r.z0, r.z1, flat(self.tangent(r.u0))));
+            s.faces.push(quad(r.u1, hi, r.u1, lo, r.z0, r.z1, -flat(self.tangent(r.u1))));
+            let mut floor = self.path(r.u0, r.u1, lo);
+            floor.extend(self.path(r.u1, r.u0, hi));
+            s.faces.push(Face::new(floor.iter().map(|p| DVec3::new(p.x, p.y, r.z0)).collect(), DVec3::Z));
+            s.faces.push(Face::new(floor.iter().rev().map(|p| DVec3::new(p.x, p.y, r.z1)).collect(), -DVec3::Z));
         }
         // End caps, omitted where another wall closes the joint.
         let cap = |s: &mut Solid, col: &Column, (ul, ur): (f64, f64), outward: f64| {
@@ -658,8 +1079,9 @@ impl WallGeom {
                 n = -n;
             }
             let n3 = DVec3::new(n.x, n.y, 0.0);
-            for &(z0, z1) in &col.solid {
-                s.faces.push(quad(ur, -h, ul, h, z0, z1, n3));
+            let (at_r, at_l) = (self.intervals_at(col, ur), self.intervals_at(col, ul));
+            for (&(z0, zr), &(_, zl)) in at_r.iter().zip(&at_l) {
+                s.faces.push(slanted(ur, -h, ul, h, z0, zr, zl, n3));
             }
         };
         if !self.start_joined
@@ -687,6 +1109,7 @@ mod tests {
             join_start: true,
             join_end: true,
             bulge: 0.0,
+            drawn: [DVec2::new(a.0, a.1), DVec2::new(b.0, b.1)],
         }
     }
 
@@ -724,6 +1147,74 @@ mod tests {
         assert!((b.start_ext.0 - 0.1).abs() < 1e-9 && (b.start_ext.1 - 0.1).abs() < 1e-9);
         let a = geom(&walls, 0);
         assert!(!a.start_joined && !a.end_joined);
+    }
+
+    /// A niche: the wall keeps its columns, loses the recess's volume and
+    /// gets an open face with the recess's five faces behind it.
+    #[test]
+    fn a_recess_opens_one_face_and_takes_its_volume() {
+        let walls = [line((0.0, 0.0), (4.0, 0.0))];
+        let mut g = geom(&walls, 0);
+        g.set_openings(Vec::new());
+        let whole = g.volume();
+        let plain = g.to_solid([200; 3]).faces.len();
+        let niche = |u0: f64, side: f64, depth: f64| Recess {
+            element: ElementId(9),
+            u0,
+            u1: u0 + 1.0,
+            z0: 0.5,
+            z1: 1.5,
+            side,
+            depth,
+        };
+        g.set_recesses(vec![
+            niche(1.0, 1.0, 0.1),
+            // Overlapping the first: left out. Deeper than the wall: stops short of its other face.
+            niche(1.5, -1.0, 0.1),
+            niche(2.5, -1.0, 9.0),
+        ]);
+        assert_eq!(g.recesses.len(), 2);
+        assert_eq!(g.columns.len(), 1, "the wall is not split");
+        let deep = 2.0 * g.half - RECESS_MIN_BACK;
+        assert!((g.recesses[1].depth - deep).abs() < 1e-12);
+        assert!((whole - g.volume() - (0.1 + deep)).abs() < 1e-9, "1 m x 1 m recesses");
+        let solid = g.to_solid([200; 3]);
+        // Each recess: its face in four pieces instead of one, and five faces inside.
+        assert_eq!(solid.faces.len(), plain + 2 * (3 + 5));
+        // The back of the first one stands 10 cm inside the left face, facing left.
+        let back = solid
+            .faces
+            .iter()
+            .find(|f| f.normal.y > 0.9 && f.verts.iter().all(|v| (v.y - (g.half - 0.1)).abs() < 1e-9))
+            .expect("the back of the recess");
+        let (min, max) = back.verts.iter().fold((DVec3::MAX, DVec3::MIN), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+        assert!((min.x - 1.0).abs() < 1e-9 && (max.x - 2.0).abs() < 1e-9 && (min.z - 0.5).abs() < 1e-9);
+        // The mesh is closed and wound outward: its volume is the wall's less the recesses.
+        assert!((solid.volume() - g.volume()).abs() < 1e-9, "{} vs {}", solid.volume(), g.volume());
+    }
+
+    /// In an arc wall the recess follows the arc: its exact volume, and a
+    /// closed mesh whose chords come within a part in a thousand of it.
+    #[test]
+    fn a_recess_follows_an_arc_wall() {
+        let walls = [arc((0.0, 0.0), (6.0, 0.0), quarter())];
+        let mut g = geom(&walls, 0);
+        g.set_openings(Vec::new());
+        let whole = g.volume();
+        for side in [1.0, -1.0] {
+            let r = Recess { element: ElementId(9), u0: 1.0, u1: 2.5, z0: 0.3, z1: 1.3, side, depth: 0.08 };
+            g.set_recesses(vec![r]);
+            let r = &g.recesses[0];
+            let a = g.arc.unwrap();
+            // A ring sector: the mean radius of the band, its width, its angle.
+            let (face, back) = r.across(g.half);
+            let mean = (a.radius_at(face) + a.radius_at(back)) * 0.5;
+            let expected = mean * 0.08 * (1.5 / a.radius);
+            assert!((g.recess_area(r) - expected).abs() < 1e-9, "{} vs {expected}", g.recess_area(r));
+            assert!((whole - g.volume() - expected).abs() < 1e-9);
+            let mesh = g.to_solid([0; 3]).volume();
+            assert!((mesh - g.volume()).abs() < g.volume() * 1e-3, "{mesh} vs {}", g.volume());
+        }
     }
 
     #[test]

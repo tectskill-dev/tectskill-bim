@@ -70,6 +70,23 @@ impl DimRef {
         anchor && self.z.is_none_or(|h| h.dz.is_finite())
     }
 
+    /// The reference to the mirror image of this point once `target` (the
+    /// referenced element, already mirrored) went through a mirror: a wall
+    /// is walked the other way, beams, grids, columns and components keep
+    /// their direction, and an opening's frame follows its wall.
+    pub(crate) fn mirrored(self, target: &ElementKind) -> DimRef {
+        let anchor = match (self.anchor, target) {
+            (RefAnchor::Line { from_end, along, across }, ElementKind::Wall(_)) => {
+                RefAnchor::Line { from_end: !from_end, along, across }
+            }
+            (RefAnchor::Line { from_end, along, across }, _) => RefAnchor::Line { from_end, along, across: -across },
+            (RefAnchor::Local { x, y }, _) => RefAnchor::Local { x, y: -y },
+            (RefAnchor::Hosted { along, across }, _) => RefAnchor::Hosted { along: -along, across },
+            (RefAnchor::Level, _) => RefAnchor::Level,
+        };
+        DimRef { anchor, ..self }
+    }
+
     /// Whether the target still exists in `project`.
     pub(crate) fn target_exists(&self, project: &Project) -> bool {
         match self.target {
@@ -138,7 +155,7 @@ impl Project {
             }
             ElementKind::Column(c) => local(c.position, c.rotation_deg, p),
             ElementKind::Component(c) => local(c.position, c.rotation_deg, p),
-            ElementKind::Door(h) | ElementKind::Window(h) => {
+            ElementKind::Door(h) | ElementKind::Window(h) | ElementKind::Niche(h) => {
                 let (center, u) = self.opening_frame(h)?;
                 RefAnchor::Hosted { along: (p - center).dot(u), across: (p - center).dot(u.perp()) }
             }
@@ -190,7 +207,10 @@ impl Project {
             }
             (RefAnchor::Local { x, y }, ElementKind::Column(c)) => from_local(c.position, c.rotation_deg, x, y),
             (RefAnchor::Local { x, y }, ElementKind::Component(c)) => from_local(c.position, c.rotation_deg, x, y),
-            (RefAnchor::Hosted { along, across }, ElementKind::Door(h) | ElementKind::Window(h)) => {
+            (
+                RefAnchor::Hosted { along, across },
+                ElementKind::Door(h) | ElementKind::Window(h) | ElementKind::Niche(h),
+            ) => {
                 let (center, u) = self.opening_frame(h)?;
                 center + u * along + u.perp() * across
             }
@@ -226,7 +246,9 @@ impl Project {
             }
             ElementKind::Column(c) => Some(c.position),
             ElementKind::Component(c) => Some(c.position),
-            ElementKind::Door(h) | ElementKind::Window(h) => self.opening_frame(h).map(|(center, _)| center),
+            ElementKind::Door(h) | ElementKind::Window(h) | ElementKind::Niche(h) => {
+                self.opening_frame(h).map(|(center, _)| center)
+            }
             _ => None,
         }
     }
@@ -255,7 +277,7 @@ impl Project {
             ElementKind::Column(c) => level + c.base_offset,
             ElementKind::Component(c) => level + c.base_offset,
             ElementKind::Beam(b) => self.beam_z(e, b).1,
-            ElementKind::Door(h) | ElementKind::Window(h) => {
+            ElementKind::Door(h) | ElementKind::Window(h) | ElementKind::Niche(h) => {
                 let host = self.element(h.host);
                 let wall_base = host.and_then(|x| x.as_wall().map(|w| self.wall_base_z(x, w))).unwrap_or(level);
                 wall_base + h.sill_height
@@ -388,6 +410,8 @@ mod tests {
                 uid: Default::default(),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             };
             e.add_element(el)
         });
@@ -483,6 +507,8 @@ mod tests {
                 uid: Default::default(),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             })
         });
         assert!((self::dim(&doc, id).value().to_degrees() - 90.0).abs() < 1e-9);
@@ -539,6 +565,8 @@ mod tests {
                 uid: Default::default(),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             })
         });
         let height = |doc: &Document| self::dim(doc, id).value();
@@ -563,5 +591,102 @@ mod tests {
             }
         });
         assert!((self::dim(&doc, id).a.y - (base - 0.25)).abs() < 1e-9);
+    }
+
+    /// One dimension per element that can carry a reference, from a point
+    /// off its axis to a free point. Returns (dimension, measured point).
+    fn dimensions_to_everything(doc: &mut Document) -> Vec<(crate::ElementId, DVec2)> {
+        let view = doc.project.views.values().find(|v| v.is_plan()).map(|v| v.id).unwrap();
+        let ty = doc.project.default_type(crate::Category::Dimension).unwrap();
+        let targets: Vec<(crate::ElementId, crate::LevelId)> =
+            doc.project.elements.values().map(|e| (e.id, e.level)).collect();
+        let mut out = Vec::new();
+        for (target, level) in targets {
+            let Some(base) = doc.project.element(target).and_then(|e| doc.project.base_point(e)) else { continue };
+            let p = base + DVec2::new(0.13, 0.07);
+            let r = doc.project.dim_ref_at(target, p).unwrap();
+            let dim = Dimension {
+                view,
+                a: p,
+                b: p + DVec2::new(3.0, 0.0),
+                offset: 1.0,
+                kind: DimensionKind::Aligned,
+                refs: [Some(r), None],
+            };
+            let id = doc.edit("dim", |e| {
+                let id = crate::ElementId(e.alloc_id());
+                e.add_element(crate::Element {
+                    id,
+                    level,
+                    type_id: ty,
+                    mark: String::new(),
+                    comments: String::new(),
+                    kind: ElementKind::Dimension(Box::new(dim)),
+                    uid: Default::default(),
+                    phase_created: Default::default(),
+                    phase_demolished: None,
+                    design_option: None,
+                    paints: Vec::new(),
+                })
+            });
+            out.push((id, p));
+        }
+        out
+    }
+
+    #[test]
+    fn dimensions_keep_their_points_through_a_mirror() {
+        let mut doc = sample();
+        let dims = dimensions_to_everything(&mut doc);
+        // Walls (lines walked the other way), beams and grids (lines that keep
+        // their direction), columns and components (local frames), doors and windows.
+        assert!(dims.len() >= 20, "{}", dims.len());
+        let t = PlanTransform::mirror_across(DVec2::new(30.0, 0.0), DVec2::new(0.3, 1.0));
+        let check = |doc: &Document, id: crate::ElementId, p: DVec2| {
+            let d = dim(doc, id);
+            assert!(d.refs[0].is_some(), "{d:?}");
+            assert!((d.a - t.apply(p)).length() < 1e-9, "{:?}: {} (expected {})", d.refs[0], d.a, t.apply(p));
+        };
+        // Copies: each target (or a door's or window's wall) mirrored with its dimension.
+        for (id, p) in &dims {
+            let target = dim(&doc, *id).refs[0].and_then(|r| r.element()).unwrap();
+            let host = doc.project.element(target).and_then(|e| e.as_hosted()).map(|h| h.host);
+            let created = doc.edit("mirror copy", |e| e.copy_elements(&[host.unwrap_or(target), *id], &[t]));
+            let copy = created
+                .iter()
+                .copied()
+                .find(|c| matches!(doc.project.element(*c).map(|e| &e.kind), Some(ElementKind::Dimension(_))));
+            check(&doc, copy.unwrap(), *p);
+        }
+        // In place: the elements are mirrored, their dimensions follow.
+        let originals: Vec<crate::ElementId> =
+            dims.iter().filter_map(|(id, _)| dim(&doc, *id).refs[0].and_then(|r| r.element())).collect();
+        doc.edit("mirror", |e| e.transform_elements(&originals, &t));
+        for (id, p) in &dims {
+            check(&doc, *id, *p);
+        }
+    }
+
+    #[test]
+    fn every_copy_of_an_array_keeps_its_dimensions() {
+        let mut doc = sample();
+        let (wall, id) = dimension_to_wall(&mut doc);
+        let a = dim(&doc, id).a;
+        let steps: Vec<PlanTransform> =
+            (1..=3).map(|i| PlanTransform::translate(DVec2::new(0.0, 20.0 * i as f64))).collect();
+        let created = doc.edit("array", |e| e.copy_elements(&[wall, id], &steps));
+        let dims: Vec<Dimension> = created
+            .iter()
+            .filter_map(|c| match &doc.project.element(*c)?.kind {
+                ElementKind::Dimension(d) => Some((**d).clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dims.len(), 3);
+        for (d, t) in dims.iter().zip(&steps) {
+            let target = d.refs[0].and_then(|r| r.element());
+            assert!(target.is_some_and(|w| created.contains(&w)), "{d:?}");
+            assert!((d.a - t.apply(a)).length() < 1e-9);
+        }
     }
 }

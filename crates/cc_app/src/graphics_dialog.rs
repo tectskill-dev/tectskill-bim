@@ -60,6 +60,12 @@ impl Edits {
         Self { start: state.session.doc.undo_depth(), owns }
     }
 
+    /// Whether these edits own the shared session (no other data dialog
+    /// was open when they began).
+    pub(crate) fn owns(&self) -> bool {
+        self.owns
+    }
+
     pub(crate) fn finish(self, state: &mut AppState, ok: bool) {
         state.session.doc.break_merge();
         match (ok, self.owns) {
@@ -259,7 +265,7 @@ fn line_cell(ui: &mut Ui, label: &str, lines: &mut LineGraphics, enabled: bool) 
             changed = true;
         }
         if let Some(w) = &mut lines.weight {
-            changed |= ui.add(egui::DragValue::new(w).range(0.05..=5.0).speed(0.01).suffix(" mm")).changed();
+            changed |= ui.add(crate::properties::weight_drag(w).range(0.05..=5.0).speed(0.01)).changed();
         }
         ui.separator();
         ui.label(RichText::new(t!("vg-pattern")).color(PALETTE.text_muted));
@@ -281,7 +287,7 @@ fn line_cell(ui: &mut Ui, label: &str, lines: &mut LineGraphics, enabled: bool) 
     changed
 }
 
-fn fill_cell(ui: &mut Ui, label: &str, fill: &mut FillGraphics, enabled: bool) -> bool {
+fn fill_cell(ui: &mut Ui, label: &str, fill: &mut FillGraphics, enabled: bool, choices: &[(Pattern, String)]) -> bool {
     let shown = *fill;
     let r = cell(ui, label, enabled, |p, rect| {
         if shown.is_empty() {
@@ -307,7 +313,10 @@ fn fill_cell(ui: &mut Ui, label: &str, fill: &mut FillGraphics, enabled: bool) -
                 }
             }
         }
-        let text = shown.pattern.map(|pt| tr(pt.key())).unwrap_or_default();
+        let text = shown
+            .pattern
+            .map(|pt| choices.iter().find(|(p, _)| *p == pt).map_or_else(|| tr(pt.key()), |(_, n)| n.clone()))
+            .unwrap_or_default();
         p.text(
             egui::pos2(swatch.right() + 4.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
@@ -324,11 +333,11 @@ fn fill_cell(ui: &mut Ui, label: &str, fill: &mut FillGraphics, enabled: bool) -
         let mut pattern = fill.pattern;
         egui::Grid::new("fill-patterns").num_columns(2).show(ui, |ui| {
             ui.selectable_value(&mut pattern, None, t!("vg-by-default"));
-            for (i, pt) in Pattern::ALL.iter().enumerate() {
+            for (i, (pt, name)) in choices.iter().enumerate() {
                 if i % 2 == 0 {
                     ui.end_row();
                 }
-                ui.selectable_value(&mut pattern, Some(*pt), tr(pt.key()));
+                ui.selectable_value(&mut pattern, Some(*pt), name.as_str());
             }
         });
         if pattern != fill.pattern {
@@ -378,7 +387,7 @@ fn transparency_cell(ui: &mut Ui, label: &str, value: &mut Option<f64>, enabled:
 
 fn halftone_cell(ui: &mut Ui, label: &str, value: &mut Option<bool>, enabled: bool) -> bool {
     let mut on = *value == Some(true);
-    let r = ui.add_enabled(enabled, egui::Checkbox::without_text(&mut on)).on_hover_text(label);
+    let r = ui.add_enabled(enabled, crate::table::boxed(egui::Checkbox::without_text(&mut on))).on_hover_text(label);
     if r.changed() {
         *value = on.then_some(true);
         return true;
@@ -387,12 +396,17 @@ fn halftone_cell(ui: &mut Ui, label: &str, value: &mut Option<bool>, enabled: bo
 }
 
 /// The override cells of one row, in the column order of [`override_headers`].
-pub(crate) fn override_cells(ui: &mut Ui, ov: &mut GraphicOverride, enabled: bool) -> bool {
+pub(crate) fn override_cells(
+    ui: &mut Ui,
+    ov: &mut GraphicOverride,
+    enabled: bool,
+    choices: &[(Pattern, String)],
+) -> bool {
     let mut changed = false;
     changed |= line_cell(ui, &t!("vg-projection-lines"), &mut ov.projection_lines, enabled);
-    changed |= fill_cell(ui, &t!("vg-surface-fill"), &mut ov.surface_fill, enabled);
+    changed |= fill_cell(ui, &t!("vg-surface-fill"), &mut ov.surface_fill, enabled, choices);
     changed |= line_cell(ui, &t!("vg-cut-lines"), &mut ov.cut_lines, enabled);
-    changed |= fill_cell(ui, &t!("vg-cut-fill"), &mut ov.cut_fill, enabled);
+    changed |= fill_cell(ui, &t!("vg-cut-fill"), &mut ov.cut_fill, enabled, choices);
     changed |= halftone_cell(ui, &t!("vg-halftone"), &mut ov.halftone, enabled);
     changed |= transparency_cell(ui, &t!("vg-transparency"), &mut ov.transparency, enabled);
     changed
@@ -470,7 +484,7 @@ fn graphics_dialog(ctx: &Context, state: &mut AppState) {
     let mut new_tab = tab;
     let (mut ok, mut filters_button) = (0, usize::MAX);
     let title = graphics_title(state, target);
-    let response = Dialog::new("visibility-graphics", title).width(900.0).show(
+    let response = Dialog::new("visibility-graphics", title).width(940.0).show(
         ctx,
         |ui| {
             ui.horizontal(|ui| {
@@ -488,7 +502,9 @@ fn graphics_dialog(ctx: &Context, state: &mut AppState) {
                 ui.label(RichText::new(t!("msg-controlled-by-template", "template" => name)).color(PALETTE.warning));
             }
             let enabled = controlling_template(state, target, filters).is_none();
-            egui::ScrollArea::vertical().max_height(440.0).show(ui, |ui| match new_tab {
+            // Both ways: the columns are as wide as their texts, which in some
+            // languages is more than the dialog.
+            egui::ScrollArea::both().max_height(440.0).show(ui, |ui| match new_tab {
                 Tab::Model => categories_table(ui, state, target, &graphics, &Category::MODEL, enabled),
                 Tab::Annotation => {
                     let annotation: Vec<Category> =
@@ -543,6 +559,7 @@ fn categories_table(
     categories: &[Category],
     enabled: bool,
 ) {
+    let choices = crate::fill_patterns_dialog::choices(state.project());
     egui::Grid::new("vg-categories").num_columns(8).striped(true).spacing([8.0, 4.0]).show(ui, |ui| {
         header(ui, t!("vg-visible"));
         header(ui, t!("prop-category"));
@@ -559,7 +576,7 @@ fn categories_table(
             r.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, on, &label));
             let mut changed = r.changed();
             ui.label(name);
-            changed |= override_cells(ui, &mut g.overrides, enabled);
+            changed |= override_cells(ui, &mut g.overrides, enabled, &choices);
             if ui.add_enabled(enabled && !g.overrides.is_empty(), egui::Button::new(t!("vg-reset")).small()).clicked() {
                 g.overrides = GraphicOverride::default();
                 changed = true;
@@ -577,6 +594,7 @@ fn filters_table(ui: &mut Ui, state: &mut AppState, target: Target, graphics: &V
         ui.label(RichText::new(t!("vg-no-filters")).color(PALETTE.text_faint));
     }
     let count = graphics.filters.len();
+    let choices = crate::fill_patterns_dialog::choices(state.project());
     egui::Grid::new("vg-filters").num_columns(10).striped(true).spacing([8.0, 4.0]).show(ui, |ui| {
         if count > 0 {
             header(ui, t!("vg-enabled"));
@@ -592,7 +610,7 @@ fn filters_table(ui: &mut Ui, state: &mut AppState, target: Target, graphics: &V
             let mut changed = ui.add_enabled(enabled, egui::Checkbox::without_text(&mut u.enabled)).changed();
             ui.label(name);
             changed |= ui.add_enabled(enabled, egui::Checkbox::without_text(&mut u.visible)).changed();
-            changed |= override_cells(ui, &mut u.overrides, enabled);
+            changed |= override_cells(ui, &mut u.overrides, enabled, &choices);
             ui.horizontal(|ui| {
                 let filter = Ref::Id(u.filter.0);
                 let moved = |index| cmd::ViewFilterMove {
@@ -666,6 +684,7 @@ fn override_dialog(ctx: &Context, state: &mut AppState) {
     else {
         return;
     };
+    let choices = crate::fill_patterns_dialog::choices(state.project());
     let (mut ok, mut reset) = (0, 0);
     let mut changed = false;
     let response = Dialog::new("element-overrides", t!("dlg-element-overrides")).width(640.0).show(
@@ -676,7 +695,7 @@ fn override_dialog(ctx: &Context, state: &mut AppState) {
             egui::Grid::new("vg-element").num_columns(6).spacing([8.0, 4.0]).show(ui, |ui| {
                 override_headers(ui);
                 ui.end_row();
-                changed = override_cells(ui, &mut value, true);
+                changed = override_cells(ui, &mut value, true, &choices);
                 ui.end_row();
             });
         },
@@ -753,7 +772,7 @@ fn params() -> Vec<FilterParam> {
 
 fn param_label(p: FilterParam) -> String {
     match p {
-        FilterParam::Field(f) => tr(f.key()),
+        FilterParam::Field(f) => crate::properties::field_label(f),
         FilterParam::Elevation => t!("vg-param-elevation"),
     }
 }
@@ -859,7 +878,9 @@ fn filter_form(ui: &mut Ui, state: &mut AppState, mut f: cc_core::ViewFilter) {
     let mut name = f.name.clone();
     ui.horizontal(|ui| {
         ui.label(t!("prop-name"));
-        let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(260.0));
+        let r = crate::table::live_text(ui, ("filter-name", id), &mut name, |ui, t| {
+            ui.add(egui::TextEdit::singleline(t).desired_width(260.0))
+        });
         if r.lost_focus() && name.trim() != f.name && !name.trim().is_empty() {
             let command = cmd::FilterSet {
                 filter: Ref::Id(id.0),
@@ -875,7 +896,13 @@ fn filter_form(ui: &mut Ui, state: &mut AppState, mut f: cc_core::ViewFilter) {
     let mut changed = false;
     section(ui, "filter-categories", t!("vg-filter-categories"), |ui| {
         ui.label(RichText::new(t!("vg-filter-categories-hint")).size(11.0).color(PALETTE.text_faint));
-        egui::Grid::new("filter-cats").num_columns(4).show(ui, |ui| {
+        // Columns of one width that fill the form: a long name wraps in its
+        // cell instead of widening the dialog.
+        const COLUMNS: usize = 3;
+        let gap = ui.spacing().item_spacing.x;
+        let column = ((ui.available_width() - gap * (COLUMNS - 1) as f32) / COLUMNS as f32).max(60.0);
+        let grid = egui::Grid::new("filter-cats").num_columns(COLUMNS).min_col_width(column).max_col_width(column);
+        grid.show(ui, |ui| {
             for (i, c) in Category::ALL.iter().enumerate() {
                 let mut on = f.categories.contains(c);
                 if ui.checkbox(&mut on, crate::actions::t_category(*c)).changed() {
@@ -886,7 +913,7 @@ fn filter_form(ui: &mut Ui, state: &mut AppState, mut f: cc_core::ViewFilter) {
                     }
                     changed = true;
                 }
-                if i % 4 == 3 {
+                if i % COLUMNS == COLUMNS - 1 {
                     ui.end_row();
                 }
             }
@@ -920,7 +947,9 @@ fn filter_form(ui: &mut Ui, state: &mut AppState, mut f: cc_core::ViewFilter) {
                     },
                 );
                 if rule.op.needs_value() {
-                    let r = ui.add(egui::TextEdit::singleline(&mut rule.value).desired_width(120.0));
+                    let r = crate::table::live_text(ui, ("filter-rule", id, i), &mut rule.value, |ui, t| {
+                        ui.add(egui::TextEdit::singleline(t).desired_width(120.0))
+                    });
                     changed |= r.changed();
                 }
                 if ui.small_button("×").on_hover_text(t!("vg-remove-rule")).clicked() {
@@ -967,10 +996,10 @@ fn templates_dialog(ctx: &Context, state: &mut AppState) {
     let has_selection = selected.is_some();
     let (mut ok, mut new, mut delete) = (0, usize::MAX, usize::MAX);
     let mut edit_graphics = None;
-    let response = Dialog::new("view-templates", t!("dlg-view-templates")).width(800.0).show(
+    let response = Dialog::new("view-templates", t!("dlg-view-templates")).width(840.0).show(
         ctx,
         |ui| {
-            crate::dialog::two_columns(ui, [200.0, 520.0], |ui, column| {
+            crate::dialog::two_columns(ui, [200.0, 615.0], |ui, column| {
                 if column == 0 {
                     let list: Vec<(TemplateId, String)> =
                         state.project().templates.values().map(|t| (t.id, t.name.clone())).collect();
@@ -1040,8 +1069,6 @@ fn templates_dialog(ctx: &Context, state: &mut AppState) {
     }
 }
 
-const SCALES: [u32; 9] = [10, 20, 25, 50, 75, 100, 200, 250, 500];
-
 /// The template's properties, each with its "include" box. Returns whether
 /// Visibility/Graphics should open for it.
 fn template_form(ui: &mut Ui, state: &mut AppState, t: cc_core::ViewTemplate, active: Option<ViewId>) -> bool {
@@ -1050,7 +1077,9 @@ fn template_form(ui: &mut Ui, state: &mut AppState, t: cc_core::ViewTemplate, ac
     let mut name = t.name.clone();
     ui.horizontal(|ui| {
         ui.label(t!("prop-name"));
-        let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(260.0));
+        let r = crate::table::live_text(ui, ("template-name", id), &mut name, |ui, t| {
+            ui.add(egui::TextEdit::singleline(t).desired_width(260.0))
+        });
         if r.lost_focus() && name.trim() != t.name && !name.trim().is_empty() {
             run(
                 state,
@@ -1070,32 +1099,77 @@ fn template_form(ui: &mut Ui, state: &mut AppState, t: cc_core::ViewTemplate, ac
         header(ui, t!("vg-value"));
         ui.end_row();
 
-        changed |= ui.checkbox(&mut include.scale, "").changed();
+        changed |= crate::table::checkbox(ui, &mut include.scale).changed();
         ui.label(t!("prop-scale"));
         let mut scale = t.scale;
-        egui::ComboBox::from_id_salt(("tpl-scale", id)).selected_text(format!("1:{scale}")).show_ui(ui, |ui| {
-            for s in SCALES {
-                ui.selectable_value(&mut scale, s, format!("1:{s}"));
+        let system = state.project().measurement_system();
+        let label = |s: u32| cc_core::scale::label(system, s);
+        egui::ComboBox::from_id_salt(("tpl-scale", id)).selected_text(label(scale)).show_ui(ui, |ui| {
+            for &s in cc_core::scale::choices(system) {
+                ui.selectable_value(&mut scale, s, label(s));
             }
         });
         if scale != t.scale {
-            set.scale = Some(scale);
+            set.scale = Some(scale.into());
         }
         ui.end_row();
 
-        changed |= ui.checkbox(&mut include.categories, "").changed();
+        changed |= crate::table::checkbox(ui, &mut include.detail).changed();
+        ui.label(t!("prop-detail-level"));
+        let mut detail = t.detail;
+        egui::ComboBox::from_id_salt(("tpl-detail", id)).selected_text(tr(detail.key())).show_ui(ui, |ui| {
+            for level in cc_core::DetailLevel::ALL {
+                ui.selectable_value(&mut detail, level, tr(level.key()));
+            }
+        });
+        if detail != t.detail {
+            set.detail = Some(detail.name().to_string());
+        }
+        ui.end_row();
+
+        changed |= crate::table::checkbox(ui, &mut include.visual_style).changed();
+        ui.label(t!("prop-visual-style"));
+        let mut style = t.visual_style;
+        let name = |s: Option<cc_core::VisualStyle>| s.map_or_else(|| t!("style-default"), |s| tr(s.key()));
+        egui::ComboBox::from_id_salt(("tpl-style", id)).selected_text(name(style)).show_ui(ui, |ui| {
+            ui.selectable_value(&mut style, None, name(None));
+            for s in cc_core::VisualStyle::ALL {
+                ui.selectable_value(&mut style, Some(s), name(Some(s)));
+            }
+        });
+        if style != t.visual_style {
+            set.visual_style = Some(style.map_or("default", |s| s.name()).to_string());
+        }
+        ui.end_row();
+
+        changed |= crate::table::checkbox(ui, &mut include.underlay).changed();
+        ui.label(t!("section-underlay"));
+        let (old, mut u) = (t.underlay, t.underlay);
+        ui.vertical(|ui| {
+            if crate::properties::underlay_rows(ui, state, id.0, None, true, &mut u) {
+                set.underlay = Some(crate::properties::underlay_patch(&old, &u));
+            }
+        });
+        ui.end_row();
+
+        changed |= crate::table::checkbox(ui, &mut include.design_options).changed();
+        ui.label(t!("section-design-options"));
+        crate::design_options_ui::template_rows(ui, state, id);
+        ui.end_row();
+
+        changed |= crate::table::checkbox(ui, &mut include.categories).changed();
         ui.label(t!("vg-categories-graphics"));
         if ui.button(t!("vg-edit")).clicked() {
             open_vg = true;
         }
         ui.end_row();
 
-        changed |= ui.checkbox(&mut include.filters, "").changed();
+        changed |= crate::table::checkbox(ui, &mut include.filters).changed();
         ui.label(t!("vg-filters"));
         ui.label(RichText::new(t!("vg-filter-count", "count" => t.graphics.filters.len())).color(PALETTE.text_muted));
         ui.end_row();
 
-        changed |= ui.checkbox(&mut include.cut_height, "").changed();
+        changed |= crate::table::checkbox(ui, &mut include.cut_height).changed();
         ui.label(t!("prop-cut-height"));
         let mut h = t.cut_height;
         let r = ui.add(crate::properties::length_drag(&mut h).speed(0.01).range(0.0..=20.0));
@@ -1104,25 +1178,21 @@ fn template_form(ui: &mut Ui, state: &mut AppState, t: cc_core::ViewTemplate, ac
         }
         ui.end_row();
 
-        changed |= ui.checkbox(&mut include.discipline, "").changed();
+        changed |= crate::table::checkbox(ui, &mut include.discipline).changed();
         ui.label(t!("vg-discipline"));
         let label = |d: Option<cc_core::MepDiscipline>| d.map_or(t!("vg-discipline-none"), |d| tr(d.key()));
         let mut d = t.discipline;
         egui::ComboBox::from_id_salt(("tpl-discipline", id)).selected_text(label(d)).show_ui(ui, |ui| {
-            for o in [None, Some(cc_core::MepDiscipline::Plumbing), Some(cc_core::MepDiscipline::Electrical)] {
+            for o in std::iter::once(None).chain(cc_core::MepDiscipline::ALL.into_iter().map(Some)) {
                 ui.selectable_value(&mut d, o, label(o));
             }
         });
         if d != t.discipline {
-            set.discipline = Some(match d {
-                None => "none".into(),
-                Some(cc_core::MepDiscipline::Plumbing) => "plumbing".into(),
-                Some(cc_core::MepDiscipline::Electrical) => "electrical".into(),
-            });
+            set.discipline = Some(d.map_or("none", cc_core::MepDiscipline::name).into());
         }
         ui.end_row();
 
-        changed |= ui.checkbox(&mut include.structural, "").changed();
+        changed |= crate::table::checkbox(ui, &mut include.structural).changed();
         ui.label(t!("section-structural"));
         ui.horizontal(|ui| {
             let (mut s, mut tags) = (t.structural, t.structure_tags);
@@ -1135,7 +1205,7 @@ fn template_form(ui: &mut Ui, state: &mut AppState, t: cc_core::ViewTemplate, ac
         });
         ui.end_row();
 
-        changed |= ui.checkbox(&mut include.phase_filter, "").changed();
+        changed |= crate::table::checkbox(ui, &mut include.phase_filter).changed();
         ui.label(t!("prop-phase-filter"));
         let filters: Vec<(cc_core::PhaseFilterId, String)> =
             state.project().phase_filters.values().map(|f| (f.id, f.name.clone())).collect();
@@ -1158,11 +1228,14 @@ fn template_form(ui: &mut Ui, state: &mut AppState, t: cc_core::ViewTemplate, ac
         set.include = serde_json::to_value(include).ok();
     }
     let any = set.scale.is_some()
+        || set.detail.is_some()
+        || set.visual_style.is_some()
         || set.cut_height.is_some()
         || set.discipline.is_some()
         || set.structural.is_some()
         || set.structure_tags.is_some()
         || set.phase_filter.is_some()
+        || set.underlay.is_some()
         || set.include.is_some();
     if any {
         run(state, Some(key(("template", id))), set);
@@ -1200,12 +1273,26 @@ fn readonly_list(ui: &mut Ui, label: &str, items: &[String]) {
 /// The view's template and Visibility/Graphics in its properties.
 pub fn view_rows(ui: &mut Ui, state: &mut AppState, view: ViewId) {
     let Some(v) = state.project().view(view).cloned() else { return };
-    if !cc_core::ViewTemplate::applies_to(&v.kind) {
+    if !v.kind.has_graphics() {
         return;
     }
+    // Drafting views have graphics but no templates.
+    if cc_core::ViewTemplate::applies_to(&v.kind) {
+        template_row(ui, state, view, v.template);
+    }
+    if row(ui, &t!("dlg-visibility-graphics"), |ui| ui.button(t!("vg-edit")).clicked()) {
+        open(state, Target::View(view));
+    }
+    let hidden = v.graphics.hidden.len();
+    if hidden > 0 {
+        readonly_row(ui, &t!("vg-hidden-in-view"), hidden.to_string());
+    }
+}
+
+/// The view's template, chosen from the project's.
+fn template_row(ui: &mut Ui, state: &mut AppState, view: ViewId, current: Option<TemplateId>) {
     let templates: Vec<(TemplateId, String)> =
         state.project().templates.values().map(|t| (t.id, t.name.clone())).collect();
-    let current = v.template;
     let name = |id: Option<TemplateId>| {
         id.and_then(|i| templates.iter().find(|(t, _)| *t == i)).map_or(t!("vg-template-none"), |(_, n)| n.clone())
     };
@@ -1222,26 +1309,22 @@ pub fn view_rows(ui: &mut Ui, state: &mut AppState, view: ViewId) {
         let command = cmd::ViewTemplateAssign { views: vec![Ref::Id(view.0)], template: chosen.map(|t| Ref::Id(t.0)) };
         run(state, None, command);
     }
-    if row(ui, &t!("dlg-visibility-graphics"), |ui| ui.button(t!("vg-edit")).clicked()) {
-        open(state, Target::View(view));
-    }
-    let hidden = v.graphics.hidden.len();
-    if hidden > 0 {
-        readonly_row(ui, &t!("vg-hidden-in-view"), hidden.to_string());
-    }
 }
 
-/// Whether the view's template controls `what` (`scale`, `cut_height`,
-/// `discipline`, `structural`), for read-only rows.
+/// Whether the view's template controls `what` (`scale`, `detail`,
+/// `visual_style`, `cut_height`, `discipline`, `structural`), for read-only rows.
 pub fn controlled(state: &AppState, view: ViewId, what: &str) -> bool {
     let Some(t) = state.project().view(view).and_then(|v| v.template).and_then(|t| state.project().template(t)) else {
         return false;
     };
     match what {
         "scale" => t.include.scale,
+        "detail" => t.include.detail,
+        "visual_style" => t.include.visual_style,
         "cut_height" => t.include.cut_height,
         "discipline" => t.include.discipline,
         "structural" => t.include.structural,
+        "underlay" => t.include.underlay,
         _ => false,
     }
 }

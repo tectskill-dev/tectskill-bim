@@ -1,5 +1,5 @@
 //! Component library: browse the component files (`.ccomp`) of the folders
-//! the user adds (such as a copy of the ConstructCAD Components library),
+//! the user adds (such as a copy of the ConstructCraft Components library),
 //! search them, see a component's types, parameters, connectors and plan,
 //! load it into the project, and save the project's components into a
 //! library folder. Listing, loading and saving are engine commands.
@@ -41,6 +41,8 @@ pub struct Library {
     /// The project component to save into the library, and the folder.
     pub save_component: Option<String>,
     pub save_folder: Option<PathBuf>,
+    /// The folders the entries were read from (read again when the preference changes).
+    listed: Vec<PathBuf>,
 }
 
 /// Open the library window, reading the folders.
@@ -52,7 +54,8 @@ pub fn open(state: &mut AppState) {
 
 /// Read the folders again through the engine.
 fn refresh(state: &mut AppState, lib: &mut Library) {
-    let folders = state.library_folders.clone();
+    let folders = state.prefs.library_folders.clone();
+    lib.listed = folders.clone();
     let out = state.session.run(io::ComponentLibraryList { folders, search: None });
     let Ok(out) = out else {
         lib.entries.clear();
@@ -166,39 +169,27 @@ fn body(ui: &mut Ui, state: &mut AppState, lib: &mut Library) {
     save_section(ui, state, lib);
 }
 
-/// The library folders, each removable, and buttons to add one and to read them again.
+/// How many library folders are read, a button to manage them in the
+/// Preferences window (File locations) and one to read them again.
 fn folders(ui: &mut Ui, state: &mut AppState, lib: &mut Library) {
-    ui.label(theme::title(t!("lib-folders")));
-    let mut remove = None;
-    for (i, folder) in state.library_folders.iter().enumerate() {
-        ui.horizontal(|ui| {
-            ui.label(theme::muted(folder.display().to_string()).size(12.0));
-            if ui.small_button("×").on_hover_text(t!("action-remove")).clicked() {
-                remove = Some(i);
-            }
-        });
-    }
-    if state.library_folders.is_empty() {
-        ui.label(theme::muted(t!("lib-empty")).size(12.0));
-    }
-    let mut changed = false;
-    if let Some(i) = remove {
-        state.library_folders.remove(i);
-        changed = true;
-    }
+    // The folders changed in Preferences: read them again.
+    let changed = lib.listed != state.prefs.library_folders;
     ui.horizontal(|ui| {
-        if ui.button(t!("lib-add-folder")).clicked()
-            && let Some(folder) = rfd::FileDialog::new().pick_folder()
-            && !state.library_folders.contains(&folder)
-        {
-            state.library_folders.push(folder);
-            changed = true;
+        ui.label(theme::title(t!("lib-folders")));
+        let count = state.prefs.library_folders.len();
+        let text = if count == 0 { t!("lib-empty") } else { t!("lib-folder-count", "count" => count) };
+        ui.label(theme::muted(text).size(12.0));
+    });
+    let mut refresh_now = changed;
+    ui.horizontal(|ui| {
+        if ui.button(t!("lib-manage-folders")).clicked() {
+            crate::preferences::open(state, crate::preferences::Section::FileLocations);
         }
         if ui.button(t!("lib-refresh")).clicked() {
-            changed = true;
+            refresh_now = true;
         }
     });
-    if changed {
+    if refresh_now {
         refresh(state, lib);
     }
 }
@@ -296,26 +287,33 @@ fn save_section(ui: &mut Ui, state: &mut AppState, lib: &mut Library) {
         .collect();
     components.sort();
     components.dedup();
-    if components.is_empty() || state.library_folders.is_empty() {
+    if components.is_empty() || state.prefs.library_folders.is_empty() {
         return;
     }
     ui.separator();
-    ui.horizontal(|ui| {
+    // Wrapped: the labels and a long folder name must not widen the dialog.
+    ui.horizontal_wrapped(|ui| {
         ui.label(theme::muted(t!("lib-save")));
         let selected = lib.save_component.clone().unwrap_or_default();
-        egui::ComboBox::from_id_salt("lib-save-component").selected_text(selected).width(170.0).show_ui(ui, |ui| {
-            for c in &components {
-                ui.selectable_value(&mut lib.save_component, Some(c.clone()), c);
-            }
-        });
+        egui::ComboBox::from_id_salt("lib-save-component").selected_text(selected).width(170.0).truncate().show_ui(
+            ui,
+            |ui| {
+                for c in &components {
+                    ui.selectable_value(&mut lib.save_component, Some(c.clone()), c);
+                }
+            },
+        );
         ui.label(theme::muted(t!("lib-save-into")));
-        let folder = lib.save_folder.clone().or_else(|| state.library_folders.first().cloned());
+        let folder = lib.save_folder.clone().or_else(|| state.prefs.library_folders.first().cloned());
         let folder_name = folder.as_ref().map(|f| f.display().to_string()).unwrap_or_default();
-        egui::ComboBox::from_id_salt("lib-save-folder").selected_text(folder_name).width(180.0).show_ui(ui, |ui| {
-            for f in &state.library_folders {
-                ui.selectable_value(&mut lib.save_folder, Some(f.clone()), f.display().to_string());
-            }
-        });
+        egui::ComboBox::from_id_salt("lib-save-folder").selected_text(folder_name).width(180.0).truncate().show_ui(
+            ui,
+            |ui| {
+                for f in &state.prefs.library_folders {
+                    ui.selectable_value(&mut lib.save_folder, Some(f.clone()), f.display().to_string());
+                }
+            },
+        );
         let ready = lib.save_component.is_some() && folder.is_some();
         if ui.add_enabled(ready, egui::Button::new(t!("lib-save-button"))).clicked()
             && let (Some(component), Some(folder)) = (lib.save_component.clone(), folder)

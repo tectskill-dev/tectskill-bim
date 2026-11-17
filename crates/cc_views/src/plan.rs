@@ -1,5 +1,5 @@
 use crate::{Drawing2D, LineStyle};
-use cc_core::{ElementKind, LevelId, Project, TypeData, ViewKind};
+use cc_core::{DetailLevel, ElementKind, LevelId, Project, TypeData, ViewKind};
 use cc_geom::{Column, ModelGeometry, WallGeom, polygon};
 use glam::DVec2;
 use std::f64::consts::{PI, TAU};
@@ -41,7 +41,7 @@ pub fn plan(
     ceiling: bool,
     scale: u32,
 ) -> Drawing2D {
-    plan_of(project, geom, level, cut_height, ceiling, false, scale)
+    plan_of(project, geom, level, cut_height, (ceiling, false), scale, DetailLevel::Medium)
 }
 
 /// Whether a structural plan shows the element: slabs, the load-bearing
@@ -50,21 +50,29 @@ pub fn is_structural(e: &cc_core::Element) -> bool {
     match &e.kind {
         ElementKind::Wall(w) => w.structural,
         ElementKind::Column(c) => c.structural,
-        ElementKind::Floor(_) | ElementKind::Beam(_) | ElementKind::Foundation(_) | ElementKind::Grid(_) => true,
+        ElementKind::Floor(_)
+        | ElementKind::Beam(_)
+        | ElementKind::Foundation(_)
+        | ElementKind::Pile(_)
+        | ElementKind::Grid(_)
+        | ElementKind::SteelBuilding(_)
+        | ElementKind::Truss(_)
+        | ElementKind::Bracing(_)
+        | ElementKind::Connection(_) => true,
         _ => false,
     }
 }
 
-/// A plan as [`plan`] draws it; a `structural` plan shows only the
-/// structure, with the beams above the cut drawn as seen from below.
+/// A plan as [`plan`] draws it, at `detail`; a `structural` plan shows only
+/// the structure, with the beams above the cut drawn as seen from below.
 pub fn plan_of(
     project: &Project,
     geom: &ModelGeometry,
     level: LevelId,
     cut_height: f64,
-    ceiling: bool,
-    structural: bool,
+    (ceiling, structural): (bool, bool),
     scale: u32,
+    detail: DetailLevel,
 ) -> Drawing2D {
     let shown = |e: &cc_core::Element| !structural || is_structural(e);
     let spacing = crate::cut::spacing(scale);
@@ -78,13 +86,16 @@ pub fn plan_of(
         match &e.kind {
             ElementKind::Floor(f) if !ceiling => {
                 d.polyline(&f.boundary, true, LineStyle::Projection, id);
-                for o in &f.openings {
+                for o in f.all_openings() {
                     d.polyline(o, true, LineStyle::Projection, id);
                 }
             }
             ElementKind::Ceiling(c) if ceiling => {
                 d.polyline(&c.boundary, true, LineStyle::Projection, id);
                 ceiling_grid(&mut d, &c.boundary, e.id);
+                for cut in &c.cuts {
+                    d.polyline(cut, true, LineStyle::Projection, id);
+                }
             }
             ElementKind::Roof(r) => {
                 let outline = polygon::offset(&r.footprint, r.overhang);
@@ -99,6 +110,9 @@ pub fn plan_of(
                         d.polyline(hole, true, LineStyle::Hidden, id);
                     }
                 }
+                for cut in &r.cuts {
+                    d.polyline(cut, true, LineStyle::Projection, id);
+                }
                 for &(a, b) in geom.roof_ridges.get(&e.id).into_iter().flatten() {
                     d.line(a, b, LineStyle::Projection, id);
                 }
@@ -106,41 +120,54 @@ pub fn plan_of(
             _ => {}
         }
     }
+    if !ceiling && !structural {
+        crate::topography::draw(&mut d, project, geom, level, cut_z, scale);
+    }
     if !ceiling {
         draw_structure(&mut d, project, geom, level, cut_z, spacing, structural);
+        draw_connections(&mut d, project, geom, level, cut_z);
     }
     if !structural {
-        draw_components(&mut d, project, geom, level, cut_z, ceiling);
+        draw_components(&mut d, project, geom, level, cut_z, ceiling, detail);
+    }
+    if !structural && !ceiling {
+        draw_masses(&mut d, project, geom, level, cut_z);
+    }
+    draw_shafts(&mut d, project, level, cut_z);
+    if !ceiling {
+        draw_steel_buildings(&mut d, project, level, &shown);
+        draw_trusses(&mut d, project, level, &shown);
     }
 
     for (e, _) in project.walls().filter(|(e, _)| e.level == level && shown(e)) {
         if let Some(g) = geom.walls.get(&e.id) {
-            draw_wall(&mut d, project, g, cut_z, spacing);
+            draw_wall(&mut d, project, g, cut_z, spacing, detail);
+            draw_recesses(&mut d, g, cut_z, &|id| project.element(id).is_some_and(shown));
             if !structural {
-                draw_openings(&mut d, project, geom, g, ceiling);
+                draw_openings(&mut d, project, geom, g, (ceiling, cut_z), (detail, scale));
             }
         }
     }
-
+    // Columns over the walls they stand in (issue 276).
     if !ceiling {
+        draw_columns(&mut d, project, level, (cut_z, spacing, detail), structural);
+    }
+
+    if !ceiling && let Some((lo, hi)) = geom.bounds() {
+        // Markers stay outside the grid lines too, which usually extend past the model.
+        let grid_ends = project.elements.values().filter_map(|e| match &e.kind {
+            ElementKind::Grid(g) => Some([g.start, g.end]),
+            _ => None,
+        });
+        let (lo, hi) = grid_ends
+            .flatten()
+            .fold((DVec2::new(lo.x, lo.y), DVec2::new(hi.x, hi.y)), |(lo, hi), p| (lo.min(p), hi.max(p)));
         for v in project.views.values() {
-            if let ViewKind::Section { start, end, depth } = v.kind {
-                section_mark(&mut d, start, end, depth, &v.name);
-            }
-        }
-        if let Some((lo, hi)) = geom.bounds() {
-            // Markers stay outside the grid lines too, which usually extend past the model.
-            let grid_ends = project.elements.values().filter_map(|e| match &e.kind {
-                ElementKind::Grid(g) => Some([g.start, g.end]),
-                _ => None,
-            });
-            let (lo, hi) = grid_ends
-                .flatten()
-                .fold((DVec2::new(lo.x, lo.y), DVec2::new(hi.x, hi.y)), |(lo, hi), p| (lo.min(p), hi.max(p)));
-            for v in project.views.values() {
-                if let ViewKind::Elevation { direction } = v.kind {
-                    elevation_mark(&mut d, lo, hi, direction.look(), &v.name);
-                }
+            // A detail view of an elevation is drawn as a callout in it, not here.
+            if let ViewKind::Elevation { direction } = v.kind
+                && !v.is_detail()
+            {
+                elevation_mark(&mut d, lo, hi, direction.look(), &v.name);
             }
         }
     }
@@ -173,10 +200,10 @@ fn elevation_mark(d: &mut Drawing2D, lo: DVec2, hi: DVec2, look: DVec2, name: &s
     d.text(c + DVec2::new(r + 0.08, -r - 0.05), name, 2.5);
 }
 
-/// Columns, beams, stairs, ramps and railings of `level` as seen from the cut plane.
 /// Outlines of component pieces marked for plans: in floor plans the pieces
 /// starting below the cut (pieces above it dashed), in ceiling plans only
-/// the pieces above the cut (light fixtures and the like).
+/// the pieces above the cut (light fixtures and the like). Swept profiles
+/// are drawn the same way.
 fn draw_components(
     d: &mut Drawing2D,
     project: &Project,
@@ -184,8 +211,16 @@ fn draw_components(
     level: LevelId,
     cut_z: f64,
     ceiling: bool,
+    detail: DetailLevel,
 ) {
     for e in project.elements.values().filter(|e| e.level == level) {
+        // Swept profiles (baseboards, crown moldings) cut and show like mesh pieces.
+        if let ElementKind::Sweep(sw) = &e.kind {
+            if let Some(faces) = cc_geom::profile_sweep::sweep_faces(project, e, sw) {
+                draw_mesh(d, &faces, cut_z, ceiling, e.id);
+            }
+            continue;
+        }
         if !matches!(e.kind, ElementKind::Component(_)) {
             continue;
         }
@@ -193,7 +228,7 @@ fn draw_components(
         if !ceiling && matches!(project.mep_data(e), Some(cc_core::MepData::Device { .. })) {
             continue;
         }
-        for part in geom.components.get(&e.id).into_iter().flatten().filter(|p| p.in_plan) {
+        for part in geom.components.get(&e.id).into_iter().flatten().filter(|p| p.in_plan && p.detail.shows(detail)) {
             if !part.faces.is_empty() {
                 draw_mesh(d, &part.faces, cut_z, ceiling, e.id);
                 continue;
@@ -211,6 +246,42 @@ fn draw_components(
 
 /// A mesh piece: its section at the cut plane, the edges seen below it and,
 /// dashed, those above (in ceiling plans only the edges above).
+/// Conceptual masses in a floor plan: those on its level or cut by its cut
+/// plane, as their body cuts and shows (see [`draw_mesh`]), with the mass
+/// floor of the level and its area.
+fn draw_masses(d: &mut Drawing2D, project: &Project, geom: &ModelGeometry, level: LevelId, cut_z: f64) {
+    for (id, g) in &geom.masses {
+        let own = project.element(*id).is_some_and(|e| e.level == level);
+        if !own && !(g.z_range.0 <= cut_z && cut_z <= g.z_range.1) {
+            continue;
+        }
+        draw_mesh(d, &g.faces, cut_z, false, *id);
+        if let Some(floor) = g.floors.iter().find(|f| f.level == level) {
+            d.polyline(&floor.outline, true, LineStyle::Thin, Some(*id));
+            let n = floor.outline.len().max(1) as f64;
+            let center = floor.outline.iter().copied().sum::<DVec2>() / n;
+            d.prims.push(crate::Prim::Text {
+                pos: center,
+                text: crate::format::area(floor.area),
+                size: 2.5,
+                anchor: crate::Anchor::Center,
+                angle: 0.0,
+                element: Some(*id),
+            });
+        }
+    }
+}
+
+/// Connections whose member stands on `level`: their plates and bolts as
+/// they cut and show (see [`draw_mesh`]).
+fn draw_connections(d: &mut Drawing2D, project: &Project, geom: &ModelGeometry, level: LevelId, cut_z: f64) {
+    for g in geom.connections.values() {
+        if project.element(g.member).is_some_and(|m| m.level == level) {
+            draw_mesh(d, &g.faces(), cut_z, false, g.element);
+        }
+    }
+}
+
 fn draw_mesh(d: &mut Drawing2D, faces: &[Vec<glam::DVec3>], cut_z: f64, ceiling: bool, id: cc_core::ElementId) {
     let plan = cc_geom::mesh_plan(faces, cut_z);
     let id = Some(id);
@@ -223,6 +294,8 @@ fn draw_mesh(d: &mut Drawing2D, faces: &[Vec<glam::DVec3>], cut_z: f64, ceiling:
     plan.above.iter().for_each(|&(a, b)| d.line(a, b, LineStyle::Hidden, id));
 }
 
+/// Foundations, beams, stairs, ramps and railings of `level` as seen from the
+/// cut plane (columns: [`draw_columns`]).
 fn draw_structure(
     d: &mut Drawing2D,
     project: &Project,
@@ -236,34 +309,44 @@ fn draw_structure(
         let id = Some(e.id);
         let data = project.element_type(e.type_id).map(|t| &t.data);
         match (&e.kind, data) {
-            (ElementKind::Column(c), Some(TypeData::Column { section, .. })) => {
-                let loops = cc_geom::section::column_loops(*section, c.position, c.rotation_deg);
-                let (base, top) = project.column_span(e, c);
-                let style = if base <= cut_z && cut_z <= top {
-                    let material = project.element_type(e.type_id).map_or("", |t| t.data.cut_material());
-                    for part in cc_geom::section::column_parts(*section, c.position, c.rotation_deg) {
-                        crate::cut::cut_fill(d, project, material, part, spacing, id);
-                    }
-                    LineStyle::Cut
-                } else if base > cut_z {
-                    LineStyle::Hidden
-                } else {
-                    LineStyle::Projection
-                };
-                for outline in &loops {
-                    d.polyline(outline, true, style, id);
-                }
-            }
             (ElementKind::Foundation(_), Some(TypeData::Foundation { .. })) => {
                 // Foundations lie under the floor: dashed, unless the cut plane passes through them.
                 let Some(g) = geom.foundations.get(&e.id) else { continue };
                 let (bottom, top) = g.z_range;
                 if bottom <= cut_z && cut_z <= top {
                     let material = project.element_type(e.type_id).map_or("", |t| t.data.cut_material());
-                    crate::cut::cut_fill(d, project, material, g.footprint.clone(), spacing, id);
+                    // A ring pile cap fills around its hole.
+                    let region = match g.holes.is_empty() {
+                        true => Some(g.footprint.clone()),
+                        false => cc_geom::polygon::keyhole(&g.footprint, &g.holes),
+                    };
+                    if let Some(region) = region {
+                        crate::cut::cut_fill(d, project, material, region, spacing, id);
+                    }
                     d.polyline(&g.footprint, true, LineStyle::Cut, id);
+                    g.holes.iter().for_each(|h| d.polyline(h, true, LineStyle::Cut, id));
                 } else {
                     d.polyline(&g.footprint, true, LineStyle::Hidden, id);
+                    g.holes.iter().for_each(|h| d.polyline(h, true, LineStyle::Hidden, id));
+                }
+                // The beam on top of a haunched strip: its two faces.
+                if let (Some(body), Some(h)) = (g.body(), data.and_then(|t| t.strip_haunch())) {
+                    let style = if bottom <= cut_z && cut_z <= top { LineStyle::Projection } else { LineStyle::Hidden };
+                    for v in [-h.beam_width / 2.0, h.beam_width / 2.0] {
+                        d.polyline(&body.line(v), false, style, id);
+                    }
+                }
+            }
+            (ElementKind::Pile(_), Some(TypeData::Pile { .. })) => {
+                // Piles lie under the floor: dashed, unless the cut plane passes
+                // through them; a center mark on their axis.
+                let Some(g) = geom.piles.get(&e.id) else { continue };
+                let (bottom, top) = g.z_range;
+                let style = if bottom <= cut_z && cut_z <= top { LineStyle::Cut } else { LineStyle::Hidden };
+                d.polyline(&g.outline(), true, style, id);
+                let (u, arm) = (DVec2::from_angle(g.rotation_deg.to_radians()), g.section.size() * 0.75);
+                for axis in [u, u.perp()] {
+                    d.line(g.position - axis * arm, g.position + axis * arm, LineStyle::Center, id);
                 }
             }
             (ElementKind::Beam(_), Some(TypeData::Beam { .. })) => {
@@ -281,7 +364,7 @@ fn draw_structure(
                 } else {
                     LineStyle::Projection
                 };
-                d.polyline(&g.footprint(), true, style, id);
+                d.polyline(&g.outline(), true, style, id);
             }
             (ElementKind::Stair(st), Some(TypeData::Stair { .. })) => {
                 if let Some(g) = cc_geom::stair_geom(project, e, st) {
@@ -302,9 +385,49 @@ fn draw_structure(
     }
 }
 
+/// Columns of `level` as seen from the cut plane. They are drawn after the
+/// walls, so a column standing in or crossing a wall shows whole over the
+/// wall's cut; a wall joined with an architectural column still cuts it, as
+/// [`crate::joins::merge`] paints the cutting element over the one it cuts.
+fn draw_columns(
+    d: &mut Drawing2D,
+    project: &Project,
+    level: LevelId,
+    (cut_z, spacing, detail): (f64, f64, DetailLevel),
+    structural: bool,
+) {
+    for e in project.elements.values().filter(|e| e.level == level && (!structural || is_structural(e))) {
+        let id = Some(e.id);
+        let (ElementKind::Column(c), Some(data @ TypeData::Column { .. })) =
+            (&e.kind, project.element_type(e.type_id).map(|t| &t.data))
+        else {
+            continue;
+        };
+        let Some(section) = cc_geom::section::detailed(project, data, detail) else { continue };
+        let (outer, holes) = cc_geom::section::column_body(&section, c.position, c.rotation_deg);
+        let (base, top) = project.column_span(e, c);
+        let style = if base <= cut_z && cut_z <= top {
+            let material = data.cut_material();
+            crate::cut::cut_fill_with_holes(d, project, material, &outer, &holes, spacing, id);
+            LineStyle::Cut
+        } else if base > cut_z {
+            LineStyle::Hidden
+        } else {
+            LineStyle::Projection
+        };
+        for outline in std::iter::once(&outer).chain(&holes) {
+            d.polyline(outline, true, style, id);
+        }
+    }
+}
+
+/// Height of the step numbers of a stair, paper millimeters.
+const STAIR_NUMBER_MM: f64 = 2.0;
+
 /// Stair symbol: the treads and landings (dashed beyond the cut), a break
-/// line across the first step above the cut plane and an arrow along the
-/// walking line pointing up, to the cut (or the top).
+/// line across the first step above the cut plane, the step numbers when
+/// the stair asks for them and an arrow along the walking line pointing up,
+/// to the cut (or the top).
 fn draw_stair(d: &mut Drawing2D, g: &cc_geom::StairGeom, cut_z: f64, element: cc_core::ElementId) {
     let id = Some(element);
     let below = |z: f64| z <= cut_z + 1e-9;
@@ -325,6 +448,11 @@ fn draw_stair(d: &mut Drawing2D, g: &cc_geom::StairGeom, cut_z: f64, element: cc
         let m = (a + b) * 0.5;
         let z = inward * 0.08;
         d.polyline(&[a, m - z, m + z, b], false, LineStyle::Projection, id);
+    }
+    if g.layout.numbers {
+        for (at, n) in g.number_spots() {
+            d.tag_text(at, n.to_string(), STAIR_NUMBER_MM, crate::Anchor::Center, 0.0, id);
+        }
     }
     // Arrow along the walking line, to the cut plane or the top.
     let min_z = g.base + g.riser * 1.5;
@@ -463,40 +591,52 @@ fn draw_ramp(d: &mut Drawing2D, g: &cc_geom::RampGeom, cut_z: f64, element: cc_c
     }
 }
 
-fn draw_wall(d: &mut Drawing2D, project: &Project, g: &WallGeom, cut_z: f64, spacing: f64) {
+/// A wall in plan: cut, its layers with their materials' patterns (at the
+/// coarse level one plain region), or seen below or above the cut. Where a
+/// layered wall meets another in a T, its core runs on through the other
+/// wall's outer layers to its core (layer cleanup).
+fn draw_wall(d: &mut Drawing2D, project: &Project, g: &WallGeom, cut_z: f64, spacing: f64, detail: DetailLevel) {
+    if let Some(c) = &g.curtain {
+        draw_curtain(d, project, g, c, cut_z, spacing, detail);
+        return;
+    }
     let id = Some(g.element);
     let h = g.half;
     let states: Vec<ColumnCut> = g.columns.iter().map(|c| column_state(c, cut_z)).collect();
+    let count = g.columns.len();
     for (i, c) in g.columns.iter().enumerate() {
         let poly = g.column_polygon(c);
         let state = states[i];
+        // Each layer with its material's cut pattern; coarse, one plain region.
+        let layers: &[_] = if state == ColumnCut::Cut && detail.shows_layers() { &g.layers } else { &[] };
         if state == ColumnCut::Cut {
-            // Each layer with its material's cut pattern.
-            if g.layers.is_empty() {
+            if layers.is_empty() {
                 d.cut_fill(poly.to_vec(), POCHE, id);
             }
-            for (v0, v1, material) in &g.layers {
-                let at = |v: f64| {
-                    let s = (v + h) / (2.0 * h);
-                    (c.right.0 + (c.left.0 - c.right.0) * s, c.right.1 + (c.left.1 - c.right.1) * s)
-                };
-                let ((a0, a1), (b0, b1)) = (at(*v0), at(*v1));
-                let mut strip = g.path(a0, a1, *v0);
-                strip.extend(g.path(b1, b0, *v1));
-                crate::cut::cut_fill(d, project, material, strip, spacing, id);
+            for (v0, v1, material) in layers {
+                let (a, b) = (g.layer_span(c, i, count, *v0), g.layer_span(c, i, count, *v1));
+                for ((a0, a1), (b0, b1)) in g.layer_pieces(*v0, *v1, a, b) {
+                    let mut strip = g.path(a0, a1, *v0);
+                    strip.extend(g.path(b1, b0, *v1));
+                    crate::cut::cut_fill(d, project, material, strip, spacing, id);
+                }
             }
             // Interior layer boundaries; the outer faces are drawn below.
-            for &(_, v, _) in g.layers.iter().take(g.layers.len().saturating_sub(1)) {
-                let s = (v + h) / (2.0 * h);
-                let u0 = c.right.0 + (c.left.0 - c.right.0) * s;
-                let u1 = c.right.1 + (c.left.1 - c.right.1) * s;
-                d.polyline(&g.path(u0, u1, v), false, LineStyle::Thin, id);
+            for &(_, v, _) in layers.iter().take(layers.len().saturating_sub(1)) {
+                let (u0, u1) = g.layer_span(c, i, count, v);
+                for (a, b) in g.boundary_segments(v, u0, u1) {
+                    d.polyline(&g.path(a, b, v), false, LineStyle::Thin, id);
+                }
             }
         }
         if let Some(style) = style_of(state) {
-            // Faces, opened where other walls meet them in a T.
-            for (side, (u0, u1)) in [(-1.0, c.right), (1.0, c.left)] {
-                for (a, b) in g.face_segments(side, u0, u1) {
+            // Faces, opened where other walls meet them in a T (and carried on
+            // with a core that reaches them).
+            let face = |v: f64, plain: (f64, f64)| if layers.is_empty() { plain } else { g.layer_span(c, i, count, v) };
+            for (side, (u0, u1)) in [(-1.0, face(-h, c.right)), (1.0, face(h, c.left))] {
+                // A cut wall's face is open where a niche is cut too.
+                let cut_at = if state == ColumnCut::Cut { cut_z } else { f64::NAN };
+                for (a, b) in g.face_segments_at(side, u0, u1, cut_at) {
                     d.polyline(&g.path(a, b, side * h), false, style, id);
                 }
             }
@@ -522,50 +662,212 @@ fn draw_wall(d: &mut Drawing2D, project: &Project, g: &WallGeom, cut_z: f64, spa
     }
 }
 
-fn draw_openings(d: &mut Drawing2D, project: &Project, geom: &ModelGeometry, g: &WallGeom, ceiling: bool) {
+/// The niches of a wall in plan. One the cut passes through opens the wall's
+/// face: the wall's fill is covered from the face to the recess's back, and
+/// its sides and back are cut lines. One wholly below or above the cut is
+/// dashed. The lines and the cover belong to the niche, so hiding niches
+/// shows the wall whole.
+fn draw_recesses(d: &mut Drawing2D, g: &WallGeom, cut_z: f64, shown: &dyn Fn(cc_core::ElementId) -> bool) {
+    for r in g.recesses.iter().filter(|r| shown(r.element)) {
+        let id = Some(r.element);
+        let (face, back) = r.across(g.half);
+        let cut = r.z0 <= cut_z && cut_z <= r.z1;
+        if cut {
+            let mut area = g.path(r.u0, r.u1, face);
+            area.extend(g.path(r.u1, r.u0, back));
+            d.fill(area, PAPER, id);
+        }
+        let style = if cut { LineStyle::Cut } else { LineStyle::Hidden };
+        d.line(g.world(r.u0, face), g.world(r.u0, back), style, id);
+        d.polyline(&g.path(r.u0, r.u1, back), false, style, id);
+        d.line(g.world(r.u1, back), g.world(r.u1, face), style, id);
+    }
+}
+
+/// The paper showing through a cut niche, over its wall's fill.
+const PAPER: [u8; 4] = [255, 255, 255, 255];
+
+/// A curtain wall in plan: its mullions (cut with their material's pattern,
+/// or seen below the cut), a line along each glass panel and the outline of
+/// solid ones, and the pieces of component panels.
+fn draw_curtain(
+    d: &mut Drawing2D,
+    project: &Project,
+    g: &WallGeom,
+    c: &cc_geom::curtain::CurtainGeom,
+    cut_z: f64,
+    spacing: f64,
+    detail: DetailLevel,
+) {
+    use cc_core::curtain::CurtainPanel;
+    let id = Some(g.element);
+    let state = |z: (f64, f64)| {
+        if z.0 <= cut_z && cut_z <= z.1 {
+            Some(LineStyle::Cut)
+        } else if z.1 < cut_z {
+            Some(LineStyle::Projection)
+        } else {
+            None
+        }
+    };
+    for p in &c.panels {
+        let Some(cell) = c.layout.panels.get(p.cell) else { continue };
+        match &cell.panel {
+            CurtainPanel::Glass { .. } => {
+                if let Some(style) = state(p.z) {
+                    d.line(p.start, p.end, style, id);
+                }
+            }
+            CurtainPanel::Solid { thickness, material } => {
+                let (_, n) = p.frame();
+                let t = n * (thickness * 0.5);
+                let poly = vec![p.start - t, p.end - t, p.end + t, p.start + t];
+                match state(p.z) {
+                    Some(LineStyle::Cut) => {
+                        crate::cut::cut_fill(d, project, material, poly.clone(), spacing, id);
+                        d.polyline(&poly, true, LineStyle::Cut, id);
+                    }
+                    Some(style) => d.polyline(&poly, true, style, id),
+                    None => {}
+                }
+            }
+            CurtainPanel::Empty => {}
+            CurtainPanel::Component { .. } => {
+                for part in p.parts.iter().filter(|q| q.in_plan && !q.void && q.detail.shows(detail)) {
+                    if !part.faces.is_empty() {
+                        draw_mesh(d, &part.faces, cut_z, false, g.element);
+                    } else if let Some(style) = state((part.z0, part.z1)) {
+                        d.polyline(&part.footprint, true, style, id);
+                    }
+                }
+            }
+        }
+    }
+    for m in &c.mullions {
+        let Some(piece) = c.layout.mullions.get(m.piece) else { continue };
+        let poly = m.footprint.to_vec();
+        match state(m.z) {
+            Some(LineStyle::Cut) => {
+                crate::cut::cut_fill(d, project, &piece.mullion.material, poly.clone(), spacing, id);
+                d.polyline(&poly, true, LineStyle::Cut, id);
+            }
+            Some(style) => d.polyline(&poly, true, style, id),
+            None => {}
+        }
+    }
+}
+
+fn draw_openings(
+    d: &mut Drawing2D,
+    project: &Project,
+    geom: &ModelGeometry,
+    g: &WallGeom,
+    (ceiling, cut_z): (bool, f64),
+    (detail, scale): (DetailLevel, u32),
+) {
     for o in &g.openings {
         let Some(e) = project.element(o.element) else { continue };
         let Some(host) = e.as_hosted() else { continue };
         let id = Some(e.id);
         // A door or window component may draw its own symbol: its pieces marked for plans.
-        let own_symbol = match project.element_type(e.type_id).map(|t| &t.data) {
-            Some(cc_core::TypeData::Component { def, .. }) => def.opening.as_ref().is_some_and(|o| o.own_symbol),
-            _ => false,
+        let opening = match project.element_type(e.type_id).map(|t| &t.data) {
+            Some(cc_core::TypeData::Component { def, .. }) => def.opening.as_deref(),
+            _ => None,
         };
+        let own_symbol = opening.is_some_and(|o| o.own_symbol);
         if own_symbol {
             if !ceiling {
-                for p in geom.opening_fills.get(&e.id).into_iter().flatten().filter(|p| p.in_plan && !p.void) {
+                let shown = |p: &&cc_core::component::ComponentPart| p.in_plan && !p.void && p.detail.shows(detail);
+                for p in geom.opening_fills.get(&e.id).into_iter().flatten().filter(shown) {
                     d.polyline(&p.footprint, true, LineStyle::Projection, id);
                 }
             }
             continue;
         }
+        let width = o.u1 - o.u0;
+        let side = if host.flip_facing { -1.0 } else { 1.0 };
         match e.kind {
             ElementKind::Door(_) if !ceiling => {
-                let width = o.u1 - o.u0;
-                let side = if host.flip_facing { -1.0 } else { 1.0 };
-                let (hinge_u, toward) = if host.flip_hand { (o.u1, -1.0) } else { (o.u0, 1.0) };
-                let hinge = g.world(hinge_u, side * g.half);
-                // Square to the wall at the opening's center (an arc wall's chord).
-                let (_, dir, normal) = g.frame_at((o.u0 + o.u1) * 0.5);
-                let leaf_dir = normal * side;
-                d.line(hinge, hinge + leaf_dir * width, LineStyle::Projection, id);
-                let a0 = leaf_dir.to_angle();
-                let mut a1 = (dir * toward).to_angle();
-                if a1 - a0 > PI {
-                    a1 -= TAU;
-                } else if a0 - a1 > PI {
-                    a1 += TAU;
+                // A swing per leaf: a double door's two meet in the middle.
+                let hinges = opening.map(|o| o.door_operation).unwrap_or_default().hinges();
+                let leaf = width / hinges.len().max(1) as f64;
+                for &(at, toward) in hinges {
+                    let (at, toward) = if host.flip_hand { (1.0 - at, -toward) } else { (at, toward) };
+                    let hinge = (o.u0 + at * width, toward);
+                    swing(d, g, (o.u0 + o.u1) * 0.5, hinge, (leaf, LineStyle::Thin, scale), side, id);
                 }
-                d.arc(hinge, width, a0, a1, LineStyle::Thin, id);
             }
             ElementKind::Window(_) => {
-                for v in [-0.01, 0.01] {
-                    d.polyline(&g.path(o.u0, o.u1, v), false, LineStyle::Thin, id);
+                let operation = opening.map(|o| o.operation).unwrap_or_default();
+                // A window above the cut is seen from below through the wall: dashed, jambs too.
+                if !ceiling && o.z0 > cut_z {
+                    for v in [-0.01, 0.01] {
+                        d.polyline(&g.path(o.u0, o.u1, v), false, LineStyle::Hidden, id);
+                    }
+                    for u in [o.u0, o.u1] {
+                        d.line(g.world(u, -g.half), g.world(u, g.half), LineStyle::Hidden, id);
+                    }
+                    continue;
+                }
+                if operation == cc_core::WindowOperation::Sliding {
+                    // Two panels on their tracks, overlapping in the middle.
+                    let (mid, lap) = ((o.u0 + o.u1) * 0.5, SLIDING_LAP.min(width / 4.0));
+                    let (first, second) = if host.flip_hand { (0.02, -0.02) } else { (-0.02, 0.02) };
+                    d.polyline(&g.path(o.u0, mid + lap, first), false, LineStyle::Thin, id);
+                    d.polyline(&g.path(mid - lap, o.u1, second), false, LineStyle::Thin, id);
+                } else {
+                    for v in [-0.01, 0.01] {
+                        d.polyline(&g.path(o.u0, o.u1, v), false, LineStyle::Thin, id);
+                    }
+                }
+                if ceiling {
+                    continue;
+                }
+                // Side-hung panels, open square to the wall on the side the window opens to.
+                let hinges = operation.hinges();
+                let leaf = width / hinges.len().max(1) as f64;
+                for &(at, toward) in hinges {
+                    let (at, toward) = if host.flip_hand { (1.0 - at, -toward) } else { (at, toward) };
+                    let hinge = (o.u0 + at * width, toward);
+                    swing(d, g, (o.u0 + o.u1) * 0.5, hinge, (leaf, LineStyle::Hidden, scale), side, id);
                 }
             }
             _ => {}
         }
+    }
+}
+
+/// How far the panels of a sliding window overlap past the middle in plan, meters.
+const SLIDING_LAP: f64 = 0.05;
+
+/// A swing in plan: a leaf `width` long from the hinge at `hinge_u` on the
+/// wall's face on `side`, square to the wall at `center_u` (an arc wall's
+/// chord), and the arc (in style `arc`: windows dash it) its free end runs
+/// back to the wall `toward` the opening's other end (+1 along the wall).
+fn swing(
+    d: &mut Drawing2D,
+    g: &WallGeom,
+    center_u: f64,
+    (hinge_u, toward): (f64, f64),
+    (width, arc, scale): (f64, LineStyle, u32),
+    side: f64,
+    id: Option<cc_core::ElementId>,
+) {
+    let hinge = g.world(hinge_u, side * g.half);
+    let (_, dir, normal) = g.frame_at(center_u);
+    let leaf_dir = normal * side;
+    d.line(hinge, hinge + leaf_dir * width, LineStyle::Projection, id);
+    let a0 = leaf_dir.to_angle();
+    let mut a1 = (dir * toward).to_angle();
+    if a1 - a0 > PI {
+        a1 -= TAU;
+    } else if a0 - a1 > PI {
+        a1 += TAU;
+    }
+    if arc.dashes().is_empty() {
+        d.arc(hinge, width, a0, a1, arc, id);
+    } else {
+        d.dashed_arc(hinge, width, (a0, a1), arc, id, scale);
     }
 }
 
@@ -588,19 +890,217 @@ fn ceiling_grid(d: &mut Drawing2D, boundary: &[DVec2], id: cc_core::ElementId) {
     }
 }
 
-fn section_mark(d: &mut Drawing2D, start: DVec2, end: DVec2, depth: f64, name: &str) {
+/// Diameter of a section head on paper, millimeters (NBR 6492, A.4.7).
+const SECTION_HEAD_MM: f64 = 12.0;
+/// Pen of a section line: dash-dot, extra wide.
+const SECTION_PEN_MM: f64 = 0.7;
+/// Paper height of the drawing number and of the sheet number, millimeters.
+const SECTION_NUMBER_MM: f64 = 3.5;
+const SECTION_SHEET_MM: f64 = 2.5;
+
+/// The marks of every section in a plan at 1:`scale`, each listed in
+/// `d.sections` to be picked, moved and flipped.
+pub(crate) fn section_marks(d: &mut Drawing2D, project: &Project, scale: u32) {
+    for v in project.views.values() {
+        // A detail view of a section is drawn as a callout in it, not here.
+        if let ViewKind::Section { start, end, depth, segments } = v.kind
+            && !v.is_detail()
+        {
+            let (number, sheet) = section_labels(project, v);
+            let handle = section_mark(d, (start, end), depth, segments, scale, (&number, &sheet));
+            d.sections.push(crate::SectionHandle { view: v.id, ..handle });
+        }
+    }
+}
+
+/// What a section head shows: the drawing's number on its sheet and the
+/// sheet's number, or, while the section is on no sheet, the last word of
+/// its name (its letter, as in "Section A") over a dash.
+pub(crate) fn section_labels(project: &Project, view: &cc_core::View) -> (String, String) {
+    for sheet in project.views.values() {
+        if let ViewKind::Sheet { number, viewports, .. } = &sheet.kind
+            && let Some(i) = viewports.iter().position(|vp| vp.view == view.id)
+        {
+            return ((i + 1).to_string(), number.clone());
+        }
+    }
+    let short = view.name.split_whitespace().last().unwrap_or_default();
+    (short.chars().take(4).collect(), "-".into())
+}
+
+/// The pieces of a section line drawn between its heads: the whole line, or
+/// with `segments` only that much of it next to each head (the whole line
+/// when they would meet). The line starts at the base of each head's
+/// triangle, `head` from its end.
+pub fn section_pieces(start: DVec2, end: DVec2, segments: Option<[f64; 2]>, head: f64) -> Vec<(DVec2, DVec2)> {
+    let length = start.distance(end);
+    let dir = (end - start).normalize_or_zero();
+    if length <= 2.0 * head || dir == DVec2::ZERO {
+        return Vec::new();
+    }
+    let (a, b) = (start + dir * head, end - dir * head);
+    match segments {
+        Some([s0, s1]) if s0 + s1 < length => {
+            let mut out = Vec::new();
+            if s0 > head {
+                out.push((a, start + dir * s0));
+            }
+            if s1 > head {
+                out.push((end - dir * s1, b));
+            }
+            out
+        }
+        _ => vec![(a, b)],
+    }
+}
+
+/// A section mark (NBR 6492, figure A.19): at each end a 12 mm circle split
+/// by a horizontal line, the drawing number above it and the sheet number
+/// below, on a filled triangle pointing where the section looks; between
+/// the heads an extra-wide dash-dot line (split with `segments`), and the
+/// far extent dashed. Sizes are on paper at 1:`scale`.
+fn section_mark(
+    d: &mut Drawing2D,
+    (start, end): (DVec2, DVec2),
+    depth: f64,
+    segments: Option<[f64; 2]>,
+    scale: u32,
+    (number, sheet): (&str, &str),
+) -> crate::SectionHandle {
+    let k = f64::from(scale.max(1)) / 1000.0;
+    let r = SECTION_HEAD_MM * 0.5 * k;
     let dir = (end - start).normalize_or_zero();
     let look = -dir.perp();
-    d.line(start, end, LineStyle::Annotation, None);
-    for p in [start, end] {
-        let tip = p + look * 0.6;
-        d.line(p, tip, LineStyle::Annotation, None);
-        d.line(tip, tip - look * 0.2 + dir * 0.12, LineStyle::Annotation, None);
-        d.line(tip, tip - look * 0.2 - dir * 0.12, LineStyle::Annotation, None);
+    // The triangle's base runs along the line, twice the circle wide.
+    let half_base = 2.0 * r;
+    let pieces = section_pieces(start, end, segments, half_base);
+    let pen = crate::Pen { weight: Some(SECTION_PEN_MM), ..Default::default() };
+    for &(a, b) in &pieces {
+        d.prims.push(crate::Prim::Line { a, b, style: LineStyle::Center, element: None, pen: Some(pen) });
+    }
+    let [ink_r, ink_g, ink_b] = LineStyle::Annotation.pen().1;
+    for c in [start, end] {
+        d.fill(vec![c + dir * half_base, c + look * 1.4 * r, c - dir * half_base], [ink_r, ink_g, ink_b, 255], None);
+        let circle: Vec<DVec2> = (0..32)
+            .map(|i| {
+                let a = f64::from(i) / 32.0 * std::f64::consts::TAU;
+                c + DVec2::new(a.cos(), a.sin()) * r
+            })
+            .collect();
+        d.fill(circle.clone(), [255, 255, 255, 255], None);
+        d.polyline(&circle, true, LineStyle::Annotation, None);
+        d.line(c - DVec2::X * r, c + DVec2::X * r, LineStyle::Annotation, None);
+        d.text_at(c + DVec2::Y * r * 0.48, number, SECTION_NUMBER_MM, crate::Anchor::Center, 0.0);
+        d.text_at(c - DVec2::Y * r * 0.5, sheet, SECTION_SHEET_MM, crate::Anchor::Center, 0.0);
     }
     // Far clip extent, dashed.
     d.line(start + look * depth, end + look * depth, LineStyle::Hidden, None);
-    d.text(start - dir * 0.4 + DVec2::new(0.0, 0.1), name, 2.5);
+    crate::SectionHandle { view: cc_core::ViewId(0), start, end, segments, pieces, radius: r, head: half_base }
+}
+
+/// Steel buildings of a plan's level: their column lines' rectangle, thin
+/// and dashed, as the building's own lines so it can be picked (its
+/// columns and beams draw themselves).
+fn draw_steel_buildings(
+    d: &mut Drawing2D,
+    project: &Project,
+    level: LevelId,
+    shown: &dyn Fn(&cc_core::Element) -> bool,
+) {
+    for e in project.elements.values().filter(|e| e.level == level && shown(e)) {
+        let ElementKind::SteelBuilding(b) = &e.kind else { continue };
+        d.polyline(&b.footprint(), true, LineStyle::Hidden, Some(e.id));
+    }
+}
+
+/// Trusses of a plan's level: each copy's span line, thin and dashed, as
+/// the truss's own line so it can be picked (its members draw themselves).
+/// A bracing draws its bay line the same way.
+fn draw_trusses(d: &mut Drawing2D, project: &Project, level: LevelId, shown: &dyn Fn(&cc_core::Element) -> bool) {
+    for e in project.elements.values().filter(|e| e.level == level && shown(e)) {
+        if let ElementKind::Bracing(b) = &e.kind {
+            d.line(b.start, b.end, LineStyle::Hidden, Some(e.id));
+        }
+        let ElementKind::Truss(t) = &e.kind else { continue };
+        for [a, b] in t.span_lines() {
+            d.line(a, b, LineStyle::Hidden, Some(e.id));
+        }
+    }
+}
+
+/// Shafts in a plan: those on its level and those its cut plane passes
+/// through, as their outline crossed by its two diagonals (the usual
+/// symbol of an opening through the floors).
+fn draw_shafts(d: &mut Drawing2D, project: &Project, level: LevelId, cut_z: f64) {
+    for e in project.elements.values() {
+        let ElementKind::Shaft(s) = &e.kind else { continue };
+        let (base, top) = project.shaft_span(e, s);
+        if e.level != level && !(base <= cut_z && cut_z <= top) {
+            continue;
+        }
+        let id = Some(e.id);
+        d.polyline(&s.outline, true, LineStyle::Projection, id);
+        // Corner to opposite corner: the points farthest apart, then the
+        // two farthest from that line on either side.
+        let n = s.outline.len();
+        let pairs = (0..n).flat_map(|i| (i + 1..n).map(move |j| (i, j)));
+        let Some((i, j)) = pairs.max_by(|a, b| {
+            let da = s.outline[a.0].distance(s.outline[a.1]);
+            let db = s.outline[b.0].distance(s.outline[b.1]);
+            da.total_cmp(&db)
+        }) else {
+            continue;
+        };
+        let (a, b) = (s.outline[i], s.outline[j]);
+        d.line(a, b, LineStyle::Thin, id);
+        let side = |p: DVec2| (b - a).perp_dot(p - a);
+        let left = s.outline.iter().copied().max_by(|p, q| side(*p).total_cmp(&side(*q)));
+        let right = s.outline.iter().copied().min_by(|p, q| side(*p).total_cmp(&side(*q)));
+        if let (Some(l), Some(r)) = (left, right)
+            && side(l) > 1e-9
+            && side(r) < -1e-9
+        {
+            d.line(l, r, LineStyle::Thin, id);
+        }
+    }
+}
+/// The faces a plan sees beyond its cut plane at `cut_z`, filled in the
+/// view's visual style, to lie under the plan's linework: what is below the
+/// cut in floor plans, above it in ceiling plans (the shaded, consistent
+/// colors and textures styles). Only fills and surface patterns: the plan
+/// draws its own edges and cuts.
+pub fn style_underlay(
+    geom: &ModelGeometry,
+    cut_z: f64,
+    ceiling: bool,
+    look: crate::Look,
+    patterns: &cc_core::fill_pattern::FillPatterns,
+) -> Vec<crate::Prim> {
+    let forward = if ceiling { glam::DVec3::Z } else { -glam::DVec3::Z };
+    let mut frame = crate::projected::Frame::looking(glam::DVec3::new(0.0, 0.0, cut_z), forward);
+    frame.near = Some(0.0);
+    let d = crate::projected::render(geom, &frame, None, look, patterns);
+    // Looking up, the frame's up is -y: back to plan coordinates.
+    let flip = |p: DVec2| if ceiling { DVec2::new(p.x, -p.y) } else { p };
+    d.prims
+        .into_iter()
+        .filter(|p| match p {
+            crate::Prim::Fill { cut, .. } => !cut,
+            crate::Prim::Line { style, .. } => *style == LineStyle::Thin,
+            _ => false,
+        })
+        .map(|p| p.mapped(flip))
+        .collect()
+}
+
+/// The wireframe style of a plan: no fills (but the invisible room areas
+/// that make rooms pickable) and no hatches, only lines.
+pub fn strip_fills(d: &mut Drawing2D) {
+    d.prims.retain(|p| match p {
+        crate::Prim::Fill { color, .. } => color[3] == 0,
+        crate::Prim::Line { style, .. } => *style != LineStyle::Hatch,
+        _ => true,
+    });
 }
 
 #[cfg(test)]
@@ -608,6 +1108,203 @@ mod tests {
     use super::*;
     use crate::Prim;
     use cc_core::{Category, Document, Element, ElementId, Hosted, Wall};
+
+    /// A steel building draws its footprint dashed as its own lines, so it
+    /// can be picked; its members draw themselves.
+    #[test]
+    fn steel_buildings_draw_their_footprint() {
+        let mut doc = Document::new(Project::from_template());
+        let level = doc.project.levels[0].id;
+        let host = doc.edit("t", |e| {
+            let column = e.project().default_type(Category::Column).unwrap();
+            let beam = e.project().default_type(Category::Beam).unwrap();
+            let ty = cc_core::ElementTypeId(e.alloc_id());
+            e.add_type(cc_core::steel_building::host_type(ty, "Steel building".into()));
+            let b = cc_core::steel_building::SteelBuilding::new(column, beam, None);
+            let id = ElementId(e.alloc_id());
+            e.add_element(Element {
+                id,
+                level,
+                type_id: ty,
+                mark: String::new(),
+                comments: String::new(),
+                uid: Default::default(),
+                kind: ElementKind::SteelBuilding(Box::new(b)),
+                phase_created: Default::default(),
+                phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
+            })
+        });
+        let geom = ModelGeometry::build(&doc.project);
+        let d = plan(&doc.project, &geom, level, 1.2, false, 100);
+        let lines = d
+            .prims
+            .iter()
+            .filter(|p| matches!(p, Prim::Line { style: LineStyle::Hidden, element: Some(e), .. } if *e == host))
+            .count();
+        assert_eq!(lines, 4);
+        // Mid-bay on a long side: nothing else is there.
+        assert_eq!(d.hit_test(DVec2::new(0.0, 3.0), 0.01), Some(host));
+    }
+    /// A truss draws each copy's span line dashed as its own line, so it can
+    /// be picked; its members draw themselves.
+    #[test]
+    fn trusses_draw_their_span_lines() {
+        let mut doc = Document::new(Project::from_template());
+        let level = doc.project.levels[0].id;
+        let host = doc.edit("t", |e| {
+            let column = e.project().default_type(Category::Column).unwrap();
+            let beam = e.project().default_type(Category::Beam).unwrap();
+            let ty = cc_core::ElementTypeId(e.alloc_id());
+            e.add_type(cc_core::truss::host_type(ty, "Truss".into()));
+            let mut t = cc_core::truss::Truss::new(beam, beam, column);
+            (t.copies, t.spacing, t.base_offset) = (2, 3.0, 2.0);
+            let id = ElementId(e.alloc_id());
+            e.add_element(Element {
+                id,
+                level,
+                type_id: ty,
+                mark: String::new(),
+                comments: String::new(),
+                uid: Default::default(),
+                kind: ElementKind::Truss(Box::new(t)),
+                phase_created: Default::default(),
+                phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
+            })
+        });
+        let geom = ModelGeometry::build(&doc.project);
+        let d = plan(&doc.project, &geom, level, 1.2, false, 100);
+        let lines = d
+            .prims
+            .iter()
+            .filter(|p| matches!(p, Prim::Line { style: LineStyle::Hidden, element: Some(e), .. } if *e == host))
+            .count();
+        assert_eq!(lines, 2);
+    }
+
+    /// A connection draws its plate and bolts where its member stands.
+    #[test]
+    fn connections_draw_on_their_members_level() {
+        use cc_core::connection::{Connection, ConnectionKind, MemberEnd};
+        let mut doc = Document::new(Project::from_template());
+        let level = doc.project.levels[0].id;
+        let element = move |id, type_id, kind| Element {
+            id,
+            level,
+            type_id,
+            mark: String::new(),
+            comments: String::new(),
+            uid: Default::default(),
+            kind,
+            phase_created: Default::default(),
+            phase_demolished: None,
+            design_option: None,
+            paints: Vec::new(),
+        };
+        let conn = doc.edit("t", |e| {
+            let column_t = e.project().default_type(Category::Column).unwrap();
+            let ty = cc_core::ElementTypeId(e.alloc_id());
+            e.add_type(cc_core::connection::host_type(ty, "Connection".into()));
+            let col = ElementId(e.alloc_id());
+            let column = cc_core::Column {
+                position: glam::DVec2::new(1.0, 1.0),
+                rotation_deg: 0.0,
+                base_offset: 0.0,
+                height: 3.0,
+                top: cc_core::WallTop::Unconnected,
+                structural: true,
+            };
+            e.add_element(element(col, column_t, ElementKind::Column(column)));
+            let id = ElementId(e.alloc_id());
+            let c = Connection::new(col, MemberEnd::Base, ConnectionKind::BasePlate);
+            e.add_element(element(id, ty, ElementKind::Connection(c)))
+        });
+        let geom = ModelGeometry::build(&doc.project);
+        let d = plan(&doc.project, &geom, level, 1.2, false, 100);
+        let lines = d.prims.iter().filter(|p| matches!(p, Prim::Line { element: Some(e), .. } if *e == conn)).count();
+        assert!(lines >= 4, "the plate's outline at least: {lines}");
+    }
+
+    /// A wall with a column standing in it, cut by the plan; the column is
+    /// joined with the wall when `joined` (the wall cutting an architectural one).
+    fn wall_and_column(structural: bool, joined: bool) -> (Drawing2D, ElementId, ElementId) {
+        let mut doc = Document::new(Project::from_template());
+        let level = doc.project.levels[0].id;
+        let element = |id, type_id, kind| Element {
+            id,
+            level,
+            type_id,
+            mark: String::new(),
+            comments: String::new(),
+            uid: Default::default(),
+            kind,
+            phase_created: Default::default(),
+            phase_demolished: None,
+            design_option: None,
+            paints: Vec::new(),
+        };
+        let (wall, column) = doc.edit("t", |e| {
+            let wall_t = e.project().default_type(Category::Wall).unwrap();
+            let column_t = e.project().default_type(Category::Column).unwrap();
+            let w = ElementId(e.alloc_id());
+            let kind = ElementKind::Wall(Wall { end: DVec2::new(5.0, 0.0), height: 3.0, ..Default::default() });
+            e.add_element(element(w, wall_t, kind));
+            let c = ElementId(e.alloc_id());
+            let kind = ElementKind::Column(cc_core::Column {
+                position: DVec2::new(2.5, 0.0),
+                rotation_deg: 0.0,
+                base_offset: 0.0,
+                height: 3.0,
+                top: Default::default(),
+                structural,
+            });
+            e.add_element(element(c, column_t, kind));
+            if joined {
+                e.set_joined(w, c, true);
+            }
+            (w, c)
+        });
+        let geom = ModelGeometry::build(&doc.project);
+        let mut d = plan(&doc.project, &geom, level, 1.2, false, 50);
+        crate::joins::merge(&doc.project, &mut d);
+        (d, wall, column)
+    }
+
+    /// Indices of the cut fills of `id`.
+    fn fills_of(d: &Drawing2D, id: ElementId) -> Vec<usize> {
+        let fill = |p: &Prim| matches!(p, Prim::Fill { element: Some(e), cut: true, .. } if *e == id);
+        d.prims.iter().enumerate().filter(|(_, p)| fill(p)).map(|(i, _)| i).collect()
+    }
+
+    /// Issue 276: a column standing in a wall is drawn over the wall's cut,
+    /// fills and outline, unless it is an architectural column the wall cuts.
+    #[test]
+    fn columns_show_over_the_walls_they_stand_in() {
+        for structural in [true, false] {
+            let (d, wall, column) = wall_and_column(structural, false);
+            let wall_fills = fills_of(&d, wall);
+            let last_wall_fill = *wall_fills.iter().max().unwrap();
+            let cut = |p: &Prim| match p {
+                Prim::Fill { element: Some(e), cut: true, .. } => *e == column,
+                Prim::Line { style: LineStyle::Cut, element: Some(e), .. } => *e == column,
+                _ => false,
+            };
+            let column_cut: Vec<usize> = d.prims.iter().enumerate().filter(|(_, p)| cut(p)).map(|(i, _)| i).collect();
+            assert!(!column_cut.is_empty());
+            assert!(
+                column_cut.iter().all(|&i| i > last_wall_fill),
+                "the column's cut is painted after the wall's (structural: {structural})"
+            );
+            assert_eq!(d.hit_test(DVec2::new(2.5, 0.0), 0.001), Some(column));
+        }
+        // A wall joined with an architectural column cuts it: the wall stays on top.
+        let (d, wall, column) = wall_and_column(false, true);
+        let first_wall_fill = *fills_of(&d, wall).iter().min().unwrap();
+        assert!(fills_of(&d, column).iter().all(|&i| i < first_wall_fill));
+    }
 
     #[test]
     fn plan_cuts_wall_and_gaps_at_door() {
@@ -633,6 +1330,8 @@ mod tests {
                 }),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             });
             let dr = ElementId(e.alloc_id());
             e.add_element(Element {
@@ -651,6 +1350,8 @@ mod tests {
                 }),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             });
             (w, dr)
         });
@@ -668,6 +1369,99 @@ mod tests {
         assert_eq!(d.hit_test(DVec2::new(1.0, 0.0), 0.01), Some(wall_id));
         // On the open leaf, drawn from the hinge at u = 2.1 on the left face.
         assert_eq!(d.hit_test(DVec2::new(2.12, 0.5), 0.05), Some(door_id));
+    }
+
+    /// A layered wall meeting another in a T (issue 165): its core runs on
+    /// through the other wall's plaster to its core, the plaster opens there
+    /// and, the cores being of one masonry, no line parts them. A wall with
+    /// no core besides its one layer still stops at the face.
+    #[test]
+    fn t_joined_cores_run_through_the_plaster() {
+        use cc_core::ElementTypeId;
+        let mut doc = Document::new(Project::from_template());
+        let level = doc.project.levels[0].id;
+        let wall_t = doc.project.default_type(Category::Wall).unwrap();
+        let partition = doc
+            .project
+            .types
+            .values()
+            .find(|t| t.category() == Category::Wall && t.layers().len() == 1)
+            .map(|t| t.id)
+            .unwrap();
+        let add = |doc: &mut Document, ty: ElementTypeId, a: (f64, f64), b: (f64, f64)| {
+            doc.edit("t", |e| {
+                let id = ElementId(e.alloc_id());
+                e.add_element(Element {
+                    id,
+                    level,
+                    type_id: ty,
+                    mark: String::new(),
+                    comments: String::new(),
+                    uid: Default::default(),
+                    kind: ElementKind::Wall(Wall {
+                        start: DVec2::new(a.0, a.1),
+                        end: DVec2::new(b.0, b.1),
+                        height: 3.0,
+                        ..Default::default()
+                    }),
+                    phase_created: Default::default(),
+                    phase_demolished: None,
+                    design_option: None,
+                    paints: Vec::new(),
+                });
+                id
+            })
+        };
+        let host = add(&mut doc, wall_t, (0.0, 0.0), (6.0, 0.0));
+        let branch = add(&mut doc, wall_t, (3.0, -4.0), (3.0, 0.0));
+        let geom = ModelGeometry::build(&doc.project);
+        let (h, b) = (&geom.walls[&host], &geom.walls[&branch]);
+        // The template's 15 cm wall: 2 cm plaster, 11 cm masonry, 2 cm plaster.
+        let (half, core) = (h.half, h.core.unwrap().0);
+        assert!((half - 0.075).abs() < 1e-9 && (core - 0.055).abs() < 1e-9, "{half} {core}");
+        // The branch's faces stop at the host's face, its core at the host's core.
+        assert!((b.end_ext.0 - (4.0 - half)).abs() < 1e-9, "{:?}", b.end_ext);
+        let (ul, ur) = b.core_ends[1].unwrap();
+        assert!((ul - (4.0 - core)).abs() < 1e-9 && (ur - (4.0 - core)).abs() < 1e-9, "{ul} {ur}");
+        let [gap] = h.layer_gaps.as_slice() else { panic!("{:?}", h.layer_gaps) };
+        assert!(gap.merge && (gap.v_face + half).abs() < 1e-9 && (gap.v_core + core).abs() < 1e-9, "{gap:?}");
+        assert!((gap.at_face.0 - (3.0 - core)).abs() < 1e-9 && (gap.at_face.1 - (3.0 + core)).abs() < 1e-9);
+
+        let d = plan(&doc.project, &geom, level, 1.2, false, 50);
+        let fills_at = |p: DVec2| -> Vec<ElementId> {
+            d.prims
+                .iter()
+                .filter_map(|prim| match prim {
+                    Prim::Fill { pts, element: Some(e), .. } if cc_geom::polygon::contains(pts, p) => Some(*e),
+                    _ => None,
+                })
+                .collect()
+        };
+        // In the host's plaster under the branch: the branch's masonry only.
+        assert_eq!(fills_at(DVec2::new(3.0, -0.065)), [branch]);
+        // Beside the branch's core the host's plaster runs on.
+        assert_eq!(fills_at(DVec2::new(3.065, -0.065)), [host]);
+        let crosses = |e: ElementId, p: DVec2| {
+            d.prims.iter().any(|prim| match prim {
+                Prim::Line { a, b, element: Some(id), .. } if *id == e => {
+                    let (ab, ap) = (*b - *a, p - *a);
+                    let t = ap.dot(ab) / ab.length_squared().max(1e-12);
+                    (0.0..=1.0).contains(&t) && (*a + ab * t).distance(p) < 1e-6
+                }
+                _ => false,
+            })
+        };
+        // No line along the host's core face where the cores meet; the
+        // branch's core faces run on to it.
+        assert!(!crosses(host, DVec2::new(3.0, -core)));
+        assert!(crosses(host, DVec2::new(1.0, -core)));
+        assert!(crosses(branch, DVec2::new(3.0 - core, -0.065)));
+
+        // A one-layer partition has no core to run through: it stops at the face.
+        let other = add(&mut doc, partition, (1.0, 4.0), (1.0, 0.0));
+        let geom = ModelGeometry::build(&doc.project);
+        assert!(geom.walls[&other].core.is_none() && geom.walls[&other].core_ends == [None, None]);
+        assert_eq!(geom.walls[&host].layer_gaps.len(), 1);
     }
 
     /// A half-circle wall: plans draw its faces as arcs (pickable as arcs),
@@ -691,6 +1485,8 @@ mod tests {
                 kind: ElementKind::Wall(wall),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             });
             w
         });
@@ -745,7 +1541,7 @@ mod tests {
             vec![3, 2, 6, 7],
             vec![2, 0, 4, 6],
         ];
-        let shape = ComponentShape::Mesh { vertices: (0..8).map(v).collect(), faces };
+        let shape = ComponentShape::Mesh { vertices: (0..8).map(v).collect::<Vec<_>>().into(), faces: faces.into() };
         let item = ComponentItem {
             name: "m".into(),
             shape,
@@ -753,6 +1549,7 @@ mod tests {
             in_plan: true,
             void: false,
             plan_only: false,
+            detail: Default::default(),
         };
         let id = doc.edit("t", |e| {
             let type_id = ElementTypeId(e.alloc_id());
@@ -773,6 +1570,7 @@ mod tests {
                 overrides: Default::default(),
                 properties: Vec::new(),
                 system: None,
+                ..Default::default()
             });
             e.add_element(Element {
                 id,
@@ -784,6 +1582,8 @@ mod tests {
                 kind,
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             });
             id
         });

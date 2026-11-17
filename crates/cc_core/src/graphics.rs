@@ -505,6 +505,15 @@ pub struct TemplateIncludes {
     /// The phase filter (not the phase: views of one template can show
     /// different phases).
     pub phase_filter: bool,
+    /// The detail level.
+    pub detail: bool,
+    /// The visual style.
+    pub visual_style: bool,
+    /// Plans: the underlay (other levels' plans drawn under them).
+    pub underlay: bool,
+    /// The design option shown of each set (off by default: views keep
+    /// their own choice).
+    pub design_options: bool,
 }
 
 impl Default for TemplateIncludes {
@@ -517,6 +526,10 @@ impl Default for TemplateIncludes {
             discipline: true,
             structural: true,
             phase_filter: true,
+            detail: true,
+            visual_style: true,
+            underlay: true,
+            design_options: false,
         }
     }
 }
@@ -542,6 +555,17 @@ pub struct ViewTemplate {
     pub structure_tags: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase_filter: Option<crate::PhaseFilterId>,
+    #[serde(default, skip_serializing_if = "crate::DetailLevel::is_medium")]
+    pub detail: crate::DetailLevel,
+    /// `None`: views keep the usual style of their kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_style: Option<crate::VisualStyle>,
+    /// Plans: other levels' plans drawn under them.
+    #[serde(default, skip_serializing_if = "crate::Underlay::is_empty")]
+    pub underlay: crate::Underlay,
+    /// The option shown of each design option set (sets left out: automatic).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub design_options: BTreeMap<crate::OptionSetId, crate::OptionId>,
 }
 
 fn default_cut() -> f64 {
@@ -565,6 +589,10 @@ impl ViewTemplate {
             structural: false,
             structure_tags: false,
             phase_filter: view.phase_filter,
+            detail: view.detail,
+            visual_style: view.visual_style,
+            underlay: view.kind.underlay().copied().unwrap_or_default(),
+            design_options: view.design_options.clone(),
         };
         match &view.kind {
             ViewKind::FloorPlan { cut_height, structural, structure_tags, mep, .. } => {
@@ -609,6 +637,20 @@ impl ViewTemplate {
         if inc.phase_filter {
             view.phase_filter = self.phase_filter;
         }
+        if inc.detail {
+            view.detail = self.detail;
+        }
+        if inc.visual_style {
+            view.visual_style = self.visual_style;
+        }
+        if inc.design_options {
+            view.design_options = self.design_options.clone();
+        }
+        if inc.underlay
+            && let Some(u) = view.kind.underlay_mut()
+        {
+            *u = self.underlay;
+        }
         match &mut view.kind {
             ViewKind::FloorPlan { cut_height, structural, structure_tags, mep, .. } => {
                 if inc.cut_height {
@@ -632,6 +674,7 @@ impl ViewTemplate {
         &mut self,
         filters: &BTreeMap<FilterId, ViewFilter>,
         phase_filters: &BTreeMap<crate::PhaseFilterId, crate::PhaseFilter>,
+        levels: &[crate::LevelId],
     ) -> usize {
         let mut n = self.graphics.repair(filters, Some(&|_| false));
         if self.phase_filter.is_some_and(|f| !phase_filters.contains_key(&f)) {
@@ -646,7 +689,7 @@ impl ViewTemplate {
             self.cut_height = 1.2;
             n += 1;
         }
-        n
+        n + self.underlay.repair(|l| levels.contains(&l))
     }
 }
 

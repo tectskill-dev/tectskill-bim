@@ -21,9 +21,11 @@ impl FontFile {
 /// Larger files are not fonts we want to hold in memory.
 const MAX_FONT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// One character of each script to cover: an ideograph ("中"), kana ("あ")
-/// and Hangul ("한").
-const PROBES: [char; 3] = ['\u{4E2D}', '\u{3042}', '\u{D55C}'];
+/// One character of each script to cover: a Simplified ideograph ("图")
+/// and its Traditional form ("圖"), so both Chinese interfaces find their
+/// glyphs even when the first font holds only one set, kana ("あ") and
+/// Hangul ("한").
+const PROBES: [char; 4] = ['\u{56FE}', '\u{5716}', '\u{3042}', '\u{D55C}'];
 
 /// The system's CJK fonts in fallback order (empty when there is none).
 pub fn cjk() -> &'static [FontFile] {
@@ -185,6 +187,29 @@ mod tests {
         if let Some(font) = lao().first().and_then(|f| f.font_ref()) {
             assert!(font.charmap().map(LAO_PROBE).is_some());
             assert_eq!(fallbacks().count(), cjk().len() + lao().len());
+        }
+    }
+
+    /// A system with CJK fonts draws every character of the Chinese
+    /// interfaces, Simplified and Traditional, and the Japanese one from them.
+    #[test]
+    fn chinese_interfaces_come_from_system_fonts() {
+        use skrifa::MetadataProvider;
+        let fonts: Vec<_> = cjk().iter().filter_map(|f| f.font_ref()).collect();
+        if fonts.is_empty() {
+            return;
+        }
+        for (name, source) in [
+            ("zh-CN", include_str!("../../../assets/i18n/zh-CN.ftl")),
+            ("zh-TW", include_str!("../../../assets/i18n/zh-TW.ftl")),
+            ("ja", include_str!("../../../assets/i18n/ja.ftl")),
+        ] {
+            let missing: std::collections::BTreeSet<char> = source
+                .chars()
+                .filter(|c| ('\u{4E00}'..='\u{9FFF}').contains(c))
+                .filter(|c| fonts.iter().all(|f| f.charmap().map(*c).is_none()))
+                .collect();
+            assert!(missing.is_empty(), "{name}: no system font has {missing:?}");
         }
     }
 }

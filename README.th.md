@@ -3,8 +3,9 @@
 โปรแกรม BIM (Building Information Modeling) ภาษาไทย ใช้ฟรีและเปิดซอร์สโค้ด
 สำหรับสถาปนิก นักออกแบบ และนักศึกษา
 
-TectSkill BIM พัฒนาต่อจาก [ConstructCAD](https://github.com/francisreboucas/constructcad)
-ของ Francis Rebouças โดยเพิ่มสิ่งที่จำเป็นสำหรับผู้ใช้ชาวไทย
+TectSkill BIM พัฒนาต่อจาก [ConstructCraft](https://github.com/francisreboucas/constructcraft)
+(เดิมชื่อ ConstructCAD) ของ Francis Rebouças โดยเพิ่มสิ่งที่จำเป็นสำหรับผู้ใช้ชาวไทย
+และติดตามรุ่นใหม่ของต้นฉบับอย่างต่อเนื่อง
 
 ## สิ่งที่เพิ่มจากต้นฉบับ
 
@@ -19,16 +20,20 @@ TectSkill BIM พัฒนาต่อจาก [ConstructCAD](https://github.co
 แล้วดับเบิลคลิกเพื่อติดตั้ง จะมีไอคอน TectSkill BIM ที่เดสก์ท็อปและเมนูเริ่ม
 หรือดาวน์โหลดไฟล์ `.zip` แล้วแตกไฟล์ เปิด `tectskill-bim.exe` ได้ทันทีโดยไม่ต้องติดตั้ง
 
-ไฟล์โครงการ `.ccad` ใช้รูปแบบเดียวกับ ConstructCAD เปิดสลับกันได้ และแลกเปลี่ยนกับโปรแกรม BIM อื่นผ่าน IFC
+เมื่อมีรุ่นใหม่ ปุ่ม อัปเดตเลย ในโปรแกรมจะดาวน์โหลดและติดตั้งรุ่นใหม่ของ TectSkill BIM ให้
+(ตรวจไฟล์กับ SHA256SUMS ก่อนติดตั้งทุกครั้ง)
+
+ไฟล์โครงการ `.ccad` ใช้รูปแบบเดียวกับ ConstructCraft เปิดสลับกันได้ และแลกเปลี่ยนกับโปรแกรม BIM อื่นผ่าน IFC
+นำเข้า DWG/DXF, SketchUp (.skp), OBJ และ glTF ได้ และส่งออก PDF, DXF, SVG และรูปภาพ
 
 ## สัญญาอนุญาตและเครดิต
 
-- TectSkill BIM และ ConstructCAD ใช้สัญญาอนุญาต [GPL-3.0-or-later](LICENSE)
+- TectSkill BIM และ ConstructCraft ใช้สัญญาอนุญาต [GPL-3.0-or-later](LICENSE)
   ซอร์สโค้ดทั้งหมดอยู่ที่ https://github.com/tectskill-dev/tectskill-bim
-- ต้นฉบับ ConstructCAD © Francis Rebouças
+- ต้นฉบับ ConstructCraft (เดิมชื่อ ConstructCAD) © Francis Rebouças
 - ฟอนต์ Inter © The Inter Project Authors และฟอนต์ Sarabun © Cadson Demak
   ใช้สัญญาอนุญาต SIL Open Font License 1.1 (`assets/fonts/`)
-- TectSkill BIM และ ConstructCAD เป็นโปรแกรมอิสระ ไม่มีส่วนเกี่ยวข้องกับ Autodesk
+- TectSkill BIM และ ConstructCraft เป็นโปรแกรมอิสระ ไม่มีส่วนเกี่ยวข้องกับ Autodesk
   Autodesk และ Revit เป็นเครื่องหมายการค้าของ Autodesk, Inc.
 
 ติดต่อ: tectskill@gmail.com

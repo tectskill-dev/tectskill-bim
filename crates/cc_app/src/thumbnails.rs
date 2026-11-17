@@ -36,9 +36,8 @@ pub fn sample_file(name: &str) -> Option<PathBuf> {
     Some(dir()?.join(format!("sample-{name}.png")))
 }
 
-/// Render `project` framed whole from its first 3D view's direction.
-fn render(project: &Project, rs: &egui_wgpu::RenderState) -> Option<Vec<u8>> {
-    let geom = cc_geom::ModelGeometry::build(project);
+/// Render `project`, whose model geometry is `geom`, framed whole from its first 3D view's direction.
+fn render(project: &Project, geom: &cc_geom::ModelGeometry, rs: &egui_wgpu::RenderState) -> Option<Vec<u8>> {
     geom.bounds()?;
     let mut camera = project
         .views
@@ -48,11 +47,11 @@ fn render(project: &Project, rs: &egui_wgpu::RenderState) -> Option<Vec<u8>> {
             _ => None,
         })
         .unwrap_or_default();
-    crate::view3d::fit_camera(&mut camera, &geom, SIZE[0] as f32 / SIZE[1] as f32);
+    crate::view3d::fit_camera(&mut camera, geom, SIZE[0] as f32 / SIZE[1] as f32);
     let mut renderer = cc_render::Renderer3D::new(&rs.device);
     renderer.upload(
         &rs.device,
-        &cc_render::SceneMesh::build_plain(&cc_render::Tessellation::new(&geom), &Default::default()),
+        &cc_render::SceneMesh::build_plain(&cc_render::Tessellation::new(geom), &Default::default()),
     );
     renderer.render_to_rgba(&rs.device, &rs.queue, SIZE, &camera)
 }
@@ -73,10 +72,15 @@ fn write_png(path: &Path, rgba: &[u8]) -> Result<(), Box<dyn std::error::Error>>
 pub fn process(state: &mut AppState, rs: &egui_wgpu::RenderState) {
     for job in std::mem::take(&mut state.thumbnail_jobs) {
         let (rgba, file) = match &job {
-            Job::Project(path) => (render(state.project(), rs), project_file(path)),
+            Job::Project(path) => {
+                // The open document's geometry is the session's, already current or rebuilt once.
+                let (project, geom) = state.session.project_and_geometry();
+                (render(project, geom, rs), project_file(path))
+            }
             Job::Sample(name) => {
                 let project = crate::home::sample_project(name);
-                (project.and_then(|p| render(&p, rs)), sample_file(name))
+                let rgba = project.and_then(|p| render(&p, &cc_geom::ModelGeometry::build(&p), rs));
+                (rgba, sample_file(name))
             }
         };
         let (Some(rgba), Some(file)) = (rgba, file) else { continue };

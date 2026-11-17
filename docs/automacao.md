@@ -2,17 +2,18 @@
 
 [English](automation.md)
 
-Tudo o que o ConstructCAD faz num modelo pode ser feito sem a interface. O **motor** (`cc_engine`) reúne as operações num catálogo de **comandos** nomeados, e três clientes usam esse mesmo catálogo:
+Tudo o que o ConstructCraft faz num modelo pode ser feito sem a interface. O **motor** (`cc_engine`) reúne as operações num catálogo de **comandos** nomeados, e três clientes usam esse mesmo catálogo:
 
 ```
                      ┌──────────────────────────────┐
   aplicativo     ──▶│                              │
   ccad (CLI)     ──▶│  cc_engine: Session +        │──▶ o modelo (.ccad)
   agentes (MCP)  ──▶│  catálogo de comandos        │
+  scripts Lua    ──▶│  (+ comandos de plugins)     │
                      └──────────────────────────────┘
 ```
 
-Uma parede desenhada com o mouse, um `ccad run wall_create …` e um agente de IA chamando a ferramenta `wall_create` executam o mesmo código, com os mesmos padrões, verificações e desfazer. A lista completa de comandos e parâmetros está na [referência de comandos](commands.md) (em inglês, gerada do próprio catálogo).
+Uma parede desenhada com o mouse, um `ccad run wall_create …`, um script Lua chamando `ccad.run("wall_create", …)` e um agente de IA chamando a ferramenta `wall_create` executam o mesmo código, com os mesmos padrões, verificações e desfazer. A lista completa de comandos e parâmetros está na [referência de comandos](commands.md) (em inglês, gerada do próprio catálogo); [plugins](#plugins) acrescentam seus próprios comandos ao catálogo.
 
 ## Conceitos
 
@@ -66,6 +67,65 @@ ccad -p casa.ccad run phases_list
 
 Cada planta, elevação, corte, vista 3D e tabela mostra o modelo na sua fase (`phase`) com um filtro de fases (`phase_filter`, ambos com `view_set`; modelos de vista controlam o filtro, não a fase). Em relação à fase da vista um elemento é *existente* (construído antes, de pé), *demolido* (nesta fase), *novo* (construído nesta fase) ou *temporário* (construído e demolido nela); elementos construídos depois ou demolidos antes não aparecem. Os filtros de fases (`phase_filters_list`, `phase_filter_create`, `phase_filter_set`, `phase_filter_delete`; o modelo traz *Mostrar tudo*, *Mostrar completo*, *Mostrar novo*, *Mostrar anterior + demolição*, *Mostrar anterior + novo*, *Mostrar fase anterior* e *Mostrar demolição + novo*) dizem, para cada situação, `not_displayed`, `by_category` ou `overridden`, que usa os gráficos da situação definidos no projeto (`phase_graphics_get`, `phase_graphics_set`: existente esmaecido, demolido tracejado e sem hachura de corte, temporário esmaecido e tracejado), abaixo das sobreposições de elementos e dos filtros de vista e acima da categoria. Uma vista cuja fase deixa elementos de fora tem geometria própria: portas de fases posteriores não abrem paredes existentes e paredes só se unem com paredes da fase. Um ambiente é delimitado pelas paredes de pé ao fim da fase em que é criado, então paredes demolidas nessa fase ou antes não o delimitam. Tabelas listam o que sua fase e seu filtro mostram e oferecem os campos `PhaseCreated` e `PhaseDemolished` (que também servem em regras de filtros, como `phase_created` e `phase_demolished`).
 
+**Organização do navegador de projeto.** O navegador de projeto agrupa as vistas apenas por tipo, a menos que um esquema esteja em uso. `browser_scheme_create` cria um esquema com nome (`group_by`: os critérios, do grupo mais externo para dentro, entre `view_type`, `level`, `discipline` e `phase`; padrão `["view_type", "level"]`) e o põe em uso, salvo com `use_it` falso; `browser_scheme_set` o renomeia ou muda os critérios, `browser_scheme_delete` o remove e `browser_scheme_use` escolhe o esquema que o navegador segue (sem `scheme`: o padrão). `browser_schemes_list` lista os esquemas, e `browser_tree` devolve a árvore que o navegador mostra — linhas de grupo com `group`, `name`, `value`, `views` e `children`, linhas de vista com `view` e `name` — para o esquema em uso, outro `scheme` ou qualquer `group_by`. Uma vista sem valor para um critério (um corte não tem nível) fica ao lado dos grupos daquele critério.
+
+**Opções de projeto.** Alternativas para uma parte do modelo ficam em conjuntos de opções (`options_list`): `option_set_create` cria um conjunto com as opções nomeadas em `options` (a primeira é a principal), e `option_create`, `option_set` (renomear, `primary: true`, mover com `index`), `option_delete` (não a principal; exclui os elementos da opção), `option_set_rename` e `option_set_delete` (com todos os elementos das suas opções) os gerenciam. Um elemento pertence ao modelo principal ou a uma opção (`design_option` em `element_get`); `elements_option_set` passa elementos para uma opção ou de volta com `null` (portas, janelas e outros hospedados seguem o hospedeiro; anotações não têm opção). Cada planta, elevação, corte, vista 3D e tabela mostra o modelo principal e uma opção por conjunto: `view_options_set` escolhe uma, ou `null` para automática (`design_options` em `view_get` mostra a escolha e o que aparece); modelos de vista podem controlá-la (`design_options` e `include.design_options` em `template_set`). Automática é a opção em edição quando ela está nesse conjunto (`option_active_set`, estado da sessão, não salvo: elementos novos do modelo entram nela), senão a principal. Elementos de opções que a vista não mostra ficam fora do seu desenho, tabela e geometria: paredes se unem e ambientes são delimitados só entre o que aparece junto. `option_accept_primary` passa os elementos da opção principal para o modelo principal e exclui o conjunto com as outras opções e seus elementos. A exportação IFC grava o modelo principal e só as opções principais, cada elemento de opção com `ConstructCAD_DesignOption` (`OptionSet`, `Option`, `Primary`), que a importação lê de volta como conjuntos e opções.
+
+```sh
+ccad -p casa.ccad --save run option_set_create name=Entrada 'options=["Varanda", "Marquise"]'
+ccad -p casa.ccad --save run elements_option_set 'ids=[31]' option="Entrada: Marquise"
+ccad -p casa.ccad --save run view_options_set view=Térreo set=Entrada option=Marquise
+```
+
+**Escalas.** A `scale` de uma vista é o denominador `N` de 1:`N`. `view_create`, `view_set`, `template_set` e `callout_create` também a aceitam como texto: `"1:50"` ou, em projetos imperiais, um rótulo como `"1/4\" = 1'-0\""` (48) ou `"1\" = 20'"` (240). `view_get` acrescenta `scale_text`, a escala como o projeto a escreve (`1:50`, ou `1/4" = 1'-0"` em projetos imperiais), e a escala padrão de uma chamada de detalhe num projeto imperial é uma escala imperial.
+
+**Sistemas de medida.** Os parâmetros e resultados dos comandos são SI, quaisquer que sejam as unidades do projeto (metros, metros quadrados e cúbicos, graus, quilogramas; inclinações em porcentagem quando o comando diz), assim como os arquivos, o IFC e o DXF; `project_info` informa o `system`. O que um comando escreve como texto segue o projeto: num projeto imperial, os tipos que ele cria sob demanda recebem nomes e medidas em polegadas redondas (`Rampa 4'-0"`, `Rodapé 4"`, `Eletrocalha 8"×4"`, `Condutor Ø3/8"`, tipos de porta `2'-8" x 6'-8"`, perfis `I 8"x8"x1/4"x3/8"`; padrões como alturas de parede e de pavimento, cotas de tubos e dispositivos, quedas de esgoto, cobrimento de armaduras e curvas de nível também são imperiais, como diz a descrição de cada parâmetro), as mensagens de verificação (`stair_check`, `ramp_check`) escrevem polegadas e inclinações por 12, e as tabelas (`schedule_table`, `schedule_export_csv`) escrevem `lb` e `lb/ft` para pesos, polegadas para espessuras, diâmetros e espelhos, e cabeçalhos sem unidades métricas. As seções de condutores continuam em mm².
+
+**Vistas de desenho.** `view_create` com `kind: "drafting"` cria uma vista 2D independente do modelo (categoria `drafting`, 1:10 a menos que `scale` diga outra coisa): ela não desenha a geometria do modelo, só os elementos colocados nela — `text_create`, `dimension_create` (e as formas em cadeia e ordenada), `cad_import` e `image_import` a aceitam como `view`. `view_get` mostra sua `scale` e `detail`, `view_set` os altera (ela não tem fase nem estilo visual) e `view_graphics_set` oculta ou sobrepõe suas categorias. Vai para folhas com `sheet_place_view` e é exportada com `view_export` (PNG, SVG, PDF, DXF) como as outras vistas; `view_delete` exclui o que foi desenhado nela.
+
+**Chamadas de detalhe e vistas de detalhe.** `callout_create` desenha uma chamada de detalhe numa planta, planta de forro, corte ou elevação (`parent`): `rect` são dois cantos opostos nas coordenadas de desenho da vista (metros; `y` é a altura em cortes e elevações). Ela cria uma vista de detalhe dessa região (chamada `Detalhe N` a menos que `name` diga outra coisa, na escala `scale`, por padrão uma escala usual cerca de cinco vezes maior que a da vista: 1:10 sob 1:50) do mesmo tipo da vista, que continua ligada ao modelo: segue o nível, a linha de corte ou a direção da vista mãe, mostra o modelo como ela (fase, nível de detalhe, estilo visual, gráficos) e é recortada pelo retângulo, e suas próprias linhas de detalhe, regiões, componentes de detalhe, textos e cotas são desenhados inteiros. Com `drafting`, a chamada aponta para essa vista de desenho existente (sem recorte; uma chamada por vista de desenho). A vista mãe desenha a chamada como um retângulo de cantos arredondados e uma marca: o número do detalhe na folha sobre o número da folha depois de colocado, senão a última palavra do nome sobre um traço. `view_get` mostra `crop` (`[[x mín, y mín], [x máx, y máx]]`) e `callout` (`parent`, `parent_name`, `rect`, `drafting`); `view_set` `crop` move ou redimensiona a chamada de uma vista de detalhe (são um só retângulo), recorta qualquer planta, corte ou elevação, ou com `null` volta a mostrar tudo (uma chamada precisa do seu retângulo); numa vista de desenho apontada por uma chamada, move essa chamada. `callouts_list` lista as chamadas desenhadas numa vista, `callout_remove` remove uma chamada e mantém a vista, `view_delete` de uma vista de detalhe remove sua chamada, e excluir a vista mãe deixa os detalhes como vistas recortadas comuns. As plantas não desenham a vista de detalhe de um corte ou elevação como outra marca de corte ou elevação. Arquivos cujas chamadas apontam para vistas inexistentes, ou cujos recortes não são retângulos válidos, são reparados ao abrir.
+
+```sh
+ccad -p casa.ccad --save run callout_create parent="Térreo" rect=[[2,3],[5,6]] scale=20
+```
+
+**Sol.** Plantas, plantas de forro, vistas 3D, elevações e cortes podem ter um sol: `view_set` `sun` recebe os campos a mudar (`null` o remove) e `view_get` os mostra com `derived`. `mode` é `still` (`date`, `time`), `single_day` (`date`, `from`, `to`, `sunrise_to_sunset`, `interval` de 15, 30 ou 45 minutos ou uma hora), `multi_day` (`from_date`, `to_date`, `from`, `to`, `sunrise_to_sunset`, `interval` também `day`, `week` ou `month`) ou `lighting` (`azimuth`, `altitude`, `relative_to_view`); todo modo tem `frame` (o quadro do estudo mostrado), `show_path`, `shadows` e `ground` (o nível que recebe as sombras). Datas são `AAAA-MM-DD` e horas `HH:MM`, locais do terreno; outro modo começa dos seus valores padrão e mantém a data, e um campo que o modo não tem é recusado. `derived` dá o azimute (horário a partir do norte verdadeiro) e a altura do quadro atual, sua data e hora, o nascer e o pôr do sol, o número de quadros e se o projeto tem localização (senão, o equador em Greenwich). `sun_position` responde para uma vista ou para qualquer `date` e `time` (opcionalmente em outra `latitude`, `longitude` e `utc_offset`), `sun_frames` lista os quadros de um estudo. Predefinições com nome guardam um modo: `sun_preset_save` (de uma `view` ou de um `sun`; `replace` para sobrescrever), `sun_presets_list`, `sun_preset_rename`, `sun_preset_delete`, e uma vista toma uma com `"sun": {"preset": "Verão"}`. `site_set` `utc_offset` define o fuso horário em relação ao UTC (horas, de -12 a 14; `null` para o fuso nominal da longitude, mostrado em `utc_offset_used`).
+
+```sh
+ccad -p casa.ccad --save run view_set view="3D 1" 'sun={"mode":"single_day","date":"2026-12-21","interval":"minutes_30","shadows":true}'
+```
+
+**Linhas de detalhe.** `detail_line_create` desenha linhas 2D próprias de uma vista numa planta, planta de forro, elevação, corte, legenda ou vista de desenho (`view`), nas coordenadas de desenho da vista em metros (como notas de texto e cotas): `curves` aceita as mesmas formas dos esboços (`line`, `arc` por `bulge` ou `through`, `circle`, `ellipse` ou parte dela, `rectangle`, `polygon`), cada curva um elemento (categoria `detailline`; uma polilinha são os seus segmentos), tudo num passo de desfazer, e `style` é um dos estilos de linha internos `thin` (padrão), `medium`, `wide`, `hidden`, `dashed`, `center` e `dotted`. Só a sua vista as desenha, por cima do modelo; `view_delete` as exclui com ela, e vistas 3D e a exportação IFC as deixam de fora. `element_get` mostra `params.curve` (a curva como `Line`, `Arc`, `Circle` ou `Ellipse`) e `params.style` (`{"BuiltIn": "Wide"}`), com os derivados `length` e `style_name`; `element_set` os altera (`"style": "hidden"` também vale). Os comandos genéricos as editam: `elements_move`, `elements_copy`, `elements_rotate`, `elements_mirror`, `elements_delete`, `trim_corner` (duas linhas de detalhe, que se encontram onde suas retas, círculos ou elipses se cruzam), `trim_extend` (até outra linha de detalhe ou a linha de uma parede, viga ou eixo), `element_split` e `element_offset` (arcos e círculos concêntricos; elipses não têm deslocamento). A exportação DXF as põe numa camada com o nome do seu estilo (`THIN`, `CENTER`…).
+
+```sh
+ccad -p casa.ccad --save run detail_line_create view=Térreo style=dashed 'curves=[{"kind":"circle","center":[2,3],"radius":0.5}]'
+```
+
+**Estilos de linha.** Além dos estilos internos, um projeto tem estilos de linha próprios (nome, espessura no papel em mm, cor, tracejado), guardados como configurações do projeto: `line_styles_list` lista os dois (internos pelo código, os do projeto pelo nome, com `weight`, `color`, `pattern` e `used_by`), `line_style_create` adiciona um (`name` único e diferente dos códigos internos, `weight` de 0,05 a 5 mm, padrão 0,25, `color` `[r, g, b]`, `pattern` `solid`, `dash`, `short_dash`, `dot` ou `dash_dot`), `line_style_set` o altera (as linhas desenhadas com ele acompanham) e `line_style_delete` o exclui, passando as linhas de detalhe e contornos de regiões que o usam para `replace_with` (padrão `thin`) no mesmo passo de desfazer. Onde um comando aceita um estilo de linha (`style` de `detail_line_create`, `boundary` de uma região, `element_set`) um estilo do projeto é nomeado como um interno; `params.style` então mostra `{"Project": <id>}`. Um arquivo cujas linhas usam um estilo que não existe mais recebe o estilo fino ao ser aberto.
+
+**Regiões preenchidas e de máscara.** `filled_region_create` desenha uma área 2D numa planta, planta de forro, elevação, corte, legenda ou vista de desenho (`view`), nas suas coordenadas de desenho em metros: as `curves` (como nos esboços) fecham laços, o maior é o contorno e os que estão dentro dele são aberturas, tudo num passo de desfazer. Ela é preenchida como o seu tipo diz e contornada no estilo de linha `boundary` (padrão `thin`; `none` para nenhum contorno); `type` escolhe um tipo de região preenchida, senão o primeiro do projeto, criado com a primeira região (linhas diagonais sobre branco). `filled_region_type_create` cria outro (padrões `foreground` e `background` — `none`, `solid`, `diagonal`, `diagonal_back`, `crosshatch`, `horizontal`, `vertical`, `grid`, `brick`, `concrete`, `sand`, `insulation`, `earth` — cada um com sua cor; um padrão `solid` preenche com a sua cor e um fundo `none` deixa o modelo visível entre as linhas do padrão); `type_set` altera o seu `fill`. `masking_region_create` desenha uma área branca opaca que esconde as linhas do modelo sob ela (sem contorno, a menos que `boundary` nomeie um estilo). As regiões são desenhadas só na sua vista, em ordem de id, por cima do modelo e sob as anotações da vista (linhas de detalhe, cotas, textos e, nas plantas, etiquetas, eixos e marcas de corte); vistas 3D e a exportação IFC as deixam de fora. `element_get` mostra `params` (`outline`, `openings`, `sketch`, `boundary`) com os derivados `area`, `perimeter` e `boundary_name`; `element_set` troca o tipo ou `"boundary": "wide"` / `"none"`; `sketch_get` e `sketch_set` leem e redesenham o contorno; os comandos de mover, copiar, girar, espelhar e excluir valem para elas, e `view_delete` as exclui com a sua vista. As exportações escrevem os preenchimentos: SVG, PDF e PNG como polígonos (uma região com aberturas como um só anel), DXF como triângulos `SOLID` e linhas do padrão numa camada com o nome do estilo do contorno (uma região sem contorno na da sua categoria, `FILLEDREGION` ou `MASKINGREGION`).
+
+```sh
+ccad -p casa.ccad --save run filled_region_create view=Térreo boundary=wide 'curves=[{"kind":"rectangle","corner":[0,0],"opposite":[4,3]}]'
+```
+
+**Componentes de detalhe.** Um componente de detalhe é um componente 2D reutilizável para detalhes construtivos (categoria `detailcomponent`, tipo de componente `Detail`): suas peças são as peças 2D dos carimbos — `stroke` (linhas e arcos por pontos, abertos ou fechados com `closed`, com espessura `weight` em milímetros de papel, `color`, tracejado `pattern` e, fechados, um preenchimento sólido `fill` ou um padrão) e `text` e `image` — mais peças `nested` que inserem outro componente de detalhe dentro dele (`component`, `x`, `y`, `rotation`, `scale`, `mirrored`), tudo em metros no seu próprio sistema (alturas de texto também) e como números ou expressões sobre os seus parâmetros. `detail_component_create` cria um como novo tipo chamado `name` (único entre tipos e componentes): a partir de `pieces`, ou de `elements` de uma vista `view` — linhas de detalhe mantêm a pena, regiões preenchidas e de máscara viram traços fechados com o seu preenchimento (aberturas como contornos), notas de texto viram textos na altura impressa (chamadas como linhas) e componentes de detalhe viram peças aninhadas — cujo ponto `origin` (padrão: o canto inferior esquerdo da sua extensão) vira a origem do componente; com `replace` (padrão true) esses elementos são excluídos e o componente é inserido onde estavam (`placed`), tudo num passo de desfazer. `detail_component_place` insere um tipo numa planta, planta de forro, elevação, corte, legenda ou vista de desenho (`view`): a origem em `position`, girado `rotation` graus, com tamanho `scale` (0,0001 a 10000) e, com `mirrored`, espelhado antes no próprio eixo X. Só essa vista o desenha, por cima do modelo e das regiões e sob as linhas de detalhe e anotações; `view_delete` o exclui com a vista, e vistas 3D e IFC o deixam de fora. `element_get` mostra `params` (`view`, `position`, `rotation_deg`, `scale`, `mirrored`, `overrides`) com os derivados `component`, `pieces` e `nested`; `element_set` os altera (menos a vista); os comandos de mover, copiar, girar, espelhar e excluir valem para ele. `component_sheet_piece_add`, `component_sheet_piece_set` e `component_sheet_piece_delete` editam as peças de um componente de detalhe (todos os inseridos acompanham), `component_param_*` os parâmetros. Uma peça aninhada nomeia um componente (usa os valores de parâmetro do primeiro tipo dele); nomear um que contém este componente (um ciclo) é recusado, e o desenho para em 8 níveis de aninhamento e num limite de peças de qualquer forma. `component_save` grava no arquivo `.ccomp` também os componentes aninhados, e `component_load` adiciona os que o projeto não tem; `component_library_list` lista componentes de detalhe com `kind` `Detail` e `category` `detail_component`. `cad_import` com `blocks: true` traz os blocos de um DWG ou DXF como componentes de detalhe em vez de explodi-los: cada bloco inserido por translação, rotação, escala uniforme ou espelhamento vira um tipo com o seu nome (os seus próprios blocos inseridos como peças aninhadas, referências que fechariam um ciclo descartadas), cada inserção desse tipo no desenho vira um componente de detalhe inserido, e o resto (outras inserções, cotas, entidades soltas) fica no desenho importado; o resultado lista os novos `components.types` e `components.elements`. A exportação DXF (`view_export`) grava os componentes de detalhe de uma vista como blocos (um por componente; um inserido com valores de parâmetro próprios tem o seu) e `INSERT`s na camada `DETAILCOMPONENT`, os aninhados como inserções dentro dos seus blocos.
+
+```sh
+ccad -p casa.ccad --save run detail_component_create name=Tijolo 'pieces=[{"kind":"stroke","closed":true,"fill":[200,80,60],"points":[{"u":0,"v":0},{"u":0.2,"v":0},{"u":0.2,"v":0.1},{"u":0,"v":0.1}]}]'
+ccad -p casa.ccad --save run detail_component_place type=Tijolo view="Vista de desenho 1" position=[1,2] rotation=90
+ccad -p casa.ccad --save run cad_import path=detalhes.dwg view="Vista de desenho 1" blocks=true
+```
+
+**Desenhos CAD importados.** `cad_import` lê um arquivo DWG (R12 até 2018 e posteriores, pela biblioteca acadrust) ou DXF (ASCII ou binário, lido pelo próprio ConstructCraft) para uma planta, planta de forro, elevação, corte, legenda ou vista de desenho, num passo de desfazer, e informa o que leu: `format`, `version`, `units` (e `units_assumed`), `layers`, `entities`, `blocks`, `primitives`, `skipped` (entidades não desenhadas, por tipo), `truncated` e a extensão na vista (`extents`). Blocos são inseridos (aninhados, escalados, girados, em matriz), arcos e círculos continuam arcos, elipses, splines e contornos de hachuras viram polilinhas, textos e MTEXT mantêm posição, altura e rotação; sólidos 3D, imagens, linhas infinitas e entidades parecidas são ignorados. `position` com `align` posiciona a origem do desenho (`origin`, o padrão), o centro da sua extensão (`center`) ou a origem, a menos que fique a mais de 1 km do conteúdo da vista (`auto`); `units` substitui as do arquivo (`mm`, `cm`, `dm`, `m`, `km`, `in`, `ft`, `yd`, `mi`), e arquivos sem unidades são lidos em metros quando pequenos, senão em milímetros. O elemento começa fixado e só a sua vista o desenha, sob o modelo (categoria `cadimport`; vistas 3D e exportação IFC o deixam de fora). `element_get` mostra o posicionamento em `params` (`units`, `scale`, `position`, `rotation_deg`, `mirrored`, `hidden_layers`, `color_mode` `Grey`/`Layers`/`Black`, `halftone`), mas não o desenho; `element_set` os altera; os comandos de mover, girar, espelhar, fixar e excluir valem para ele. `cad_layers` lista as camadas e `cad_layers_set` as mostra ou oculta. `cad_explode` o transforma em elementos nativos da sua vista num passo de desfazer: linhas, polilinhas (segmentos com bulge como arcos), arcos e círculos viram linhas de detalhe, um elemento por segmento (elipses, splines e contornos de hachuras, guardados como polilinhas, saem como seus segmentos); preenchimentos viram regiões preenchidas sem contorno, de um tipo de região preenchida sólido da cor do preenchimento (chamado *Sólido #RRGGBB*, reaproveitado quando um já preenche com essa cor); textos de uma linha viram notas de texto no mesmo lugar, altura, rotação e alinhamento, de um tipo de texto do seu tamanho no papel na escala da vista (reaproveitado quando um tem esse tamanho). Cada camada vira um estilo de linha do projeto com o nome e a cor da camada (cores claras escurecidas para o papel), reaproveitado quando já existe um estilo com esse nome; camadas ocultas no elemento ficam de fora (ele começa com as desligadas ou congeladas no arquivo ocultas), e o posicionamento é aplicado. Imagens continuam no elemento (sem as outras primitivas); sem elas o elemento é excluído. O modo de cor e o meio-tom não são levados. O resultado lista os elementos criados (`created`), as contagens `detail_lines`, `filled_regions` e `texts`, os novos `line_styles` e `types`, `kept` (o elemento quando as imagens ficam) e as primitivas ignoradas (`skipped`: pequenas demais ou fora dos limites); um desenho que geraria mais de 100.000 elementos, ou acrescentaria mais de 1.000 tipos, é recusado. Com `cad_import` `blocks: true` os blocos já são componentes de detalhe, e explodir os deixa como estão.
+
+```sh
+ccad -p casa.ccad --save run cad_import path=levantamento.dwg view=Térreo align=auto
+ccad -p casa.ccad --save run element_set id=120 'params={"units": "Centimeters", "halftone": true}'
+ccad -p casa.ccad --save run cad_layers_set id=120 'layers=["COTAS", "TEXTOS"]' visible=false
+ccad -p casa.ccad --save run cad_explode id=120
+```
+
 **Validação e desfazer.** Cada edição é um passo de desfazer (`undo`, `redo`). Uma edição que deixaria o modelo inválido — uma porta numa parede inexistente, uma medida negativa, uma referência a nada — é recusada sem deixar rastro. Elementos fixados não são movidos, aparados nem excluídos.
 
 **Erros.** Um comando que falha devolve `{"error": {"code": …, "message": …}}`, com a mensagem no idioma da sessão (`--lang`, `language_set`).
@@ -78,6 +138,7 @@ Cada planta, elevação, corte, vista 3D e tabela mostra o modelo na sua fase (`
 | `rejected` | a edição deixaria o modelo inválido ou não é permitida (fixado, em uso…) |
 | `io` | falha ao ler ou gravar um arquivo |
 | `internal` | um defeito; o projeto fica como estava |
+| `script` | um script ou plugin Lua falhou: erro de sintaxe ou de execução, ou um limite atingido |
 
 ## Linha de comando: `ccad`
 
@@ -88,14 +149,21 @@ ccad [opções] commands             lista os comandos
 ccad [opções] schema <comando>     o esquema JSON dos parâmetros de um comando
 ccad reference                     a referência de comandos em Markdown
 ccad [opções] run <comando> [args] executa um comando
-ccad [opções] script <arquivo|->   executa um script de comandos
+ccad [opções] script <arquivo|-> [level=<id|nome>]
+                                   executa um script de comandos
+ccad [opções] lua <arquivo|-> [args] executa um script Lua
+ccad [opções] plugins              lista os plugins carregados com --plugins
+ccad plugins install <zip> <pasta>  instala um arquivo de plugin numa pasta de plugins
+ccad plugins remove <id> <pasta>    remove um plugin instalado
 ccad [opções] mcp                  serve os comandos por MCP (stdio)
 
 -p, --project <arquivo>   abre um projeto antes (.ccad, ou .ifc para importar)
 --save                    salva o projeto no fim (no próprio arquivo)
 --save-as <arquivo>       salva o projeto no fim em <arquivo>
+--plugins <pasta>         carrega o plugin da <pasta>, ou cada plugin das suas
+                          subpastas (pode repetir)
 --lang <código>           idioma dos nomes padrão e mensagens (também CCAD_LANG):
-                          en, pt-BR, es, fr, de, it, lo, pl, uk-UA ou zh-TW
+                          en, pt-BR, es, fr, de, it, lo, pl, uk-UA, zh-TW, zh-CN ou ja
 ```
 
 Os argumentos de `run` podem ser um objeto JSON, `@arquivo.json`, `-` (entrada padrão) ou pares `chave=valor`, cujos valores são lidos como JSON quando possível e como texto caso contrário:
@@ -108,6 +176,7 @@ ccad -p casa.ccad --save run view_set '{"view": "Corte 1", "scale": 100}'
 ccad -p modelo.ifc --save-as modelo.ccad run project_info          # importa um IFC
 ccad -p casa.ccad run sheet_export sheet=A101 path=a101.pdf
 ccad -p casa.ccad run view_export view="Corte 1" path=corte.png dpi=300     # qualquer vista em PNG, SVG ou PDF
+ccad -p casa.ccad run view_export view="Térreo" path=terreo.dxf             # ou em DXF, em tamanho real em mm
 ```
 
 Os resultados saem como JSON na saída padrão. Erros vão para a saída de erro como JSON, com código de saída 1; erros de uso saem com 2. Sem `--save` ou `--save-as`, o arquivo do projeto não muda.
@@ -138,15 +207,455 @@ Um script é uma lista de passos: um array JSON de objetos `{"command": …, "ar
 ccad --save-as casa.ccad script examples/small_house.ccmacro
 ```
 
-Scripts não têm variáveis: um passo não usa o id criado por um passo anterior. Os comandos ajudam aceitando posições onde isso importa (`door_create` e `window_create` encontram a parede mais próxima de `point`; pisos, forros e telhados acompanham as paredes com `from_walls`). Para lógica entre passos, chame `ccad run` a partir de um script de shell ou use um agente via MCP.
+### Contornos desenhados com curvas
+
+Pisos, forros, telhados, radiers e massas recebem o contorno como `curves` em vez de pontos: linhas, arcos (por `bulge` ou por um ponto `through` por onde passam), círculos, elipses (inteiras ou parte delas), retângulos e polígonos regulares (estes dois viram linhas). Laços dentro do contorno são aberturas de pisos e telhados. O elemento guarda as curvas: `sketch_get` as devolve (ou linhas ao longo do contorno de um elemento desenhado por pontos) e `sketch_set` desenha o contorno de novo; mover, girar e espelhar o elemento leva as curvas junto, e editar diretamente os pontos do contorno as descarta.
+
+```text
+{"command": "mass_create", "args": {"curves": [{"kind": "circle", "center": [0, 0], "radius": 5}], "height": 9}}
+{"command": "floor_create", "args": {"curves": [{"kind": "rectangle", "corner": [0, 0], "opposite": [10, 8]}, {"kind": "circle", "center": [5, 4], "radius": 1}]}}
+```
+
+### Terreno
+
+`topography_create` cria uma superfície de terreno a partir de pontos medidos `[x, y, z]` (cotas acima do nível) dentro de um contorno `boundary` ou `curves`; sem nenhum dos dois, o contorno convexo dos pontos o limita. Os vértices do contorno recebem as cotas que os pontos lhes dão, e a terra fecha até uma base plana `base_depth` (2 m por padrão) abaixo do ponto mais baixo, então os cortes a cortam como um sólido. `element_get` mostra as cotas mínima e máxima, a base, a área, o volume e os avisos (`few-points`, `collinear`, `boundary-crossing`) em `derived.topography`. `topography_points_set` substitui os pontos ou altera, remove e adiciona pontos pelo índice; `sketch_set` redesenha o contorno e, com `points`, substitui os pontos no mesmo passo. Um tipo de terreno define o material da terra e o intervalo e as mestras das curvas de nível (`topography_type_create`, `type_set`).
+
+```text
+{"command": "topography_create", "args": {"points": [[0, 0, 0], [20, 0, 2], [20, 10, 2.5], [0, 10, 0.5], [10, 5, 1.2]]}}
+```
+
+`pad_create` conforma um platô num terreno: uma área plana na cota `elevation` (metros acima do nível do terreno) dentro de um contorno `outline` ou `curves`, com talude de corte onde o terreno fica acima dele e talude de aterro onde fica abaixo, cada um descendo até o terreno natural. As inclinações são a distância horizontal por unidade de altura (`cut_slope` 1 é 1:1, `fill_slope` 1,5 é 1:1,5); sem elas, o platô usa as do seu tipo (`pad_type_create`, `type_set`). O terreno `host`, por padrão, é aquele cujo contorno contém o centro do platô. O platô fica no nível do terreno, move-se com ele e é excluído com ele; os platôs de um terreno se aplicam na ordem de criação. `element_get` mostra o `cut` (corte), o `fill` (aterro), o `net` (aterro − corte), a `area` e os avisos (`off-terrain`, `coarse`, `failed`) de um platô em `derived.pad`, e o `derived.topography` de um terreno soma o `cut` e o `fill` dos seus platôs. As tabelas de platôs têm `Elevation`, `CutVolume` e `FillVolume`, que somam como volumes.
+
+```text
+{"command": "pad_create", "args": {"outline": [[6, 3], [14, 3], [14, 8], [6, 8]], "elevation": 1.2}}
+```
+
+### Cortinas de vidro
+
+Uma cortina de vidro é uma parede cujo tipo tem uma grade de cortina em vez de camadas: linhas verticais ao longo da parede e horizontais a partir da base (a uma distância fixa, em um número de divisões ou com um espaçamento máximo, justificadas no início, no centro ou no fim), um painel em cada célula (vidro, cego, vazio ou um componente, como uma porta) e montantes nas linhas e em volta da borda. `curtain_type_create` cria o tipo e `wall_create` posiciona paredes dele, retas ou em arco (painéis planos ao longo do arco). Cada parede pode ajustar a sua grade: `curtain_grid_set` acrescenta, move e remove linhas e remove trechos delas (as células vizinhas viram um só painel), `curtain_panel_set` troca painéis e `curtain_get` lista linhas e painéis. Uma cortina desenhada dentro de outra parede abre essa parede onde está. Tabelas de paredes têm `PanelCount`, `GlazedArea` e `MullionLength`. A exportação IFC as grava como `IfcCurtainWall` feitas de `IfcPlate` e `IfcMember`, e a importação as traz de volta com a grade; uma cortina de outro programa volta como cortina quando os painéis formam uma grade simples, senão como objetos separados.
+
+```text
+{"command": "curtain_type_create", "args": {"name": "Vitrine", "curtain": {"vertical": {"spacing": 1.2}, "horizontal": {"layout": "FixedNumber", "count": 2}}}}
+{"command": "wall_create", "args": {"start": [2, 0], "end": [6, 0], "type": "Vitrine", "height": 2.8}}
+```
+
+### Eletrocalhas e registros
+
+`cable_tray_create` desenha um trecho de eletrocalha como `conduit_create` (com `circuits`, `offset`, `end_offset`); um projeto sem tipo de eletrocalha ganha um (200 × 100 mm, leito), e `cable_tray_type_create` cria outros (`width`, `height`, `style`: `ladder`, `solid_bottom` ou `perforated`). Eletrocalhas só se ligam a outras eletrocalhas, e as curvas e tês entre elas aparecem em `mep_fittings`. `valve_place` coloca um registro num tubo, num `point` perto dele ou a uma `distance` ao longo dele, de um `type` ou de uma função `kind` (`gate`, `ball`, `check`, `globe`; um tipo dessa função é criado quando não há); `valve_type_create` cria tipos de várias funções (`kinds`) de uma vez. O registro tem o diâmetro e o sistema do seu tubo, é um nó da rede e acompanha o tubo; `element_get` mostra `derived.point`, `kind` e `diameter`, e `element_set` o desloca ao longo do tubo (`params.at`).
+
+```text
+{"command": "cable_tray_create", "args": {"start": [0, 0], "end": [6, 0], "circuits": ["1"]}}
+{"command": "valve_place", "args": {"pipe": 42, "distance": 0.5, "kind": "ball"}}
+```
+
+### SPDA e cabeamento estruturado
+
+`lps_conductor_create` desenha um condutor de SPDA de `start` a `end` (sobre a superfície da cobertura sob as pontas, salvo `offset`/`end_offset`), ou uma descida da cobertura sobre `start` até 0,5 m abaixo do nível quando não há `end`; `role` (`air`, `down`, `earth`) tem padrão pelo lugar onde ele passa. `earth_ring_create` lança condutores enterrados em volta das paredes do nível (ou de `points`), `air_terminal_place` põe um captor de altura `height` na cobertura sob `position`, e `earth_electrode_place` crava uma haste de comprimento `length` abaixo do nível. Eles entram no primeiro sistema de SPDA (`system_create` com `kind: "lightning"`), criado com o primeiro deles. `lps_check` (`class` de `I` a `IV`) amostra as coberturas e informa quantos pontos a captação protege, pelos métodos da esfera rolante e da malha, com os pontos desprotegidos; `systems_list` dá os captores, as hastes e os comprimentos de condutor por função de cada SPDA.
+
+`rack_place` insere um rack e cria o seu sistema de dados (`kind: "data"`, com o rack como `panel` e o código da marca do rack); `data_outlet_place` insere tomadas cabeadas até um `rack` (ou um `system` de dados) com `ports` conectores; `cabling_list` dá por rack as tomadas, os cabos, o comprimento estimado de cada um e os cabos acima de 90 m. `device_type_create` dá ao projeto um tipo de dispositivo embutido (`data_outlet`, `rack`, `air_terminal`, `earth_electrode` ou qualquer dispositivo elétrico). Eletrodutos e eletrocalhas levam sistemas de dados como os circuitos.
+
+```text
+{"command": "earth_ring_create", "args": {}}
+{"command": "lps_conductor_create", "args": {"start": [0, 4], "end": [10, 4]}}
+{"command": "air_terminal_place", "args": {"position": [5, 4], "height": 2}}
+{"command": "lps_check", "args": {"class": "II"}}
+{"command": "rack_place", "args": {"position": [0, 0]}}
+{"command": "data_outlet_place", "args": {"position": [8, 3], "rack": 120, "ports": 2}}
+```
+
+### Perfis estruturais
+
+Tipos de pilar e de viga são desenhados e construídos com um perfil estrutural: uma forma paramétrica padrão (`i`, `channel`, `rect_tube`, `cold_lipped_u`, `rect`…) de um material (`steel`, `cold_formed`, `timber`, `concrete`), ou um esboço. `profile_catalog` lista as séries embutidas (W, HP, IPE, HEA, HEB, perfis formados a frio da NBR 6355, madeira serrada, MLC, SHS, RHS, CHS) e, com `series` (e `search`), suas linhas; `profile_import` copia linhas para o projeto como perfis que lembram sua origem no catálogo (`on_clash`: `keep` mantém o perfil existente, o padrão, ou `rename`). `profile_type_create` cria um tipo de pilar ou de viga de um perfil, com um material da sua classe; `type_set` muda o `profile` de um tipo (um nome, ou `null` para a seção própria), `profile_rotation_deg` e `profile_mirror`. `profile_create`, `profile_set`, `profile_duplicate` e `profile_delete` (`replace_with`) editam perfis, e os tipos que os usam acompanham; `profile_get` dá o contorno e as propriedades da seção, `element_get` a `derived.section` de um pilar ou viga (área, massa por metro, momentos de inércia e módulos resistentes) e `analytical_model` a seção de cada barra.
+
+```text
+{"command": "profile_import", "args": {"series": "IPE", "designations": ["IPE 200"]}}
+{"command": "profile_type_create", "args": {"profile": "IPE 200", "category": "beam"}}
+{"command": "beam_create", "args": {"type": "IPE 200", "start": [0, 0], "end": [6, 0]}}
+{"command": "profile_set", "args": {"profile": "IPE 200", "name": "IPE 200 (cobertura)"}}
+{"command": "profile_get", "args": {"profile": "IPE 200 (cobertura)"}}
+{"command": "profiles_list", "args": {"material": "steel"}}
+```
+
+### Estrutura por material e pórticos por grade
+
+`structural_type_for` (`category` pilar ou viga, `material` concrete, steel ou timber) devolve o primeiro tipo desse material, ou cria um padrão do catálogo. `grid_frame_create` coloca pilares em cada pavimento de uma faixa de níveis e vigas nos níveis superiores sobre as grades (`grids` padrão todas, `base_level`/`top_level` padrão os dois primeiros níveis, `column_type`/`beam_type` ou um `material`), com vigas secundárias opcionais em cada vão, num só passo de desfazer (no máximo 2000 elementos); devolve os ids e o número de pulados.
+
+```text
+{"command": "grid_frame_create", "args": {"base_level": "Térreo", "top_level": "Cobertura", "material": "steel", "secondary": {"parallel_to": 12, "spacing": 2.5}}}
+```
+
+`steel_building_create` cria um galpão metálico paramétrico: pórticos de pilares e vigas de cobertura em `bays` módulos, com terças e longarinas (`null` desliga uma delas), como pilares e vigas comuns num só passo de desfazer; os tipos padrão são o `W310x38,7` do catálogo. Os elementos são regenerados, mantendo seus ids, quando `element_set` muda os parâmetros do galpão; um elemento editado ou excluído diretamente fica desvinculado e não é mexido. Os elementos acompanham as fases e a opção de projeto do galpão, e uma cópia ou colagem faz os seus próprios. `element_get` lista `derived.members`, `detached` e `at_limit` (o arranjo chegou ao limite de elementos e deixou de fora as últimas terças ou longarinas).
+
+```text
+{"command": "steel_building_create", "args": {"span": 24, "eave_height": 7, "bays": 8, "roof": "mono", "girts": null}}
+{"command": "element_set", "args": {"id": 42, "params": {"span": 30}}}
+```
+
+`truss_create` cria uma treliça paramétrica: um elemento hospedeiro cujos banzos, diagonais e montantes são vigas e pilares comuns, feitos num só passo de desfazer e devolvidos como `{id, members}`. `shape` é `flat`, `mono` ou `gable`; `pattern` é `pratt`, `howe`, `warren` ou, nas de duas águas, `kingpost`, `queenpost` e `fink`; `copies` treliças ficam a `spacing` de distância à esquerda da linha do vão; `material` (`steel` ou `timber`) escolhe as linhas do catálogo dos tipos padrão (concreto é recusado). Como no galpão metálico, os elementos são regenerados, mantendo seus ids, quando `element_set` muda os parâmetros, e um elemento editado ou excluído diretamente fica desvinculado.
+
+```text
+{"command": "truss_create", "args": {"start": [0, 0], "end": [12, 0], "height": 2, "shape": "gable", "pattern": "fink", "panels": 6, "copies": 5, "spacing": 1.2, "material": "timber"}}
+{"command": "element_set", "args": {"id": 42, "params": {"panels": 8}}}
+```
+
+`connections_create` coloca ligações de aço e madeira: `kind` é `base_plate` (em pilares), `end_plate`, `fin_plate`, `timber_bolts` ou `hanger` (em vigas); `members` os lista, senão `level` (por padrão o nível ativo) pega todos os seus pilares ou vigas. Só as extremidades que servem ao tipo ganham uma, as que já têm uma são puladas, e o resultado é `{created, skipped}` num só passo de desfazer. `params` muda os tamanhos padrão do tipo (metros; `thickness`, `width` e `length`, com 0 valendo a partir da seção, `bolt_diameter`, `rows`, `columns`, `spacing`, `edge`, `anchor_length`). Depois, `element_set` edita os tamanhos, não o elemento, a extremidade nem o tipo. As tabelas têm os campos `ConnectionKind`, `PlateMass` (kg), `BoltCount` e `BoltDiameter`.
+
+```text
+{"command": "connections_create", "args": {"kind": "end_plate", "members": [12, 13], "params": {"rows": 3, "bolt_diameter": 0.02}}}
+{"command": "element_set", "args": {"id": 42, "params": {"params": {"thickness": 0.02}}}}
+```
+
+`wall_framing_create` estrutura paredes retas em light steel frame ou madeira: um elemento de ossatura por parede, dono de pilares comuns (montantes, montantes duplos, montantes curtos) e vigas (guias ou soleiras, vergas, contravergas, bloqueadores), feitos num só passo de desfazer e devolvidos como `{framings: [{id, wall, members}]}`. `system` é `light_steel` (padrão) ou `wood`; `spacing` é o espaçamento dos montantes em metros (0,2 a 1,2; 0,4 e 0,6 por padrão); `stud_type`, `track_type` e `header_type` aceitam id ou nome (padrão: os tipos do catálogo do sistema); `double_top` (madeira) e `blocking` são booleanos. Paredes curvas e já estruturadas são recusadas antes de qualquer alteração. Os elementos são regenerados, mantendo seus ids, quando `element_set` muda os parâmetros da ossatura ou quando a parede, suas portas ou janelas mudam; um elemento editado ou excluído diretamente fica desvinculado. As guias e soleiras padrão são as linhas do catálogo giradas 90 graus, deitadas (a largura da seção é a sua altura); um tipo dado é usado como desenha. A ossatura e seus elementos acompanham as fases, a opção de projeto e o nível da parede. Montantes não são unidos onde uma abertura chega à ponta da parede, onde duas aberturas ficam a menos de uns quatro montantes uma da outra, nem no canto entre duas paredes estruturadas; dividir uma parede estruturada reestrutura só a parte que fica com a ossatura.
+
+```text
+{"command": "wall_framing_create", "args": {"walls": [12, 13], "system": "wood", "blocking": true}}
+{"command": "element_set", "args": {"id": 42, "params": {"spacing": 0.4}}}
+```
+
+`beam_create` desenha uma viga em arco com `mid` (um ponto do arco), `bulge` ou `radius` (positivo no sentido anti-horário; `major_arc` escolhe o arco maior), como `wall_create` desenha paredes em arco; `element_get` devolve então `center`, `radius`, `sweep` e o `true_length` ao longo do arco. `rebar_create` arma uma viga ou pilar: `top`, `bottom` (vigas) ou `perimeter` (pilares) com um `count`, `sides` (barras de pele nas duas faces laterais de uma viga: um `count` por face, ou um `spacing` ao longo da altura) e `stirrups` a cada `spacing`. Em uma viga em arco as barras seguem o arco, cada uma com o comprimento do arco no seu raio, e os estribos são radiais. As barras que não cabem lado a lado vão para uma segunda camada, e as barras ao longo de uma viga mais compridas que `max_length` (padrão 12 m; 0 para barras inteiras) são emendadas com traspasse `lap` (padrão 40 diâmetros), com as emendas vizinhas defasadas.
+
+```text
+{"command": "beam_create", "args": {"start": [2.5, 0], "end": [0, 2.5], "radius": 2.5}}
+{"command": "rebar_create", "args": {"host": 42, "layout": "bottom", "count": 6}}
+{"command": "rebar_create", "args": {"host": 42, "layout": "sides", "spacing": 0.15}}
+{"command": "rebar_create", "args": {"host": 42, "layout": "stirrups", "spacing": 0.12}}
+```
+
+Um pilar que continua uma parede cilíndrica tem um perfil `annular_sector`; `rebar_create` recebe então as barras face a face (as faces são listadas, em ordem, no `derived.faces` do pilar), estribos que seguem o contorno, grampos e lances:
+
+```text
+{"command": "profile_create", "args": {"name": "P1", "material": "concrete", "shape": "annular_sector", "params": {"r_in": 2.0, "r_out": 2.2, "sweep": 30}}}
+{"command": "profile_type_create", "args": {"profile": "P1", "category": "column"}}
+{"command": "column_create", "args": {"type": "P1", "position": [0, 2.1]}}
+{"command": "rebar_create", "args": {"host": 42, "layout": "perimeter", "faces": [7, 3, 7, 3], "same_type": true}}
+{"command": "rebar_create", "args": {"host": 42, "layout": "stirrups", "spacing": 0.15}}
+{"command": "rebar_create", "args": {"host": 42, "layout": "ties", "spacing": 0.30}}
+```
+
+`wall_rebar_create` arma paredes, retas ou em arco: barras horizontais (de anel) com um espaçamento ou `zones` por altura, barras verticais com pontas dobradas e conjuntos adicionais, e grampos, junto às duas faces com um cobrimento para cada. Uma parede cilíndrica recebe as suas quatro famílias de barras em um comando:
+
+```text
+{"command": "wall_rebar_create", "args": {"walls": [12, 13], "cover_exterior": 0.03, "cover_interior": 0.04, "horizontal": {"type": "Barra Ø 10,0 mm", "zones": [{"up_to": 2, "spacing": 0.10}, {"up_to": 4, "spacing": 0.12}, {"up_to": 6, "spacing": 0.15}]}, "vertical": {"spacing": 0.20, "bottom": {"across": 0.12, "along": 0.60}}, "max_length": 5}}
+{"command": "wall_rebar_create", "args": {"walls": [12, 13], "vertical": {"spacing": 0.20, "offset": 0.10, "to": 1.5}}}
+{"command": "wall_rebar_create", "args": {"walls": [12, 13], "ties": {"every_horizontal": 1, "every_vertical": 2}}}
+```
+
+`slab_rebar_create` arma pisos e radiers de qualquer contorno: uma malha, ou barras de anel e radiais, recortadas pelo contorno verdadeiro e em volta das aberturas, com reforço de aberturas. Uma laje circular com tampa de inspeção, armada em cima e embaixo:
+
+```text
+{"command": "floor_create", "args": {"structural": true, "curves": [{"kind": "circle", "center": [0, 0], "radius": 2.0}, {"kind": "rectangle", "corner": [-0.3, -0.3], "opposite": [0.3, 0.3]}]}}
+{"command": "slab_rebar_create", "args": {"slabs": [42], "type": "Barra Ø 8,0 mm", "spacing": 0.15, "cover": 0.03}}
+{"command": "slab_rebar_create", "args": {"slabs": [42], "layout": "radial", "layers": "bottom", "spacing": 0.20, "radial_count": 24, "intermediate": 1.0}}
+{"command": "element_get", "args": {"id": 43}}
+```
+
+Uma sapata em anel sob uma parede cilíndrica: um tipo de sapata corrida em T invertido, uma sapata em arco, a sua armadura, e um radier circular que guarda a curva verdadeira:
+
+```text
+{"command": "type_set", "args": {"type": "Viga baldrame 20 x 40 cm", "params": {"width": 1.6, "thickness": 0.4, "haunch": {"edge_thickness": 0.2, "beam_width": 0.4, "beam_height": 0.5}}}}
+{"command": "strip_footing_create", "args": {"start": [3, 0], "end": [-3, 0], "bulge": 1}}
+{"command": "strip_rebar_create", "args": {"strips": [42], "transverse_spacing": 0.20, "longitudinal_spacing": 0.20, "beam": {"top": 3, "sides": 1, "stirrups": 0.15}}}
+{"command": "foundation_slab_create", "args": {"curves": [{"kind": "circle", "center": [0, 0], "radius": 2.5}]}}
+```
+
+`bracing_create` contraventa um vão de pórtico: um elemento hospedeiro cujas barras são vigas comuns, criado em um passo de desfazer e devolvido como `{id, members}`. O vão vai de `start` a `end` (os eixos dos dois pilares) ou fica entre os dois `columns`, de quem toma a base e a altura; `pattern` é `x`, `diagonal` (com `flip` e `alternate`), `v`, `chevron` ou `k`; `stories` pavimentos de altura `height` ficam um sobre o outro a partir de `base_offset`; `material` (`steel` ou `timber`) escolhe a linha de catálogo do tipo padrão das barras. `element_set` muda seus parâmetros e regenera as barras mantendo seus ids.
+
+```text
+{"command": "bracing_create", "args": {"start": [0, 0], "end": [6, 0], "pattern": "chevron", "height": 3, "stories": 4}}
+{"command": "bracing_create", "args": {"columns": [12, 13], "pattern": "k", "stories": 2}}
+{"command": "element_set", "args": {"id": 42, "params": {"pattern": "X"}}}
+```
+
+### Folhas e carimbos
+
+`sheet_set` altera uma folha: `number`, `size` (`"A0"`…`"A4"`, `"ANSI A"`…`"ANSI E"`, `"ARCH A"`…`"ARCH E1"`, `"ARCH E"`, ou `{"width": …, "height": …}` em milímetros), `portrait`, `title_block` (um tipo de carimbo, ou `null` para nenhum), `fields` (os valores da folha para os campos por folha do carimbo; `null` limpa um) e `issue_date` (`AAAA-MM-DD`, ou `""`). `sheet_fields` mostra o que o carimbo da folha vai ler: cada campo com seu valor, os campos por folha com o valor desta folha e o padrão, e as peças que não se resolvem. `project_info_set` aceita `fields` (campos do projeto por nome, lidos como `{project:Nome}`).
+
+Um carimbo é um componente cujas peças 2D desenham a folha inteira, em milímetros a partir do canto inferior esquerdo do papel. `title_block_create` copia o padrão (ou começa vazio com `empty`); `component_sheet_piece_add`, `component_sheet_piece_set` (um merge patch sobre a peça como `component_get` a mostra em `def.sheet`) e `component_sheet_piece_delete` editam seus traços, textos e imagens; várias peças são adicionadas (`pieces`), excluídas (`indices`) ou alteradas e adicionadas (`add`) em um só passo. Uma imagem não é alterada por patch: `component_sheet_piece_set` a substitui com `image_path` (um arquivo) ou `image` (base64), e `component_get` e `type_get` a mostram apenas como resumo (`format`, `width`, `height`, `bytes`), nunca em base64. `title_block_create` recusa um nome já usado por um tipo ou por um componente. A categoria é `titleblock` (`types_list`, `categories_list`). `type_delete` pode excluir o último tipo de carimbo: suas folhas ficam então sem carimbo, e uma folha sem carimbo é desenhada como papel em branco. As expressões leem os parâmetros e `SheetWidth`/`SheetHeight`, então um carimbo serve para qualquer papel; os textos têm `{campos}` (`sheet_number`, `sheet_name`, `sheet_count`, `sheet_index`, `sheet_scale`, `paper`, `project_name`, `project_number`, `client`, `address`, `author`, `date`, `issue_date`, `project:<Nome>`, `param:<Nome>`). Um campo por folha é um parâmetro de texto com `instance`.
+
+```text
+{"command": "title_block_create", "args": {"name": "Escritório"}}
+{"command": "component_param_add", "args": {"type": "Escritório", "name": "Desenho", "kind": "text", "instance": true, "text": "Equipe"}}
+{"command": "component_sheet_piece_add", "args": {"type": "Escritório", "piece": {"kind": "text", "x": "SheetWidth - 60", "y": 8, "text": "{param:Desenho} · {sheet_index}/{sheet_count}", "size": 2.5}}}
+{"command": "component_sheet_piece_add", "args": {"type": "Escritório", "piece": {"kind": "image", "x": 15, "y": 15, "width": 30, "height": 12, "image_path": "logo.png"}}}
+{"command": "view_create", "args": {"kind": "sheet", "name": "Plantas gerais"}}
+{"command": "sheet_set", "args": {"sheet": "Plantas gerais", "title_block": "Escritório", "size": "A1", "issue_date": "2026-11-06", "fields": {"Desenho": "Ana"}}}
+{"command": "sheet_fields", "args": {"sheet": "Plantas gerais"}}
+```
+
+**Referências entre passos.** Scripts não têm variáveis, mas um argumento pode tomar um valor do resultado de um passo anterior: `{"$step": n}` é o `id` que o passo `n` (contado a partir de 1) devolveu, e `{"$step": n, "path": "/created/0"}` qualquer valor do seu resultado, indicado por um [ponteiro JSON](https://www.rfc-editor.org/rfc/rfc6901). `{"$level": "active"}` é o nível ativo: no app, o nível da planta ativa; no `ccad script`, o nível dado como `level=<id|nome>`; sem nenhum dos dois, o nível mais baixo. Uma referência a um passo que ainda não rodou, ou a um valor que o seu resultado não tem, para o script com um erro `invalid_arguments`.
+
+```text
+{"command": "wall_create", "args": {"level": {"$level": "active"}, "start": [0, 0], "end": [6, 0]}}
+{"command": "window_create", "args": {"wall": {"$step": 1}, "offset": 2, "sill": 1}}
+```
+
+```sh
+ccad -p casa.ccad --save script paredes.ccmacro level="Pavimento 1"
+```
+
+Os comandos também ajudam aceitando posições onde isso importa (`door_create` e `window_create` encontram a parede mais próxima de `point`; pisos, forros e telhados acompanham as paredes com `from_walls`). Para lógica entre passos, escreva um [script Lua](#scripts-lua), chame `ccad run` a partir de um script de shell ou use um agente via MCP.
+
+### Posições das barras e tabelas de armação
+
+Cada barra de armadura tem uma posição que identifica sua forma (mesmo diâmetro, aço, trechos e dobras, dentro da tolerância de comprimento, 5 mm por padrão, e de 1 grau): `bar_marks_list` lista as posições com a forma (`code`, por exemplo `L 30-470`), quantidade, comprimentos, pesos e conjuntos. As formas são numeradas por partição, depois por diâmetro e comprimento do maior para o menor; `element_set` dá a um conjunto sua própria posição (`bar_mark`); `bar_marks_update` fixa as posições mostradas, para que fiquem quando o modelo muda, e `bar_marks_renumber` renumera do início (`prefix`, `start`, `keep_overrides`). `bar_marking_set` muda a tolerância e o comprimento da barra comercial (`stock_length`), que `bar_length_check` usa para listar as barras que precisam de emenda. `bending_schedule_create` cria uma tabela com uma linha por posição (o desenho da forma nas folhas, seu código no CSV) e um resumo por diâmetro (`partitions`, `group_by_partition`, `waste_percent`); `bar_tag_create` escreve quantidade, posição, diâmetro, espaçamento e comprimento de um conjunto numa planta, elevação ou corte.
+
+```text
+{"command": "bar_marks_update", "args": {}}
+{"command": "bending_schedule_create", "args": {"partitions": ["PAREDES"], "waste_percent": 10}}
+{"command": "bar_tag_create", "args": {"view": 45, "set": 120, "position": [1, 1.5], "multiplier": 2}}
+{"command": "bar_length_check", "args": {"max_length": 12}}
+```
+
+### Renderização fotorrealista
+
+Uma vista 3D guarda suas configurações de renderização em `render` (`view_get`), mudadas por `view_set` com um patch de mesclagem: amostras por pixel (`samples`), reflexões da luz (`max_depth`), largura e altura da imagem em pixels (`width`, `height`), `fov_deg`, exposição em stops (`exposure`), mapeamento de tons (`tone_map`: `Filmic` ou `Standard`), o limite contra pontos brilhantes (`clamp`), `clay` (toda superfície opaca num mesmo branco fosco, o vidro mantido, sob o mesmo céu e sol) e o ambiente (`environment`: `sky_strength`, `sun_strength`, `ground_color`, `ground_plane`); `null` as remove. O sol é o da vista (`sun`). `view_render` faz o path tracing da vista no processador e grava a imagem (`.png`, `.jpg`, ou `.exr`/`.hdr` em luz linear) com a câmera da vista, como a vista 3D a mostra; `settings` altera as configurações da vista só para essa renderização, e `region` (`[x, y, largura, altura]` em pixels) renderiza só uma parte da imagem. Retorna o tamanho, as amostras, os segundos e os triângulos, e não muda nada no modelo.
+
+```text
+{"command": "view_set", "args": {"view": "{3D}", "render": {"samples": 256, "width": 1920, "height": 1080}}}
+{"command": "view_render", "args": {"view": "{3D}", "path": "casa.png"}}
+{"command": "view_render", "args": {"view": "{3D}", "path": "maquete.jpg", "settings": {"clay": true, "samples": 64}}}
+```
+
+```sh
+cargo run -p cc_cli -- -p examples/casa_simples.ccad run view_render view="{3D}" path=saida.png 'settings={"samples":16,"width":320,"height":200}'
+```
+
+## Scripts Lua
+
+`ccad lua <arquivo>` executa um script em [Lua 5.4](https://www.lua.org/manual/5.4/) sobre a sessão. O script chama comandos com `ccad.run`, guarda os resultados em variáveis e faz laços, então o id criado num passo pode ser usado no seguinte. Os argumentos (nas mesmas formas do `run`: pares `chave=valor`, um objeto JSON, `@arquivo.json`) ficam em `ccad.args`; o que ele imprime vai para a saída padrão e o que ele retorna é impresso como JSON.
+
+[`examples/small_house.lua`](../examples/small_house.lua) constrói a casa pequena acima, com as medidas dos argumentos:
+
+```lua
+local w = ccad.args.width or 8
+local d = ccad.args.depth or 6
+local corners = { { 0, 0 }, { w, 0 }, { w, d }, { 0, d } }
+local outer = {}
+for i = 1, 4 do
+  outer[i] = ccad.run("wall_create", { start = corners[i], ["end"] = corners[i % 4 + 1], height = 2.8 }).id
+end
+ccad.run("door_create", { wall = outer[1], offset = w / 4 })
+…
+```
+
+```sh
+ccad --save-as casa.ccad lua examples/small_house.lua width=10 depth=7
+```
+
+A tabela `ccad`:
+
+| | |
+|---|---|
+| `ccad.run(nome, args)` | executa um comando e devolve o resultado como tabela Lua; gera um erro se ele falhar |
+| `ccad.try(nome, args)` | o mesmo, mas devolve `nil, err` na falha (`err.code`, `err.message`; veja [Erros](#conceitos)) |
+| `ccad.commands()` | os comandos: `name`, `kind`, `group` e `description` de cada um |
+| `ccad.describe(nome)` | um comando, com o esquema JSON dos parâmetros em `schema` |
+| `ccad.args` | os argumentos do script (também `...`) |
+| `ccad.null` | o `null` do JSON (o `nil` do Lua omite o campo) |
+| `ccad.array(t)` | marca `t` como lista, para que uma tabela vazia vá como `[]` e não `{}` |
+| `ccad.json.encode(v)`, `ccad.json.decode(s)` | texto JSON de e para valores Lua |
+| `ccad.version`, `ccad.api` | a versão do ConstructCraft e a da API de plugins (1) |
+
+Argumentos e resultados são JSON: objetos são tabelas com chaves de texto, listas são sequências (`{ 0, 0 }` é um ponto), e `end`, palavra reservada do Lua, se escreve `["end"]`. Um número inteiro calculado com `/` (que em Lua sempre dá um número real) vai como inteiro, então `10 / 2` funciona onde se espera um id ou uma contagem.
+
+**O sandbox.** Os scripts rodam num Lua restrito: as bibliotecas `table`, `string`, `math`, `utf8` e `coroutine` e as funções básicas, sem `io`, `os`, `debug`, `package`, `require`, `load`, `dofile` nem `loadfile`. Um script só chega ao projeto pelos comandos, e a arquivos só pelos comandos que os leem ou gravam. Cada execução tem um limite de 500 milhões de instruções Lua, 60 segundos e 256 MB de memória (as funções de texto contam pelo tamanho do texto, a busca de padrões pelos passos, e `string.rep` e `string.gsub` geram no máximo 16 MB); passando deles, ela para com um erro `script` (capturar esse erro com `pcall` não faz o script continuar). Cada comando que um script executa é um passo de desfazer.
+
+## Grafos de programação visual
+
+Um grafo (`.ccgraph`, JSON) é um conjunto de nós ligados por fios e
+executado como um fluxo de dados. **Todo comando do motor é um nó**: seus
+parâmetros são as entradas do nó e o resultado é a saída `result` (mais
+`element`, o id, nos comandos `*_create`). Os nós internos dão valores de
+entrada (`number`, `integer`, `slider`, `boolean`, `text`,
+`select_elements`, `elements_of_category`, `levels`), matemática, lógica,
+listas, geometria nos valores que os comandos recebem (pontos `[x, y]`,
+`line`, `arc`, `circle`, `rectangle`, `rectangle_points`, `polygon_points`,
+`polyline_segments`, `divide_line`…), parâmetros de elementos
+(`parameter_get`, `parameter_set`) e saídas (`watch`, `output`). Um nó Lua
+executa uma função das suas entradas no sandbox (sem acesso ao modelo); ele
+retorna as saídas em ordem, ou uma tabela com os nomes delas. `graph_nodes`
+lista todos os nós com suas portas e tipos.
+
+- **Listas percorrem os nós.** Um nó que recebe uma lista onde espera um
+  valor roda uma vez por item, e suas saídas viram listas (`lacing`:
+  `shortest`, `longest` ou `cross`). Uma lista de 4 pontos iniciais e 4
+  finais em `wall_create` faz 4 paredes.
+- **Rodar de novo atualiza.** Cada elemento criado por um nó fica vinculado
+  ao nó e ao item que o fez. A próxima execução o altera no lugar (mesmo id,
+  id persistente, marca e comentários), cria os novos e apaga os que não são
+  mais feitos; sem mudanças, nada acontece. Uma execução é um passo de
+  desfazer. `graph_elements` lista os elementos de um grafo, `graph_release`
+  os libera (a próxima execução cria outros).
+- **Ordem.** Um nó roda depois dos nós ligados a ele; nós independentes
+  rodam na ordem em que foram adicionados (menor id primeiro).
+- **Erros são por nó.** Um nó que falha mostra a mensagem, os nós depois
+  dele são pulados, os demais rodam, e os elementos dele ficam como estavam.
+- Um grafo nunca roda `project_new`, `project_open`, `undo`, `redo`,
+  `language_set` nem grafos, e só roda comandos de arquivo quando quem o executa permite: o
+  `allow_files` de `graph_run`, `ccad --allow-files graph`, ou a caixa
+  *Permitir comandos de arquivo* do editor, que vale até outro grafo ser
+  aberto. O arquivo do grafo não pode permitir sozinho (um campo
+  `allow_files` nele é ignorado), e um grafo que um plugin executa nunca pode.
+
+```sh
+ccad --save-as casa.ccad graph examples/graphs/house.ccgraph width=12 depth=8
+ccad run graph_check path=examples/graphs/house.ccgraph
+ccad run graph_nodes search=wall
+```
+
+Nós de entrada com `name` são as entradas do grafo (`chave=valor` acima,
+`inputs` de `graph_run`); nós `output` com `name` são seus resultados. Um
+grafo mínimo:
+
+```json
+{
+  "uid": "6f1c2a0e9b3d4c8a8e2f5a7b1c3d9e02",
+  "nodes": [
+    { "id": 1, "kind": { "builtin": "range" }, "values": { "end": 15, "step": 5 } },
+    { "id": 2, "kind": { "builtin": "point" } },
+    { "id": 3, "kind": { "builtin": "point" }, "values": { "y": 4 } },
+    { "id": 4, "kind": { "command": "wall_create" }, "values": { "height": 2.8 } }
+  ],
+  "wires": [
+    { "from": [1, "list"], "to": [2, "x"] },
+    { "from": [1, "list"], "to": [3, "x"] },
+    { "from": [2, "point"], "to": [4, "start"] },
+    { "from": [3, "point"], "to": [4, "end"] }
+  ]
+}
+```
+
+## Plugins
+
+Um plugin é uma pasta com um manifesto `plugin.toml` e código Lua que acrescenta comandos ao catálogo. Os comandos dele são listados e executados como os nativos, pelo `ccad run`, por scripts, por scripts Lua e por agentes MCP, e se chamam `<id do plugin>__<comando>` (dois sublinhados, que os nomes nativos nunca têm).
+
+```sh
+ccad --plugins examples/plugins commands                # o catálogo, com os comandos dos plugins
+ccad --plugins examples/plugins plugins                 # os plugins, as permissões e os comandos deles
+ccad --plugins examples/plugins run quick_rooms__rectangle_room width=4 depth=3 name=Escritório door=south
+claude mcp add constructcad -- ccad mcp --plugins /caminho/para/plugins
+```
+
+`--plugins` recebe a pasta de um plugin ou uma pasta de pastas de plugins, e pode ser repetido. Numa pasta de plugins, a pasta de cada plugin tem o nome do id dele (como as instalações a nomeiam); pastas ocultas (começando com `.`) são ignoradas. Um plugin que não carrega é informado na saída de erro e fica de fora; o que os plugins imprimem também vai para a saída de erro.
+
+### Escrevendo um plugin
+
+[`examples/plugins/quick_rooms`](../examples/plugins/quick_rooms) é um exemplo completo. `plugin.toml`:
+
+```toml
+id = "quick_rooms"          # letras minúsculas, dígitos e sublinhados simples, até 32
+name = "Quick rooms"
+version = "0.1.0"
+api = 1                     # a API de plugins para a qual ele foi escrito
+description = "Rectangular rooms in one step, and wall totals by type."
+authors = ["…"]
+license = "GPL-3.0-or-later"
+homepage = "https://…"
+main = "main.lua"           # o padrão
+permissions = []            # ou ["files"], veja abaixo
+```
+
+`main.lua` roda uma vez quando o plugin carrega e registra comandos com `ccad.command`:
+
+```lua
+local rect = require("lib.rect")   -- lib/rect.lua na pasta do plugin
+
+ccad.command {
+  name = "rectangle_room",         -- o comando é quick_rooms__rectangle_room
+  title = "Rectangular room",
+  description = "Four walls around a rectangle, its floor and its room.",
+  kind = "edit",                   -- "query", "edit" (o padrão) ou "file"
+  params = {                       -- um esquema JSON dos argumentos
+    properties = { width = { type = "number" }, depth = { type = "number" } },
+    required = { "width", "depth" },
+  },
+  run = function(args)
+    local p = rect.corners(0, 0, args.width, args.depth)
+    for i = 1, 4 do ccad.run("wall_create", { start = p[i], ["end"] = p[i % 4 + 1] }) end
+    return { room = ccad.run("room_create", { point = { args.width / 2, args.depth / 2 } }).id }
+  end,
+}
+```
+
+- `run` recebe os argumentos numa tabela e devolve o resultado do comando (uma tabela, um valor ou nada). Argumentos `required` que faltam são recusados antes de ele rodar; `error("mensagem", 0)` faz o comando falhar com essa mensagem.
+- **Um passo de desfazer:** quantos comandos um comando de plugin executar, ele é desfeito de uma vez, e quando falha (um erro, um `ccad.run` que falhou, um limite atingido) tudo o que ele fez é desfeito.
+- **O que um comando pode executar:** um comando `query` só consulta; um `edit` consulta e edita; comandos que leem ou gravam arquivos (importar, exportar, salvar) precisam da permissão `files` (sem ela, comandos de edição que leem um arquivo indicado por um parâmetro, como `cad_import` ou `fill_pattern_import` com `path`, recusam o caminho; as formas sem arquivo, como `fill_pattern_import` com `text`, continuam funcionando), e só com ela se declara um comando do tipo `file`. Abrir ou criar um projeto, `undo`, `redo` e `language_set` não rodam dentro de um comando de plugin, nem o comando de outro plugin.
+- **O sandbox** é o dos [scripts Lua](#scripts-lua), com o limite contado por comando; cada plugin tem o seu próprio estado Lua, que guarda as variáveis entre um comando e outro. `require("a.b")` carrega `a/b.lua` da pasta do plugin (uma vez; arquivos fora da pasta são recusados), e `ccad.plugin` tem o `id`, o `name` e a `version` dele. `ccad.run` só funciona enquanto um comando roda, não enquanto o plugin carrega.
+- **As permissões** são concedidas por quem carrega o plugin: `ccad --plugins` concede o que o manifesto pede, já que você indicou a pasta.
+
+Os plugins são compartilhados pelo índice da comunidade, [constructcraft-plugins](https://github.com/francisreboucas/constructcraft-plugins): uma entrada por plugin, com de onde baixar cada versão e o checksum dela, enviada por pull request. No aplicativo, *Gerenciar → Plugins* instala, atualiza, desativa e remove plugins ([Plugins](interface.pt-BR.md#plugins)); sem ele, `ccad plugins install <arquivo.zip> <pasta>` instala um arquivo baixado (verificado do mesmo jeito: caminhos seguros, tamanhos e um plugin que carrega) e `ccad plugins remove <id> <pasta>` remove um.
+
+## Componentes com script
+
+Uma peça de componente pode ser um **script**: código Lua que declara os parâmetros e os hotspots do componente e monta as peças a partir dos valores deles. O script é puro: ele vê os valores e nada mais (nem comandos, nem arquivos, nem o modelo), então roda uma vez para cada conjunto de valores; mover ou girar um componente já colocado não o roda de novo. [`examples/components/cabinet.lua`](../examples/components/cabinet.lua) é um exemplo completo.
+
+```lua
+param.length   { "depth", label = "Profundidade", default = 0.55 }      -- compartilhado pelos elementos do tipo
+param.choice   { "handle", { { "bar", "Barra" }, { "none", "Nenhum" } } }
+param.length   { "width", label = "Largura", default = 0.8, instance = true }  -- próprio de cada elemento
+param.boolean  { "worktop", default = true, instance = true }
+param.material { "body", label = "Corpo", instance = true }
+hotspot        { "plinth", 0, 0.05, 0, label = "Rodapé", shape = "diamond", color = "#ff8800" }
+
+function geometry(p)
+  local pieces = { box { 0, 0, 0, p.width, p.depth, 0.85, material = p.body } }
+  if p.worktop then pieces[#pieces + 1] = box { 0, 0, 0.85, p.width, p.depth + 0.02, 0.03 } end
+  return pieces
+end
+```
+
+| Declaração | Valor em `p` |
+|---|---|
+| `param.length`, `param.angle`, `param.number { id, label=, default=0, instance= }` | um número (metros, graus) |
+| `param.boolean { id, default=false }` | `true` ou `false` |
+| `param.text { id, default="" }` | um texto |
+| `param.choice { id, { {chave, rótulo}, … }, default=primeira chave }` | a chave escolhida |
+| `param.material { id, default="" }` | o nome de um material do projeto (vazio: o material da peça) |
+| `hotspot { id, x, y, z, label=, shape="circle", color="#00ffff" }` | `{ x, y, z }`, onde o elemento o tem |
+
+As declarações ficam no corpo do script, nunca dentro de `geometry`. Os ids são nomes (letras, dígitos, `_`) e não se repetem; mudar um rótulo não renomeia o parâmetro. Um parâmetro sem `instance = true` é do tipo, e mudá-lo muda todos os elementos do tipo; com ele, cada elemento guarda o seu valor. As formas de hotspot são `circle`, `square`, `triangle`, `diamond` e `triangle_down`; as cores, `#RRGGBB` ou `#RRGGBBAA`. `p` também traz os outros parâmetros do componente, seus planos de referência e, em portas e janelas, `WallThickness`.
+
+`geometry(p)` devolve uma lista de peças (listas de peças são achatadas), no referencial do componente (metros a partir do ponto de inserção, x para a direita, y para trás, z para cima). Cada construtor recebe os valores em ordem ou por nome, além de `name`, `material`, `void`, `in_plan`, `plan_only` e `detail` (uma lista de `coarse`, `medium`, `fine`):
+
+| Construtor | Valores |
+|---|---|
+| `box` | `x, y, z, width, depth, height` |
+| `cylinder` | `x, y, z, radius, height` |
+| `extrusion` | `points` (`{x, y}` em planta), `z, height` |
+| `profile` | `points` (`{u, v}`, ou `{u, v, radius = r}` para um arco até o próximo ponto), `offset, depth`, `plane = "plan"`, `"front"` ou `"side"` |
+| `revolution` | `points, offset, axis, angle` (padrão 360), `plane` |
+| `sweep` | `path, profile, offset`, `plane` |
+| `blend` | `bottom, top, offset, depth`, `plane` |
+| `mesh` | `vertices` (`{x, y, z}`), `faces` (listas de números de vértice a partir de 1, no sentido anti-horário vistas de fora) |
+
+Os scripts rodam no [sandbox](#scripts-lua) com limites menores (20 milhões de instruções, 5 segundos, 64 MB, 10.000 peças, um milhão de pontos), e `math.random` repete os mesmos números. Quando um script falha, o elemento mantém as últimas peças que funcionaram, e o erro, com a linha, aparece em `element_get` (`derived.script_errors`), na paleta de propriedades e em `component_params_get`; corrigir o script ou o valor o recupera.
+
+Comandos:
+
+```sh
+ccad run component_create name=Armario 'def={"items": [{"name": "Script", "shape": {"Script": {"source": ""}}}]}'
+ccad run component_script_set type=Armario piece=Script source=@examples/components/cabinet.lua
+ccad run component_params_get type=Armario
+ccad run component_params_set type=Armario name=handle value='"none"'
+ccad run component_params_set 'elements=[100, 101]' name=width value=1.2
+ccad run component_hotspot_move element=100 name=plinth 'point=[0, 0.08, 0]'
+```
+
+- `component_script_set` grava uma peça de script (ou acrescenta uma). Um script que não carrega (erro de sintaxe, declaração inválida) é recusado; as declarações viram os parâmetros e hotspots do componente, os que continuam declarados mantêm os valores quando o tipo ainda serve, e o resultado lista os erros da primeira execução. Um componente tem uma peça de script; seus parâmetros mudam no script, não com `component_param_set` ou `component_param_delete`.
+- `component_params_get` mostra os parâmetros e hotspots de um tipo, ou de componentes colocados de um mesmo componente, com `mixed` onde diferem.
+- `component_params_set` define o valor de um tipo, ou o valor de instância de vários elementos de uma vez: números, `true`/`false`, textos, a chave de uma opção ou o nome de um material. É um passo de desfazer, e nada muda quando algum elemento recusa o valor.
+- `component_hotspot_move` move um hotspot no referencial do componente, ou em coordenadas do projeto com `world=true`.
+
+Um material citado por um parâmetro conta como usado: não pode ser excluído, e renomeá-lo renomeia os valores. A exportação IFC grava as peças que o script fez, como em qualquer componente.
 
 ## Macros no aplicativo
 
-*Gerenciar → Macros → Gravar macro* grava as alterações que você fizer até apertar *Parar gravação*; a macro é salva como script (`.ccmacro`, o formato acima). *Executar macro* roda uma macro ou qualquer script no projeto aberto; `ccad script` roda os mesmos arquivos.
+*Gerenciar → Macros → Gravar macro* grava as alterações que você fizer até apertar *Parar gravação*; a macro é salva como script (`.ccmacro`, o formato acima). *Executar macro* roda uma macro ou qualquer script no projeto aberto; `ccad script` roda os mesmos arquivos. Com uma pasta de macros definida em *Preferências → Locais de arquivos*, os diálogos de arquivo de macro começam nela e *Executar macro* vira um menu dos arquivos `.ccmacro` dela (mais *Procurar…* para qualquer outro arquivo).
 
 - Só edições são gravadas: abrir, salvar e exportar ficam de fora, então reproduzir nunca sobrescreve arquivos.
 - Um valor arrastado nas propriedades é gravado uma vez, com o valor final; alterações feitas num diálogo cancelado não são gravadas.
-- Os passos gravados se referem a elementos pelo id. No projeto em que foi gravada (ou numa cópia dele como estava no início da gravação), a macro reproduz as mesmas alterações; em outro projeto, passos que indicam elementos pelo id podem falhar ou atingir outros elementos.
+- Elementos, tipos, vistas e níveis criados durante a gravação são escritos como [referências](#scripts) ao passo que os criou (`{"$step": n}`), de modo que a macro usa o que ela mesma cria a cada execução. O nível da planta em que você grava é escrito como `{"$level": "active"}`: a macro roda no nível da planta ativa quando você a executa (os outros níveis ficam como gravados).
+- Os demais passos se referem a elementos pelo id. No projeto em que foi gravada (ou numa cópia dele como estava no início da gravação), a macro reproduz as mesmas alterações; em outro projeto, passos que indicam elementos existentes pelo id podem falhar ou atingir outros elementos.
 
 ## Paleta de comandos no aplicativo
 
@@ -176,6 +685,18 @@ claude mcp add constructcad -- ccad mcp -p /caminho/para/casa.ccad
 }
 ```
 
+No Windows, o `ccad.exe` é instalado ao lado do aplicativo, por padrão em `C:\Program Files\ConstructCraft` (no JSON as barras invertidas são dobradas):
+
+```json
+{
+  "mcpServers": {
+    "constructcad": { "command": "C:\\Program Files\\ConstructCraft\\ccad.exe", "args": ["mcp", "--lang", "pt-BR"] }
+  }
+}
+```
+
+A opção *Add ccad to the PATH* do instalador (marcada por padrão) permite que os clientes achem só `ccad`, mas apenas clientes abertos depois da instalação enxergam o PATH novo; o caminho completo sempre funciona. Apontado para o próprio aplicativo (`constructcraft mcp` ou `constructcraft --mcp`), o cliente recebe o mesmo servidor: o aplicativo executa o `ccad` ao lado dele, na mesma entrada e saída padrão.
+
 Exemplos de pedidos que um agente resolve com essas ferramentas: *"abra casa.ccad, liste as portas sem marca e numere-as"*, *"importe modelo.ifc e diga o volume das paredes de concreto"*, *"crie um pavimento superior 3 m acima do térreo com as mesmas paredes externas"*, *"exporte a folha A101 em PDF"*.
 
 Observações:
@@ -194,5 +715,7 @@ Toda funcionalidade de usuário nasce como comando do motor; o aplicativo chama 
 4. Teste-o em `crates/cc_engine/tests/commands.rs` por `Session::execute`.
 5. Gere a referência de novo: `cargo run -p cc_cli -- reference > docs/commands.md` (um teste falha enquanto ela estiver desatualizada).
 6. No aplicativo, chame-o com `Session::run(Comando { … })`, `actions::run_command` ou os auxiliares de `engine_edit` (use `Session::run_merged` para valores arrastados). Isso também o torna gravável em macros.
+
+Comandos acrescentados durante a execução implementam `cc_engine::Extension` (`crates/cc_engine/src/extension.rs`) e são postos na sessão com `Session::set_extension`; `cc_plugins::PluginHost` é a dos plugins Lua. `Session::commands`, `describe` e `kind_of` cobrem os dois, e `Session::execute` roda um comando de extensão como um passo de desfazer (`Document::squash_since`).
 
 Os detalhes de arquitetura estão em [AGENTS.md](../AGENTS.md).

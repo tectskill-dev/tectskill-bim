@@ -1,0 +1,18 @@
+// A parametric bench modeled with engine commands only: reference planes
+// driven by labeled dimensions, and sketched pieces locked to the planes.
+// ccad --save-as bench.ccad script examples/component_bench.ccmacro
+{"command": "component_create", "args": {"name": "Bench", "def": {"params": [{"name": "Width", "value": 1.2}, {"name": "Depth", "value": 0.4}, {"name": "Height", "value": 0.45}], "items": [{"name": "Placeholder", "shape": {"Box": {"x": "0", "y": "0", "z": "0", "width": "0.1", "depth": "0.1", "height": "0.1"}}}]}}}
+{"command": "component_ref_plane_add", "args": {"type": "Bench", "name": "Left", "axis": "x", "at": "-Width/2"}}
+{"command": "component_ref_plane_add", "args": {"type": "Bench", "name": "Right", "axis": "x", "at": "0.6"}}
+{"command": "component_ref_plane_add", "args": {"type": "Bench", "name": "Front", "axis": "y", "at": "-Depth/2"}}
+{"command": "component_ref_plane_add", "args": {"type": "Bench", "name": "Back", "axis": "y", "at": "0.2"}}
+{"command": "component_ref_plane_add", "args": {"type": "Bench", "name": "Top", "axis": "z", "at": "0.45"}}
+{"command": "component_ref_plane_add", "args": {"type": "Bench", "name": "Under", "axis": "z", "at": "Top - 0.04"}}
+{"command": "component_dimension_add", "args": {"type": "Bench", "view": "plan", "from": "Left", "to": "Right", "label": "Width", "place": -0.35}}
+{"command": "component_dimension_add", "args": {"type": "Bench", "view": "plan", "from": "Front", "to": "Back", "label": "Depth", "place": 0.8}}
+{"command": "component_dimension_add", "args": {"type": "Bench", "view": "front", "from": "Base", "to": "Top", "label": "Height", "place": -0.8}}
+{"command": "component_piece_add", "args": {"type": "Bench", "name": "Seat", "plane": "plan", "start": "Under", "end": "Top", "points": [{"u": "Left", "v": "Front"}, {"u": "Right", "v": "Front"}, {"u": "Right", "v": "Back"}, {"u": "Left", "v": "Back"}]}}
+{"command": "component_piece_add", "args": {"type": "Bench", "name": "Left leg", "plane": "plan", "start": "Base", "end": "Under", "points": [{"u": "Left", "v": "Front"}, {"u": "Left + 0.05", "v": "Front"}, {"u": "Left + 0.05", "v": "Back"}, {"u": "Left", "v": "Back"}]}}
+{"command": "component_piece_add", "args": {"type": "Bench", "name": "Right leg", "plane": "plan", "start": "Base", "end": "Under", "points": [{"u": "Right - 0.05", "v": "Front"}, {"u": "Right", "v": "Front"}, {"u": "Right", "v": "Back"}, {"u": "Right - 0.05", "v": "Back"}]}}
+{"command": "component_piece_add", "args": {"type": "Bench", "name": "Hand hole", "plane": "plan", "void": true, "start": "Under", "end": "Top", "points": [{"u": -0.06, "v": 0, "radius": 0.06}, {"u": 0.06, "v": 0, "radius": 0.06}]}}
+{"command": "component_piece_delete", "args": {"type": "Bench", "index": 0}}

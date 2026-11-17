@@ -9,8 +9,8 @@
 use crate::Solid;
 use crate::polygon;
 use cc_core::{
-    Project, StairBuild, StairCheck, StairConstruction, StairLayout, StairRules, StairShape, StairSide, Stringers,
-    TypeData,
+    LandingBeams, PostAt, Project, StairBuild, StairCheck, StairConstruction, StairLayout, StairRules, StairShape,
+    StairSide, Stringers, TypeData,
 };
 use glam::{DVec2, DVec3};
 use std::f64::consts::{FRAC_PI_2, TAU};
@@ -55,6 +55,176 @@ pub struct Flight {
     pub landing_ahead: f64,
 }
 
+/// The frame of a landing: its center, the unit vectors along the flight
+/// arriving at it and across it (to the side the stair turns to), its half
+/// sizes along them and the center lines of the flights it joins. Landing
+/// coordinates `(x, y)` are along and across from the center.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StairLanding {
+    pub center: DVec2,
+    pub along: DVec2,
+    pub across: DVec2,
+    /// Half its depth along and of its width across.
+    pub half: DVec2,
+    /// Elevation of its walking surface.
+    pub z: f64,
+    /// Offset across of the arriving flight's center line.
+    pub arrive: f64,
+    /// Direction of the leaving flight in landing coordinates, and the
+    /// offset of its center line (across when it goes along, else along).
+    pub leave: DVec2,
+    pub leave_at: f64,
+}
+
+/// A rectangle `[x0, x1, y0, y1]` in landing coordinates.
+pub type LandingRect = [f64; 4];
+
+impl StairLanding {
+    /// World point of landing coordinates `p`.
+    pub fn point(&self, p: DVec2) -> DVec2 {
+        self.center + self.along * p.x + self.across * p.y
+    }
+
+    /// World plan outline of a rectangle in landing coordinates.
+    pub fn outline(&self, [x0, x1, y0, y1]: LandingRect) -> Vec<DVec2> {
+        [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| self.point(DVec2::new(x, y))).to_vec()
+    }
+
+    /// How the flights meet it: in line, at a corner (the leaving one goes
+    /// across) or coming back beside the arriving one (U-shaped).
+    fn meeting(&self) -> Meeting {
+        if self.leave.y.abs() > 0.5 {
+            Meeting::Corner
+        } else if self.leave.x > 0.0 {
+            Meeting::InLine
+        } else {
+            Meeting::Back
+        }
+    }
+
+    /// Plan rectangles (landing coordinates) of the beams under it, `width`
+    /// wide: a frame round the edge for side stringers, the stringers'
+    /// lines carried across it (as `beams` says) for a central one. Beams
+    /// that cross are split at the one carried through, so none overlap.
+    pub fn beams(&self, stringers: Stringers, beams: LandingBeams, width: f64) -> Vec<LandingRect> {
+        let (ed, et) = (self.half.x, self.half.y);
+        let h = width / 2.0;
+        let mut out: Vec<LandingRect> = Vec::new();
+        match stringers {
+            Stringers::Sides => {
+                let w = width.min(ed).min(et);
+                out.push([-ed, -ed + w, -et, et]);
+                out.push([ed - w, ed, -et, et]);
+                out.push([-ed + w, ed - w, -et, -et + w]);
+                out.push([-ed + w, ed - w, et - w, et]);
+            }
+            Stringers::Center => {
+                let yi = self.arrive.clamp(-et + h, (et - h).max(-et + h));
+                match self.meeting() {
+                    Meeting::InLine => {
+                        out.push([-ed, ed, yi - h, yi + h]);
+                        out.push([-h, h, -et, yi - h]);
+                        out.push([-h, h, yi + h, et]);
+                    }
+                    Meeting::Corner => {
+                        let xo = self.leave_at.clamp(-ed + h, (ed - h).max(-ed + h));
+                        out.push([-ed, ed, yi - h, yi + h]);
+                        let toward_inner = self.leave.y > 0.0;
+                        if beams == LandingBeams::Cross || !toward_inner {
+                            out.push([xo - h, xo + h, -et, yi - h]);
+                        }
+                        if beams == LandingBeams::Cross || toward_inner {
+                            out.push([xo - h, xo + h, yi + h, et]);
+                        }
+                    }
+                    Meeting::Back => {
+                        out.push([-h, h, -et, et]);
+                        let yo = self.leave_at.clamp(-et + h, (et - h).max(-et + h));
+                        for y in [yi, yo] {
+                            out.push([-ed, -h, y - h, y + h]);
+                            if beams == LandingBeams::Cross {
+                                out.push([h, ed, y - h, y + h]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out.retain(|r| r[1] - r[0] > 1e-6 && r[3] - r[2] > 1e-6);
+        out
+    }
+
+    /// Where posts can stand under it, on its edge (landing coordinates):
+    /// the corners of a frame, the ends of a central stringer's beams.
+    pub fn post_spots(&self, stringers: Stringers, beams: LandingBeams) -> Vec<(PostAt, DVec2)> {
+        let (ed, et) = (self.half.x, self.half.y);
+        let p = DVec2::new;
+        if stringers == Stringers::Sides {
+            return vec![
+                (PostAt::FrontOuter, p(-ed, -et)),
+                (PostAt::BackOuter, p(ed, -et)),
+                (PostAt::BackInner, p(ed, et)),
+                (PostAt::FrontInner, p(-ed, et)),
+            ];
+        }
+        let yi = self.arrive.clamp(-et, et);
+        let cross = beams == LandingBeams::Cross;
+        let mut out = Vec::new();
+        match self.meeting() {
+            Meeting::InLine => {
+                out.extend([(PostAt::Front, p(-ed, yi)), (PostAt::Back, p(ed, yi))]);
+                out.extend([(PostAt::Outer, p(0.0, -et)), (PostAt::Inner, p(0.0, et))]);
+            }
+            Meeting::Corner => {
+                let xo = self.leave_at.clamp(-ed, ed);
+                out.extend([(PostAt::Front, p(-ed, yi)), (PostAt::Back, p(ed, yi))]);
+                if cross || self.leave.y < 0.0 {
+                    out.push((PostAt::Outer, p(xo, -et)));
+                }
+                if cross || self.leave.y > 0.0 {
+                    out.push((PostAt::Inner, p(xo, et)));
+                }
+            }
+            Meeting::Back => {
+                let yo = self.leave_at.clamp(-et, et);
+                let (lo, hi) = (yi.min(yo), yi.max(yo));
+                out.extend([(PostAt::Outer, p(0.0, -et)), (PostAt::Inner, p(0.0, et))]);
+                if cross {
+                    out.extend([(PostAt::BackOuter, p(ed, lo)), (PostAt::BackInner, p(ed, hi))]);
+                } else {
+                    out.extend([(PostAt::FrontOuter, p(-ed, lo)), (PostAt::FrontInner, p(-ed, hi))]);
+                }
+            }
+        }
+        out
+    }
+
+    /// Plan outline of a square post `width` wide at `spot` on its edge,
+    /// pushed in so it stands under the landing.
+    pub fn post_outline(&self, spot: DVec2, width: f64) -> Vec<DVec2> {
+        let (ed, et) = (self.half.x, self.half.y);
+        let r = (width / 2.0).min(ed).min(et);
+        let inward = |v: f64, e: f64| {
+            if v >= e - 1e-9 {
+                v - r
+            } else if v <= -e + 1e-9 {
+                v + r
+            } else {
+                v
+            }
+        };
+        let c = DVec2::new(inward(spot.x, ed), inward(spot.y, et));
+        self.outline([c.x - r, c.x + r, c.y - r, c.y + r])
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Meeting {
+    InLine,
+    Corner,
+    Back,
+}
+
 /// A spiral stair's circle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spiral {
@@ -80,6 +250,8 @@ pub struct StairGeom {
     pub layout: StairLayout,
     pub steps: Vec<StairStep>,
     pub flights: Vec<Flight>,
+    /// The landings, up the stair.
+    pub landings: Vec<StairLanding>,
     pub spiral: Option<Spiral>,
     /// Walking line from the foot of the stair to its top, with elevations.
     pub walkline: Vec<DVec3>,
@@ -93,10 +265,12 @@ pub struct StairGeom {
 /// The local layout, kept for railing paths.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Plan {
-    /// Treads of the first flight, slots in the corner (a landing or winders)
-    /// and treads of the second flight.
+    /// Treads of the first flight, slots in the corners (a landing or
+    /// winders; the two landings of a three-flight stair), treads of the
+    /// middle flight of a three-flight stair and of the last flight.
     first: usize,
     corner: usize,
+    middle: usize,
     second: usize,
     /// Landing depth (straight and U-shaped stairs).
     landing: f64,
@@ -111,10 +285,48 @@ const SPIRAL_TURN_RISE: f64 = 2.2;
 /// Segments per radian on arcs.
 const ARC_STEPS: f64 = 8.0;
 
+/// The point of a step where its number goes and the unit vector up the
+/// stair (square to its front, into the step); none for a degenerate step.
+fn number_spot(st: &StairStep) -> Option<(DVec2, DVec2)> {
+    if st.outline.len() < 3 {
+        return None;
+    }
+    let center = st.outline.iter().copied().sum::<DVec2>() / st.outline.len() as f64;
+    let [a, b] = st.front;
+    let mut up = (b - a).perp().try_normalize()?;
+    if up.dot(center - (a + b) * 0.5) < 0.0 {
+        up = -up;
+    }
+    let side = up.perp() * (a.distance(b) * 0.25);
+    [center + side, center - side, center].into_iter().find(|p| polygon::contains(&st.outline, *p)).map(|p| (p, up))
+}
+
 impl StairGeom {
     /// Plan length of the walking line.
     pub fn run(&self) -> f64 {
         self.walkline.windows(2).map(|w| w[0].truncate().distance(w[1].truncate())).sum()
+    }
+
+    /// Where the step numbers go in plan, with each number: one in every
+    /// tread and winder up the stair (landings are not numbered) from
+    /// `layout.number_start`, then one on the floor the stair arrives at, a
+    /// tread beyond its last riser. Each sits a quarter of the step's width
+    /// to the left of its middle, walking up (to the right, or in the middle,
+    /// when that falls outside the step), clear of the walking line's arrow.
+    pub fn number_spots(&self) -> Vec<(DVec2, i32)> {
+        let mut spots = Vec::new();
+        let mut n = self.layout.number_start;
+        let mut last = None;
+        for st in self.steps.iter().filter(|st| st.kind != StepKind::Landing) {
+            let Some((spot, up)) = number_spot(st) else { continue };
+            spots.push((spot, n));
+            n = n.saturating_add(1);
+            last = Some((spot, up));
+        }
+        if let Some((spot, up)) = last {
+            spots.push((spot + up * self.tread, n));
+        }
+        spots
     }
 
     fn sign(&self) -> f64 {
@@ -156,7 +368,7 @@ impl StairGeom {
         let (g, w) = (self.tread, self.width);
         let hw = w / 2.0;
         let o = hw - e;
-        let Plan { first, corner, second, landing } = self.plan;
+        let Plan { first, corner, middle, second, landing } = self.plan;
         let mut pts: Vec<(DVec2, f64)> = Vec::new();
         let side = if turn_side { 1.0 } else { -1.0 };
         // Nosings of a flight's treads, from slot `slot`.
@@ -240,6 +452,36 @@ impl StairGeom {
                 let off = if turn_side { o } else { -o };
                 flight(&mut pts, o2, -DVec2::X, second, first + 1, off);
                 pts.push((o2 + DVec2::new(-(second as f64) * g, -off), self.top));
+            }
+            StairShape::ThreeFlight => {
+                // Up along +a, a corner landing, along +b, a second corner
+                // landing, back along -a; the inner side runs round the well.
+                let b1 = hw + middle as f64 * g;
+                let (z1, z2) = (self.slot_z(first), self.slot_z(first + 1 + middle));
+                flight(&mut pts, DVec2::ZERO, DVec2::X, first, 0, side * o);
+                if turn_side {
+                    pts.push((DVec2::new(a0 + e, o), z1));
+                } else {
+                    pts.push((DVec2::new(a0, -o), z1));
+                    pts.push((DVec2::new(a0 + w - e, -o), z1));
+                    if w - e > g {
+                        pts.push((DVec2::new(a0 + w - e, hw - g), z1));
+                    }
+                }
+                let o2 = DVec2::new(a0 + hw, hw);
+                flight(&mut pts, o2, DVec2::Y, middle, first + 1, side * o);
+                if turn_side {
+                    pts.push((DVec2::new(a0 + e, b1 + e), z2));
+                } else {
+                    pts.push((DVec2::new(a0 + w - e, b1), z2));
+                    pts.push((DVec2::new(a0 + w - e, b1 + w - e), z2));
+                    if w - e > g {
+                        pts.push((DVec2::new(a0 + g, b1 + w - e), z2));
+                    }
+                }
+                let o3 = DVec2::new(a0, b1 + hw);
+                flight(&mut pts, o3, -DVec2::X, second, first + 2 + middle, side * o);
+                pts.push((o3 - DVec2::X * (second as f64 * g) + (-DVec2::X).perp() * (side * o), self.top));
             }
         }
         pts
@@ -409,31 +651,8 @@ impl StairGeom {
 
     /// A straight flight as one closed solid: its profile across the width.
     fn flight_solid(&self, f: &Flight, waist: Option<f64>) -> Vec<Vec<DVec3>> {
-        let profile = self.flight_profile(f, waist);
         let hw = self.width / 2.0;
-        let at = |(s, z): (f64, f64), v: f64| {
-            let p = f.origin + f.dir * s + f.left * v;
-            DVec3::new(p.x, p.y, z)
-        };
-        let n = profile.len();
-        // Counter-clockwise in (s, z) seen from the left side (+v): that face
-        // takes the order, the right one its reverse, the sides each edge.
-        let area: f64 = (0..n)
-            .map(|i| {
-                let (a, b) = (profile[i], profile[(i + 1) % n]);
-                a.0 * b.1 - b.0 * a.1
-            })
-            .sum();
-        let pts: Vec<(f64, f64)> = if area >= 0.0 { profile } else { profile.into_iter().rev().collect() };
-        let mut faces: Vec<Vec<DVec3>> = Vec::with_capacity(n + 2);
-        let (left, right) = (hw, -hw);
-        faces.push(pts.iter().rev().map(|&p| at(p, left)).collect());
-        faces.push(pts.iter().map(|&p| at(p, right)).collect());
-        for i in 0..n {
-            let (a, b) = (pts[i], pts[(i + 1) % n]);
-            faces.push(vec![at(a, left), at(b, left), at(b, right), at(a, right)]);
-        }
-        faces
+        extrude_profile(f, self.flight_profile(f, waist), hw, -hw)
     }
 
     fn add_assembled(&self, build: &StairBuild, slope: f64, s: &mut Pieces) {
@@ -443,11 +662,8 @@ impl StairGeom {
         for st in &self.steps {
             let n = st.outline.len();
             match st.kind {
-                StepKind::Landing => {
-                    // A framed platform as deep as the stringers.
-                    let bottom = (st.z - build.stringer_depth).max(self.base);
-                    add_wedge(s, &st.outline, &vec![bottom; n], &vec![st.z; n]);
-                }
+                // A deck as thick as the treads, on beams (below).
+                StepKind::Landing => add_wedge(s, &st.outline, &vec![(st.z - tt).max(self.base); n], &vec![st.z; n]),
                 StepKind::Winder if self.spiral.is_none() => {
                     // Winders sit on a carriage following their pitch.
                     let bottom: Vec<f64> = st.along.iter().map(|t| (st.z - h - depth + t * h).max(self.base)).collect();
@@ -468,6 +684,25 @@ impl StairGeom {
             }
         }
         let sw = build.stringer_width.min(self.width / 2.0);
+        // Under each landing's deck, beams as wide and deep as the stringers
+        // and the posts asked for, from the base up to the beams.
+        let landing_depth = tt + build.stringer_depth;
+        for (i, l) in self.landings.iter().enumerate() {
+            let (top, bottom) = (l.z - tt, (l.z - landing_depth).max(self.base));
+            if top - bottom > 1e-6 {
+                for r in l.beams(build.stringers, build.landing_beams, sw) {
+                    add_wedge(s, &l.outline(r), &[bottom; 4], &[top; 4]);
+                }
+            }
+            let posts = self.layout.posts.get(i).copied().unwrap_or_default();
+            if bottom - self.base > 1e-3 {
+                for (at, spot) in l.post_spots(build.stringers, build.landing_beams) {
+                    if posts.get(at) {
+                        add_wedge(s, &l.post_outline(spot, build.post_width), &[self.base; 4], &[bottom; 4]);
+                    }
+                }
+            }
+        }
         if let Some(sp) = self.spiral {
             match build.stringers {
                 Stringers::Center => {
@@ -495,9 +730,7 @@ impl StairGeom {
             }
             return;
         }
-        let k = if self.tread > 1e-6 { h / self.tread } else { 0.0 };
         for f in self.flights.iter().filter(|f| f.treads > 0) {
-            let len = f.treads as f64 * self.tread;
             let strips: Vec<(f64, f64, f64)> = match build.stringers {
                 // Housed stringers whose top runs 5 cm above the nosings.
                 Stringers::Sides => {
@@ -508,15 +741,47 @@ impl StairGeom {
                 Stringers::Center => vec![(-sw / 2.0, sw / 2.0, -tt - h)],
             };
             for (v0, v1, lift) in strips {
-                let p = |s_: f64, v: f64| f.origin + f.dir * s_ + f.left * v;
-                let outline = [p(0.0, v0), p(len, v0), p(len, v1), p(0.0, v1)];
-                let floor = f.floor - if f.floor > self.base + 1e-9 { build.stringer_depth } else { 0.0 };
-                let floor = floor.max(self.base);
-                let top: Vec<f64> = [0.0, len, len, 0.0].iter().map(|s_| (f.z0 + lift + k * s_).max(floor)).collect();
-                let bottom: Vec<f64> = top.iter().map(|z| (z - depth).max(floor)).collect();
-                add_wedge(s, &outline, &bottom, &top);
+                for profile in self.stringer_profiles(f, lift, depth, landing_depth) {
+                    s.push(extrude_profile(f, profile, v1, v0));
+                }
             }
         }
+    }
+
+    /// Side profiles, in `(s, z)` along flight `f`, of a stringer whose top
+    /// runs `lift` above the nosings, `depth` deep measured plumb: a band
+    /// parallel to the pitch, cut level where it stands (the floor, or the
+    /// underside of the landing the flight leaves, `landing_depth` below
+    /// its top) and, where the flight rises to a landing, carried on under
+    /// it up to the landing's underside, so it bears on the landing instead
+    /// of touching its edge.
+    pub(crate) fn stringer_profiles(
+        &self,
+        f: &Flight,
+        lift: f64,
+        depth: f64,
+        landing_depth: f64,
+    ) -> Vec<Vec<(f64, f64)>> {
+        let (g, h) = (self.tread, self.riser);
+        let k = if g > 1e-6 { h / g } else { 0.0 };
+        let len = f.treads as f64 * g;
+        let top = |s: f64| f.z0 + lift + k * s;
+        let low = if f.floor > self.base + 1e-9 { (f.floor - landing_depth).max(self.base) } else { self.base };
+        let band = |s0: f64, s1: f64| vec![(s0, top(s0) - depth), (s1, top(s1) - depth), (s1, top(s1)), (s0, top(s0))];
+        let mut out = Vec::new();
+        let along = clip_level(&band(0.0, len), low, true);
+        if along.len() >= 3 {
+            out.push(along);
+        }
+        if f.landing_ahead > 1e-9 {
+            // Under the landing it rises to: up to the landing's underside.
+            let underside = f.z0 + f.treads as f64 * h - landing_depth;
+            let under = clip_level(&clip_level(&band(len, len + f.landing_ahead), low, true), underside, false);
+            if under.len() >= 3 {
+                out.push(under);
+            }
+        }
+        out
     }
 
     /// The part of spiral tread `st` between radii `r0` and `r1`.
@@ -550,6 +815,58 @@ fn winder_hit(a0: f64, hw: f64, reach: f64, phi: f64) -> DVec2 {
     } else {
         DVec2::new(a0 + reach, hw + reach * phi.tan())
     }
+}
+
+/// A side profile `(s, z)` of flight `f` extruded across it, from `left` to
+/// `right` (offsets to the flight's left), as a closed solid.
+fn extrude_profile(f: &Flight, profile: Vec<(f64, f64)>, left: f64, right: f64) -> Vec<Vec<DVec3>> {
+    let at = |(s, z): (f64, f64), v: f64| {
+        let p = f.origin + f.dir * s + f.left * v;
+        DVec3::new(p.x, p.y, z)
+    };
+    let n = profile.len();
+    // Counter-clockwise in (s, z) seen from the left side (+v): that face
+    // takes the order, the right one its reverse, the sides each edge.
+    let area: f64 = (0..n)
+        .map(|i| {
+            let (a, b) = (profile[i], profile[(i + 1) % n]);
+            a.0 * b.1 - b.0 * a.1
+        })
+        .sum();
+    let pts: Vec<(f64, f64)> = if area >= 0.0 { profile } else { profile.into_iter().rev().collect() };
+    let mut faces: Vec<Vec<DVec3>> = Vec::with_capacity(n + 2);
+    faces.push(pts.iter().rev().map(|&p| at(p, left)).collect());
+    faces.push(pts.iter().map(|&p| at(p, right)).collect());
+    for i in 0..n {
+        let (a, b) = (pts[i], pts[(i + 1) % n]);
+        faces.push(vec![at(a, left), at(b, left), at(b, right), at(a, right)]);
+    }
+    faces
+}
+
+/// A convex profile `(s, z)` cut by the level `z = level`, keeping what lies
+/// above it (`above`) or below it.
+fn clip_level(poly: &[(f64, f64)], level: f64, above: bool) -> Vec<(f64, f64)> {
+    let keep = |p: (f64, f64)| if above { p.1 >= level - 1e-12 } else { p.1 <= level + 1e-12 };
+    let n = poly.len();
+    let mut out = Vec::with_capacity(n + 2);
+    for i in 0..n {
+        let (a, b) = (poly[i], poly[(i + 1) % n]);
+        if keep(a) {
+            out.push(a);
+        }
+        if keep(a) != keep(b) && (b.1 - a.1).abs() > 1e-15 {
+            let t = (level - a.1) / (b.1 - a.1);
+            out.push((a.0 + (b.0 - a.0) * t, level));
+        }
+    }
+    out.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-12 && (a.1 - b.1).abs() < 1e-12);
+    if out.len() > 1
+        && out.first().zip(out.last()).is_some_and(|(a, b)| (a.0 - b.0).abs() < 1e-12 && (a.1 - b.1).abs() < 1e-12)
+    {
+        out.pop();
+    }
+    out
 }
 
 /// A prism over `outline` with an elevation per vertex at the bottom and the
@@ -611,7 +928,7 @@ pub fn layout_stair(
     mut layout: StairLayout,
 ) -> StairGeom {
     let width = if width.is_finite() { width.clamp(0.1, 20.0) } else { 1.0 };
-    let (risers, riser, g) = cc_core::stair_steps(top - base, max_riser, tread, rules);
+    let (risers, riser, g) = layout.steps(top - base, max_riser, tread, rules);
     // A spiral turns no faster than leaves headroom over the turn below:
     // its tread on the walking line grows when the type's would.
     let g = match layout.shape {
@@ -624,22 +941,31 @@ pub fn layout_stair(
     let slots = risers.saturating_sub(1);
     let hw = width / 2.0;
     let landing = if layout.landing > 1e-3 { layout.landing } else { width };
-    // Slots of the corner: one landing or the winders (fewer if there are not enough treads).
+    // Slots of the corners: one landing or the winders, two landings on a
+    // three-flight stair (fewer if there are not enough treads).
     let corner = match layout.shape {
         StairShape::Straight | StairShape::Spiral => 0,
         StairShape::LShaped if layout.winders >= 2 => (layout.winders as usize).min(slots),
+        StairShape::ThreeFlight => slots.min(2),
         _ => usize::from(slots >= 1),
     };
+    let treads = slots - corner;
     let first = match layout.shape {
         StairShape::Straight | StairShape::Spiral => slots,
-        _ if layout.split > 0 => (layout.split as usize).saturating_sub(1).min(slots - corner),
-        _ => (slots - corner) / 2,
+        _ if layout.split > 0 => (layout.split as usize).saturating_sub(1).min(treads),
+        StairShape::ThreeFlight => treads / 3,
+        _ => treads / 2,
     };
-    let second = slots - corner - first;
+    let middle = match layout.shape {
+        StairShape::ThreeFlight if layout.split2 > 0 => (layout.split2 as usize).saturating_sub(1).min(treads - first),
+        StairShape::ThreeFlight => (treads - first) / 2,
+        _ => 0,
+    };
+    let second = treads - first - middle;
     if layout.shape == StairShape::LShaped && corner < 2 {
         layout.winders = 0;
     }
-    let plan = Plan { first, corner, second, landing };
+    let plan = Plan { first, corner, middle, second, landing };
     let landing_check = match layout.shape {
         StairShape::StraightLanding | StairShape::UShaped if corner == 1 => Some((landing, width)),
         _ => None,
@@ -657,13 +983,15 @@ pub fn layout_stair(
         layout,
         steps: Vec::new(),
         flights: Vec::new(),
+        landings: Vec::new(),
         spiral: None,
         walkline: Vec::new(),
         parts: Vec::new(),
         check: StairCheck::new(risers, riser, g, max_riser, rules, landing_check),
         plan,
     };
-    let mut b = Builder { geom: &geom, steps: Vec::new(), flights: Vec::new(), parts: Vec::new() };
+    let mut b =
+        Builder { geom: &geom, steps: Vec::new(), flights: Vec::new(), landings: Vec::new(), parts: Vec::new() };
     let a0 = first as f64 * g;
     let mut walk: Vec<(DVec2, f64)> = vec![(DVec2::ZERO, base)];
     match layout.shape {
@@ -674,6 +1002,8 @@ pub fn layout_stair(
             b.flight(DVec2::ZERO, DVec2::X, first, 0);
             if corner == 1 {
                 b.landing(rect(a0, a0 + landing, -hw, hw), [DVec2::new(a0, -hw), DVec2::new(a0, hw)], first);
+                let (c, half) = (DVec2::new(a0 + landing / 2.0, 0.0), DVec2::new(landing / 2.0, hw));
+                b.frame(c, DVec2::X, half, first, DVec2::ZERO, DVec2::new(a0 + landing, 0.0), DVec2::X);
             }
             let o2 = DVec2::new(a0 + landing * corner as f64, 0.0);
             b.flight(o2, DVec2::X, second, first + corner);
@@ -684,6 +1014,8 @@ pub fn layout_stair(
             b.flight(DVec2::ZERO, DVec2::X, first, 0);
             if corner == 1 {
                 b.landing(rect(a0, a0 + width, -hw, hw), [DVec2::new(a0, -hw), DVec2::new(a0, hw)], first);
+                let c = DVec2::new(a0 + hw, 0.0);
+                b.frame(c, DVec2::X, DVec2::splat(hw), first, DVec2::ZERO, DVec2::new(a0 + hw, hw), DVec2::Y);
             } else if corner >= 2 {
                 b.winders(a0, hw, width, corner, first);
             }
@@ -698,6 +1030,8 @@ pub fn layout_stair(
             let b2 = width + layout.gap;
             if corner == 1 {
                 b.landing(rect(a0, a0 + landing, -hw, b2 + hw), [DVec2::new(a0, -hw), DVec2::new(a0, hw)], first);
+                let (c, half) = (DVec2::new(a0 + landing / 2.0, b2 / 2.0), DVec2::new(landing / 2.0, hw + b2 / 2.0));
+                b.frame(c, DVec2::X, half, first, DVec2::ZERO, DVec2::new(a0, b2), -DVec2::X);
             }
             let o2 = DVec2::new(a0, b2);
             b.flight(o2, -DVec2::X, second, first + corner);
@@ -706,15 +1040,38 @@ pub fn layout_stair(
             walk.push((DVec2::new(a0 + landing / 2.0, b2), zl));
             walk.push((o2, zl));
         }
+        StairShape::ThreeFlight => {
+            b.flight(DVec2::ZERO, DVec2::X, first, 0);
+            let o2 = DVec2::new(a0 + hw, hw);
+            let b1 = hw + middle as f64 * g;
+            let o3 = DVec2::new(a0, b1 + hw);
+            if corner >= 1 {
+                b.landing(rect(a0, a0 + width, -hw, hw), [DVec2::new(a0, -hw), DVec2::new(a0, hw)], first);
+                b.frame(DVec2::new(a0 + hw, 0.0), DVec2::X, DVec2::splat(hw), first, DVec2::ZERO, o2, DVec2::Y);
+            }
+            b.flight(o2, DVec2::Y, middle, first + 1);
+            if corner >= 2 {
+                let front = [DVec2::new(a0 + width, b1), DVec2::new(a0, b1)];
+                b.landing(rect(a0, a0 + width, b1, b1 + width), front, first + 1 + middle);
+                let c = DVec2::new(a0 + hw, b1 + hw);
+                b.frame(c, DVec2::Y, DVec2::splat(hw), first + 1 + middle, o2, o3, -DVec2::X);
+            }
+            b.flight(o3, -DVec2::X, second, first + 2 + middle);
+            let (z1, z2) = (b.z(first), b.z(first + 1 + middle));
+            walk.push((DVec2::new(a0 + hw, 0.0), z1));
+            walk.push((o2, z1));
+            walk.push((DVec2::new(a0 + hw, b1 + hw), z2));
+            walk.push((o3, z2));
+        }
         StairShape::Spiral => {
             b.spiral(slots);
         }
     }
-    let (steps, mut flights, parts) = (b.steps, b.flights, b.parts);
+    let (steps, mut flights, landings, parts) = (b.steps, b.flights, b.landings, b.parts);
     // The first flight of a stair with a landing rises to it.
     let ahead = match layout.shape {
         StairShape::StraightLanding | StairShape::UShaped => landing,
-        StairShape::LShaped => width,
+        StairShape::LShaped | StairShape::ThreeFlight => width,
         StairShape::Straight | StairShape::Spiral => 0.0,
     };
     if corner == 1
@@ -723,12 +1080,20 @@ pub fn layout_stair(
     {
         f.landing_ahead = ahead;
     }
+    // The first two flights of a three-flight stair rise to a landing (still
+    // in the local frame: they go along +a and +b).
+    if layout.shape == StairShape::ThreeFlight && corner == 2 {
+        for f in flights.iter_mut().filter(|f| f.dir.x > 0.5 || f.dir.y > 0.5) {
+            f.landing_ahead = ahead;
+        }
+    }
     // The walking line ends at the back of the last tread.
     let end = match layout.shape {
         StairShape::Straight => Some(DVec2::new(a0, 0.0)),
         StairShape::StraightLanding => Some(DVec2::new(a0 + landing * corner as f64 + second as f64 * g, 0.0)),
         StairShape::LShaped => Some(DVec2::new(a0 + hw, hw + second as f64 * g)),
         StairShape::UShaped => Some(DVec2::new(a0 - second as f64 * g, width + layout.gap)),
+        StairShape::ThreeFlight => Some(DVec2::new(a0 - second as f64 * g, width + middle as f64 * g)),
         StairShape::Spiral => None,
     };
     match end {
@@ -772,6 +1137,18 @@ pub fn layout_stair(
             Flight { origin: o, dir: d, left: d.perp(), ..f }
         })
         .collect();
+    geom.landings = landings
+        .into_iter()
+        .map(|l| {
+            let c = world(l.center);
+            StairLanding {
+                center: c,
+                along: world(l.center + l.along) - c,
+                across: world(l.center + l.across) - c,
+                ..l
+            }
+        })
+        .collect();
     geom.parts = parts.into_iter().map(|p| p.into_iter().map(world).collect()).collect();
     geom.spiral = spiral.map(|sp| Spiral { center: world(sp.center), ..sp });
     geom
@@ -786,6 +1163,7 @@ struct Builder<'a> {
     geom: &'a StairGeom,
     steps: Vec<StairStep>,
     flights: Vec<Flight>,
+    landings: Vec<StairLanding>,
     parts: Vec<Vec<DVec2>>,
 }
 
@@ -834,6 +1212,37 @@ impl Builder<'_> {
         self.parts.push(outline.clone());
         let n = outline.len();
         self.steps.push(StairStep { outline, along: vec![0.5; n], front, z: self.z(slot), kind: StepKind::Landing });
+    }
+
+    /// The frame of the landing at `slot` centered at `center`, `half` its
+    /// half sizes along `along` (the arriving flight's direction) and across;
+    /// the flights it joins start at `arrive_origin` and `leave_origin`, the
+    /// leaving one going along `leave_dir`.
+    #[allow(clippy::too_many_arguments)]
+    fn frame(
+        &mut self,
+        center: DVec2,
+        along: DVec2,
+        half: DVec2,
+        slot: usize,
+        arrive_origin: DVec2,
+        leave_origin: DVec2,
+        leave_dir: DVec2,
+    ) {
+        let across = along.perp();
+        let leave = DVec2::new(leave_dir.dot(along), leave_dir.dot(across));
+        let rel = leave_origin - center;
+        let leave_at = if leave.x.abs() > 0.5 { rel.dot(across) } else { rel.dot(along) };
+        self.landings.push(StairLanding {
+            center,
+            along,
+            across,
+            half,
+            z: self.z(slot),
+            arrive: (arrive_origin - center).dot(across),
+            leave,
+            leave_at,
+        });
     }
 
     /// `count` winders filling the corner square `[a0, a0 + w] × [-hw, hw]`,
@@ -1085,6 +1494,36 @@ mod tests {
     }
 
     #[test]
+    fn step_numbers_count_the_treads_up_to_the_floor_above() {
+        // 16 risers: treads 1 to 15, then 16 on the floor it arrives at.
+        let g = geom(StairLayout::default(), 2.88);
+        let spots = g.number_spots();
+        let numbers: Vec<i32> = spots.iter().map(|s| s.1).collect();
+        assert_eq!(numbers, (1..=16).collect::<Vec<_>>());
+        // Inside each tread, a quarter of the width to the left of the walking line.
+        for ((p, _), st) in spots.iter().zip(&g.steps) {
+            assert!(polygon::contains(&st.outline, *p), "{p} outside its tread");
+            assert!((p.y - 0.25).abs() < 1e-9, "{p}");
+        }
+        // The last one a tread past the last riser (at 15 × 0.28).
+        let (top, _) = spots[15];
+        assert!((top - DVec2::new(15.0 * 0.28 + 0.14, 0.25)).length() < 1e-9, "{top}");
+        // Landings are skipped, and the count may start elsewhere.
+        let layout = StairLayout { shape: StairShape::StraightLanding, number_start: 17, ..Default::default() };
+        let numbers: Vec<i32> = geom(layout, 2.88).number_spots().iter().map(|s| s.1).collect();
+        assert_eq!(numbers, (17..=31).collect::<Vec<_>>());
+        // Winders and spiral treads are numbered too.
+        for layout in [
+            StairLayout { shape: StairShape::LShaped, winders: 3, ..Default::default() },
+            StairLayout { shape: StairShape::Spiral, ..Default::default() },
+        ] {
+            let g = geom(layout, 2.88);
+            let treads = g.steps.iter().filter(|s| s.kind != StepKind::Landing).count();
+            assert_eq!(g.number_spots().len(), treads + 1, "{:?}", layout.shape);
+        }
+    }
+
+    #[test]
     fn landings_split_the_flights() {
         let layout = StairLayout { shape: StairShape::StraightLanding, ..Default::default() };
         let g = geom(layout, 2.88);
@@ -1137,6 +1576,297 @@ mod tests {
         let end = g.walkline.last().copied().unwrap_or_default();
         // 7 treads up, landing, 7 treads back: the top is over the start, beside it.
         assert!(end.x.abs() < 1e-9 && (end.y - 1.2).abs() < 1e-9 && (end.z - 2.88).abs() < 1e-9, "{end}");
+    }
+
+    #[test]
+    fn three_flight_stair_turns_twice_at_landings() {
+        let layout = StairLayout { shape: StairShape::ThreeFlight, ..Default::default() };
+        let g = geom(layout, 2.88);
+        // 15 slots: 4 treads, a landing, 4 treads, a landing, 5 treads.
+        let kinds: Vec<_> = g.steps.iter().map(|s| s.kind).collect();
+        assert_eq!(kinds.len(), 15);
+        assert_eq!((kinds[4], kinds[9]), (StepKind::Landing, StepKind::Landing));
+        assert_eq!(kinds.iter().filter(|k| **k == StepKind::Landing).count(), 2);
+        for (i, s) in g.steps.iter().enumerate() {
+            assert!((s.z - (i + 1) as f64 * 0.18).abs() < 1e-9);
+        }
+        // The landings are square and no step overlaps another.
+        let area: f64 = g.steps.iter().map(|s| polygon::area(&s.outline)).sum();
+        assert!((area - (13.0 * 0.28 + 2.0)).abs() < 1e-9, "{area}");
+        // The third flight comes back beside the first: it ends one tread
+        // behind the start, across the middle flight.
+        let end = g.walkline.last().copied().unwrap_or_default();
+        assert!((end - DVec3::new(-0.28, 1.0 + 4.0 * 0.28, 2.88)).length() < 1e-9, "{end}");
+        let right = geom(StairLayout { turn: Turn::Right, ..layout }, 2.88);
+        let r_end = right.walkline.last().copied().unwrap_or_default();
+        assert!((r_end.y + end.y).abs() < 1e-9 && (r_end.x - end.x).abs() < 1e-9);
+        // The inner railing turns at both inner corners; both railings reach the top.
+        let a0 = 4.0 * 0.28;
+        let inner = g.railing_path(StairSide::Left, 0.05);
+        let has =
+            |path: &[DVec3], x: f64, y: f64| path.iter().any(|p| (p.x - x).abs() < 1e-9 && (p.y - y).abs() < 1e-9);
+        assert!(has(&inner, a0 + 0.05, 0.45) && has(&inner, a0 + 0.05, 0.5 + a0 + 0.05), "{inner:?}");
+        let outer = g.railing_path(StairSide::Right, 0.05);
+        assert!(has(&outer, a0 + 0.95, -0.45) && has(&outer, a0 + 0.95, 0.5 + a0 + 0.95), "{outer:?}");
+        for path in [&inner, &outer] {
+            assert!(path.last().is_some_and(|p| (p.z - 2.88).abs() < 1e-9));
+        }
+        // Cast in place: three flight blocks and two landing slabs, all closed.
+        let build = StairBuild { construction: StairConstruction::CastInPlace, ..Default::default() };
+        let pieces = g.pieces(&build);
+        assert_eq!(pieces.len(), 5);
+        assert_eq!(g.flights.iter().filter(|f| f.landing_ahead > 0.0).count(), 2);
+        for piece in pieces {
+            let mut s = Solid::new(cc_core::ElementId(1), cc_core::Category::Stair, [0, 0, 0]);
+            s.add_polygons(piece);
+            assert!(s.volume() > 0.0);
+        }
+        // The flights can be sized.
+        let sized = geom(StairLayout { split: 3, split2: 7, ..layout }, 2.88);
+        let treads = |g: &StairGeom| g.flights.iter().map(|f| f.treads).collect::<Vec<_>>();
+        assert_eq!(treads(&sized), [2, 6, 5]);
+    }
+
+    #[test]
+    fn a_stair_can_set_its_risers_and_tread() {
+        // 18 risers of 16 cm and 30 cm treads instead of the type's 16 × 18 cm and 28 cm.
+        let g = geom(StairLayout { risers: 18, tread: 0.30, ..Default::default() }, 2.88);
+        assert_eq!((g.risers, g.steps.len()), (18, 17));
+        assert!((g.riser - 0.16).abs() < 1e-12 && (g.tread - 0.30).abs() < 1e-12);
+        assert!((g.run() - 17.0 * 0.30).abs() < 1e-9);
+        // Too few risers break the type's maximum, and the check says so.
+        let few = geom(StairLayout { risers: 12, ..Default::default() }, 2.88);
+        assert!((few.riser - 0.24).abs() < 1e-12);
+        assert!(few.check.issues.iter().any(|i| i.key() == "stair-issue-riser-high"));
+    }
+
+    /// The plumb thickness of a side profile at `s`: between the lowest and
+    /// highest points where a vertical line crosses its edges.
+    fn thickness_at(profile: &[(f64, f64)], s: f64) -> f64 {
+        let n = profile.len();
+        let zs: Vec<f64> = (0..n)
+            .filter_map(|i| {
+                let (a, b) = (profile[i], profile[(i + 1) % n]);
+                let (lo, hi) = (a.0.min(b.0), a.0.max(b.0));
+                (s >= lo && s <= hi && hi - lo > 1e-12).then(|| a.1 + (b.1 - a.1) * (s - a.0) / (b.0 - a.0))
+            })
+            .collect();
+        let (lo, hi) = zs.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), z| (lo.min(*z), hi.max(*z)));
+        if hi > lo { hi - lo } else { 0.0 }
+    }
+
+    /// Issue #142: a central stringer is a band parallel to the pitch, cut
+    /// level on the floor (not a wedge growing from nothing), and the
+    /// stringers of flights between landings bear on them instead of
+    /// touching their edges.
+    #[test]
+    fn center_stringers_are_bands_that_bear_on_the_floor_and_landings() {
+        let build = StairBuild {
+            construction: StairConstruction::Assembled,
+            stringers: Stringers::Center,
+            stringer_width: 0.06,
+            stringer_depth: 0.25,
+            tread_thickness: 0.04,
+            ..Default::default()
+        };
+        let (h, g, tt): (f64, f64, f64) = (0.18, 0.28, 0.04);
+        let k = h / g;
+        let depth = 0.25 * (1.0 + k * k).sqrt();
+        let lift = -tt - h;
+        // A straight flight from the floor: full depth wherever the band clears the floor.
+        let straight = geom(StairLayout::default(), 2.88);
+        let f = straight.flights[0];
+        let profiles = straight.stringer_profiles(&f, lift, depth, 0.25);
+        assert_eq!(profiles.len(), 1);
+        let p = &profiles[0];
+        let len = f.treads as f64 * g;
+        let clear = (depth - (f.z0 + lift)) / k; // where the band's underside reaches the floor
+        for i in 1..20 {
+            let s = clear + (len - clear) * i as f64 / 20.0;
+            assert!((thickness_at(p, s) - depth).abs() < 1e-9, "at {s}: {}", thickness_at(p, s));
+        }
+        // The built stringer (the pieces within 3 cm of the axis) holds that
+        // band: the wedge it used to be held about half of it.
+        let mut stringer = 0.0;
+        for piece in straight.pieces(&build) {
+            if piece.iter().flatten().all(|q| q.y.abs() <= 0.03 + 1e-9) {
+                let mut s = Solid::new(cc_core::ElementId(1), cc_core::Category::Stair, [0, 0, 0]);
+                s.add_polygons(piece);
+                stringer += s.volume();
+            }
+        }
+        let n = p.len();
+        let area = (0..n).map(|i| p[i].0 * p[(i + 1) % n].1 - p[(i + 1) % n].0 * p[i].1).sum::<f64>().abs() / 2.0;
+        assert!((stringer - 0.06 * area).abs() < 1e-9, "{stringer} vs {}", 0.06 * area);
+        assert!(area > 0.9 * depth * len, "{area} vs the full band {}", depth * len);
+        // Cut level on the floor, nowhere below it.
+        let low = p.iter().map(|q| q.1).fold(f64::INFINITY, f64::min);
+        assert!(low.abs() < 1e-12, "{low}");
+        assert!(p.iter().filter(|q| q.1.abs() < 1e-12).count() >= 2, "a level seat on the floor: {p:?}");
+
+        // Three flights: the middle one leaves the first landing and rises to the second.
+        let three = geom(StairLayout { shape: StairShape::ThreeFlight, ..Default::default() }, 2.88);
+        let middle = three.flights[1];
+        let pieces = three.stringer_profiles(&middle, lift, depth, 0.25);
+        assert_eq!(pieces.len(), 2, "along the flight, and on under the landing");
+        // Leaving the first landing: it bears on the landing's face from its underside up.
+        let underside_1 = middle.floor - 0.25;
+        let start = thickness_at(&pieces[0], 1e-9);
+        let top_0 = middle.z0 + lift;
+        assert!((start - (top_0 - underside_1)).abs() < 1e-9 && start > 0.15, "{start}");
+        // Rising to the second: carried on under it up to its underside, along it.
+        let underside_2 = middle.z0 + middle.treads as f64 * h - 0.25;
+        let under = &pieces[1];
+        let high = under.iter().map(|q| q.1).fold(f64::NEG_INFINITY, f64::max);
+        assert!((high - underside_2).abs() < 1e-9, "{high} vs {underside_2}");
+        let bearing = under.iter().filter(|q| (q.1 - underside_2).abs() < 1e-9).map(|q| q.0).collect::<Vec<_>>();
+        let reach = bearing.iter().fold(f64::NEG_INFINITY, |a, b| a.max(*b))
+            - bearing.iter().fold(f64::INFINITY, |a, b| a.min(*b));
+        assert!(reach > 0.1, "it bears along the landing's underside for {reach} m");
+        // Built, every piece is a closed solid.
+        for piece in three.pieces(&build) {
+            let mut s = Solid::new(cc_core::ElementId(1), cc_core::Category::Stair, [0, 0, 0]);
+            s.add_polygons(piece);
+            assert!(s.volume() > 0.0);
+        }
+    }
+
+    /// The volume of a closed piece.
+    fn piece_volume(piece: &[Vec<DVec3>]) -> f64 {
+        let mut s = Solid::new(cc_core::ElementId(1), cc_core::Category::Stair, [0, 0, 0]);
+        s.add_polygons(piece.to_vec());
+        s.volume()
+    }
+
+    /// The pieces running from elevation `lo` to `hi`.
+    fn pieces_between(pieces: &Pieces, lo: f64, hi: f64) -> Vec<&Vec<Vec<DVec3>>> {
+        pieces
+            .iter()
+            .filter(|p| {
+                let zs = p.iter().flatten().map(|q| q.z);
+                let (a, b) = zs.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), z| (a.min(z), b.max(z)));
+                (a - lo).abs() < 1e-9 && (b - hi).abs() < 1e-9
+            })
+            .collect()
+    }
+
+    /// Issue #143: an assembled stair's landings are a deck on beams in line
+    /// with the stringers (a cross or a T under a central stringer, a frame
+    /// round the edge under side ones), with posts only where asked for.
+    #[test]
+    fn assembled_landings_are_decks_on_beams_with_optional_posts() {
+        let (tt, sd, sw) = (0.04, 0.25, 0.06);
+        let center = StairBuild {
+            construction: StairConstruction::Assembled,
+            stringers: Stringers::Center,
+            stringer_width: sw,
+            stringer_depth: sd,
+            tread_thickness: tt,
+            ..Default::default()
+        };
+        let three = StairLayout { shape: StairShape::ThreeFlight, ..Default::default() };
+        let g = geom(three, 2.88);
+        assert_eq!(g.landings.len(), 2);
+        let pieces = g.pieces(&center);
+        for piece in &pieces {
+            assert!(piece_volume(piece) > 0.0);
+        }
+        for l in &g.landings {
+            // The deck: the landing's square, as thick as a tread.
+            let deck = pieces_between(&pieces, l.z - tt, l.z);
+            let deck_volume: f64 = deck.iter().map(|p| piece_volume(p)).sum();
+            assert!((deck_volume - tt).abs() < 1e-9, "{deck_volume}");
+            // The beams: a cross of two 1 m beams, the second split at the first.
+            let beams = pieces_between(&pieces, l.z - tt - sd, l.z - tt);
+            assert_eq!(beams.len(), 3, "a beam through and two halves");
+            let volume: f64 = beams.iter().map(|p| piece_volume(p)).sum();
+            assert!((volume - sd * sw * (2.0 - sw)).abs() < 1e-9, "{volume}");
+            // Nothing hangs down to the floor: no posts unless asked for.
+            assert_eq!(l.post_spots(Stringers::Center, LandingBeams::Cross).len(), 4);
+        }
+        // Only the first flight's stringer stands on the floor: no posts by default.
+        let front = g.landings[0].center.x - g.landings[0].half.x;
+        assert!(pieces.iter().flatten().flatten().all(|q| q.z > 1e-9 || q.x < front + 1e-9), "no post by default");
+        // The beams are in line with the flights' stringers: the first
+        // landing's beam through runs on the first flight's axis, the other
+        // on the middle flight's.
+        let l = g.landings[0];
+        let along = l.beams(Stringers::Center, LandingBeams::Cross, sw);
+        let axis = |r: &LandingRect| l.point(DVec2::new((r[0] + r[1]) / 2.0, (r[2] + r[3]) / 2.0));
+        assert!((axis(&along[0]).y - g.flights[0].origin.y).abs() < 1e-9);
+        assert!(along[1..].iter().all(|r| (axis(r).x - g.flights[1].origin.x).abs() < 1e-9));
+
+        // A T: the leaving flight's beam only from the beam through to the
+        // edge it leaves from.
+        let tee = StairBuild { landing_beams: LandingBeams::Tee, ..center };
+        let beams = l.beams(Stringers::Center, LandingBeams::Tee, sw);
+        assert_eq!(beams.len(), 2);
+        assert!(beams[1][2] > 0.0, "towards the middle flight, on the side the stair turns to");
+        let spots: Vec<PostAt> = l.post_spots(Stringers::Center, LandingBeams::Tee).iter().map(|s| s.0).collect();
+        assert_eq!(spots, [PostAt::Front, PostAt::Back, PostAt::Inner]);
+        assert!(volume(&g, &tee) < volume(&g, &center));
+
+        // One post, at the back of the first landing: from the floor up to its beams.
+        let mut posts = three;
+        posts.posts[0].set(PostAt::Back, true);
+        let with_post = geom(posts, 2.88).pieces(&center);
+        assert_eq!(with_post.len(), pieces.len() + 1);
+        let low: Vec<_> = with_post.iter().filter(|p| p.iter().flatten().any(|q| q.z.abs() < 1e-9)).collect();
+        let post = low.iter().find(|p| p.iter().flatten().all(|q| q.z <= l.z - tt - sd + 1e-9));
+        let post = post.copied().cloned().unwrap_or_default();
+        let pw = 0.08;
+        assert!((piece_volume(&post) - pw * pw * (l.z - tt - sd)).abs() < 1e-9, "{}", piece_volume(&post));
+        // Flush with the back edge, on the beam's axis.
+        let back = l.point(DVec2::new(l.half.x, l.arrive));
+        let xs = post.iter().flatten().map(|q| q.x);
+        let (x0, x1) = xs.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), x| (a.min(x), b.max(x)));
+        assert!((x1 - back.x).abs() < 1e-9 && (x1 - x0 - pw).abs() < 1e-9, "{x0} {x1} vs {back}");
+        // A spot the landing's beams do not reach takes no post.
+        let mut corner = three;
+        corner.posts[0].set(PostAt::FrontOuter, true);
+        assert_eq!(geom(corner, 2.88).pieces(&center).len(), pieces.len());
+
+        // Side stringers: a frame round the edge, posts at its corners.
+        let sides = StairBuild { stringers: Stringers::Sides, ..center };
+        let frame = pieces_between(&g.pieces(&sides), l.z - tt - sd, l.z - tt).len();
+        assert_eq!(frame, 4, "four beams under the landing");
+        let ring = l.beams(Stringers::Sides, LandingBeams::Cross, sw);
+        let area: f64 = ring.iter().map(|r| (r[1] - r[0]) * (r[3] - r[2])).sum();
+        assert!((area - (1.0 - (1.0 - 2.0 * sw).powi(2))).abs() < 1e-9, "{area}");
+        let mut corners = three;
+        corners.posts[1] = cc_core::LandingPosts { front_outer: true, back_inner: true, ..Default::default() };
+        let mirrored = StairLayout { turn: Turn::Right, ..corners };
+        for layout in [corners, mirrored] {
+            let g = geom(layout, 2.88);
+            let l2 = g.landings[1];
+            let built = g.pieces(&sides);
+            let on_floor = |p: &&Vec<Vec<DVec3>>| p.iter().flatten().any(|q| q.z.abs() < 1e-9 && q.x > front + 1e-9);
+            let posts: Vec<_> = built.iter().filter(on_floor).collect();
+            assert_eq!(posts.len(), 2);
+            // The back inner corner is on the side the stair turns to.
+            let inner = l2.point(DVec2::new(l2.half.x, l2.half.y) - DVec2::splat(pw / 2.0));
+            let centroid = |p: &Vec<Vec<DVec3>>| {
+                let pts: Vec<DVec2> = p.iter().flatten().map(|q| q.truncate()).collect();
+                pts.iter().copied().sum::<DVec2>() / pts.len() as f64
+            };
+            assert!(posts.iter().any(|p| centroid(p).distance(inner) < 1e-9), "{inner}");
+        }
+
+        // A U-shaped landing: a beam across the middle carrying both
+        // stringers' lines (cut short at it for a T).
+        let u = geom(StairLayout { shape: StairShape::UShaped, gap: 0.2, ..Default::default() }, 2.88);
+        let lu = u.landings[0];
+        assert!((lu.half - DVec2::new(0.5, 1.1)).length() < 1e-9 && (lu.arrive + 0.6).abs() < 1e-9);
+        assert_eq!(lu.beams(Stringers::Center, LandingBeams::Cross, sw).len(), 5);
+        assert_eq!(lu.beams(Stringers::Center, LandingBeams::Tee, sw).len(), 3);
+        for build in [center, tee, sides] {
+            for piece in u.pieces(&build) {
+                assert!(piece_volume(&piece) > 0.0);
+            }
+        }
+        // A straight landing: the stringers' line along and a beam across.
+        let straight = geom(StairLayout { shape: StairShape::StraightLanding, ..Default::default() }, 2.88);
+        assert_eq!(straight.landings[0].beams(Stringers::Center, LandingBeams::Cross, sw).len(), 3);
     }
 
     #[test]

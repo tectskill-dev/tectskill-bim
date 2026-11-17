@@ -11,6 +11,10 @@ use glam::DVec3;
 const EPS: f64 = 1e-6;
 /// Most polygons an operation may produce or hold in its trees.
 const MAX_POLYGONS: usize = 200_000;
+/// Most polygons one pass over a tree (building it or clipping by it) may
+/// split: far above what real solids need, it bounds the work of
+/// degenerate trees.
+const MAX_SPLITS: usize = 50_000_000;
 
 #[derive(Debug, Clone, Copy)]
 struct Plane {
@@ -151,14 +155,22 @@ impl Tree {
 
     /// Insert polygons, growing the tree from the root.
     fn build(&mut self, polys: Vec<Poly>) -> Result<(), TooBig> {
+        // The tree's size, kept up to date as polygons and nodes are added.
+        let mut size = self.size();
+        let mut work = 0usize;
         let mut stack = vec![(0usize, polys)];
         while let Some((i, polys)) = stack.pop() {
             let Some(first) = polys.first() else { continue };
+            work += polys.len();
+            if work > MAX_SPLITS {
+                return Err(TooBig);
+            }
             let plane = *self.nodes[i].plane.get_or_insert(first.plane);
             let (mut cf, mut cb, mut f, mut b) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for p in polys {
                 split(&plane, p, &mut cf, &mut cb, &mut f, &mut b);
             }
+            size += cf.len() + cb.len();
             self.nodes[i].polys.extend(cf);
             self.nodes[i].polys.extend(cb);
             for (side, list) in [(true, f), (false, b)] {
@@ -170,6 +182,7 @@ impl Tree {
                     Some(c) => c,
                     None => {
                         self.nodes.push(Node::default());
+                        size += 1;
                         let c = self.nodes.len() - 1;
                         if side {
                             self.nodes[i].front = Some(c);
@@ -181,7 +194,7 @@ impl Tree {
                 };
                 stack.push((child, list));
             }
-            if self.size() > MAX_POLYGONS {
+            if size > MAX_POLYGONS {
                 return Err(TooBig);
             }
         }
@@ -191,13 +204,21 @@ impl Tree {
     /// The parts of `polys` outside this tree's solid.
     fn clip_polygons(&self, polys: Vec<Poly>) -> Result<Vec<Poly>, TooBig> {
         let mut out = Vec::new();
+        // Polygons waiting on the stack, kept up to date as it changes.
+        let mut pending = polys.len();
+        let mut work = 0usize;
         let mut stack = vec![(0usize, polys)];
         while let Some((i, polys)) = stack.pop() {
+            pending -= polys.len();
             let node = &self.nodes[i];
             let Some(plane) = node.plane else {
                 out.extend(polys);
                 continue;
             };
+            work += polys.len();
+            if work > MAX_SPLITS {
+                return Err(TooBig);
+            }
             let (mut f, mut b) = (Vec::new(), Vec::new());
             for p in polys {
                 let (mut cf, mut cb) = (Vec::new(), Vec::new());
@@ -206,14 +227,18 @@ impl Tree {
                 b.extend(cb);
             }
             match node.front {
-                Some(c) => stack.push((c, f)),
+                Some(c) => {
+                    pending += f.len();
+                    stack.push((c, f));
+                }
                 None => out.extend(f),
             }
             // Behind a leaf is inside the solid: dropped.
             if let Some(c) = node.back {
+                pending += b.len();
                 stack.push((c, b));
             }
-            if out.len() + stack.iter().map(|s| s.1.len()).sum::<usize>() > MAX_POLYGONS {
+            if out.len() + pending > MAX_POLYGONS {
                 return Err(TooBig);
             }
         }
@@ -375,5 +400,28 @@ mod tests {
         assert!((volume(&mesh) - 3.0).abs() < 1e-9);
         let cut = subtract(&mesh, &cube(DVec3::new(-1.0, -1.0, -1.0), DVec3::new(0.5, 0.5, 2.0))).unwrap();
         assert!((volume(&cut) - 2.75).abs() < 1e-9, "{}", volume(&cut));
+    }
+
+    /// A finely faceted body (a 256-sided cylinder) cut by a box: the trees
+    /// grow with many polygons and the cut stays exact for its facets.
+    #[test]
+    fn many_faced_solids_are_cut() {
+        let n = 256;
+        let ring = |z: f64| -> Vec<DVec3> {
+            (0..n)
+                .map(|i| (i as f64 / n as f64 * std::f64::consts::TAU, z))
+                .map(|(a, z)| DVec3::new(a.cos(), a.sin(), z))
+                .collect()
+        };
+        let (low, high) = (ring(0.0), ring(1.0));
+        let mut mesh = vec![low.iter().rev().copied().collect::<Vec<_>>(), high.clone()];
+        for i in 0..n {
+            let j = (i + 1) % n;
+            mesh.push(vec![low[i], low[j], high[j], high[i]]);
+        }
+        let whole = volume(&mesh);
+        // The half with x > 0 goes.
+        let cut = subtract(&mesh, &cube(DVec3::new(0.0, -2.0, -1.0), DVec3::new(2.0, 2.0, 2.0))).unwrap();
+        assert!((volume(&cut) - whole / 2.0).abs() < 1e-9, "{} vs {}", volume(&cut), whole / 2.0);
     }
 }

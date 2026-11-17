@@ -531,3 +531,46 @@ fn a_3d_camera_redraws_only_what_shows_it() {
     s.doc.mark_saved();
     assert!(!s.doc.is_dirty());
 }
+
+/// Issue #332: an elevation draws the grids square to it, a dimension
+/// between two of them follows them, and the view hides them by category.
+#[test]
+fn an_elevation_draws_grids_that_dimensions_follow_and_the_view_hides() {
+    let mut s = Session::default();
+    let first = id(&run(&mut s, "grid_create", json!({"start": [0.0, -2.0], "end": [0.0, 5.0]})));
+    let second = id(&run(&mut s, "grid_create", json!({"start": [4.0, -2.0], "end": [4.0, 5.0]})));
+    let across = id(&run(&mut s, "grid_create", json!({"start": [-2.0, 1.0], "end": [6.0, 1.0]})));
+    let view = s
+        .project()
+        .views
+        .values()
+        .find(|v| matches!(v.kind, cc_core::ViewKind::Elevation { direction: cc_core::Direction::South }))
+        .map(|v| v.id)
+        .expect("a south elevation");
+    let drawn = |s: &mut Session| -> BTreeSet<u64> {
+        let d = s.drawing(view).unwrap();
+        d.prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Line { style: LineStyle::Center, element: Some(e), .. } => Some(e.0),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(drawn(&mut s), BTreeSet::from([first, second]), "not the grid along the view ({across})");
+
+    // A dimension between the two grid lines is tied to both, and follows a moved grid.
+    let dim = run(&mut s, "dimension_create", json!({"view": view.0, "a": [0.0, 1.5], "b": [4.0, 1.5]}));
+    let refs = &dim["params"]["refs"];
+    assert!(refs[0]["target"]["Element"] == first && refs[1]["target"]["Element"] == second, "{refs}");
+    run(&mut s, "elements_move", json!({"ids": [second], "delta": [1.0, 0.0]}));
+    let moved = run(&mut s, "element_get", json!({"id": dim["id"]}));
+    assert!((moved["params"]["b"][0].as_f64().unwrap() - 5.0).abs() < 1e-9, "{moved}");
+
+    // Hidden with the category in this view; plans keep theirs.
+    run(&mut s, "view_graphics_set", json!({"view": view.0, "category": "grid", "visible": false}));
+    assert!(drawn(&mut s).is_empty());
+    let plan = ViewId(id(&run(&mut s, "views_list", json!({"category": "floor_plan"}))[0]));
+    let in_plan = s.drawing(plan).unwrap();
+    assert!(in_plan.prims.iter().any(|p| p.element() == Some(ElementId(first))));
+}

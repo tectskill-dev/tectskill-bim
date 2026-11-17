@@ -79,6 +79,8 @@ pub struct Resolver<'a> {
     phase: Option<PhaseView<'a>>,
     /// Every element of the view shows by category (or not at all) in its phase.
     phase_trivial: bool,
+    /// The design options the view shows, when it leaves any element out.
+    options: Option<std::collections::BTreeSet<cc_core::OptionId>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -91,12 +93,29 @@ impl<'a> Resolver<'a> {
         let phase = PhaseView::of(project, view);
         let phase_trivial = phase
             .is_none_or(|ph| project.elements.values().all(|e| ph.style(project, e).is_some_and(|g| g.is_empty())));
-        Self { project, geom, graphics: &view.graphics, temporary, cache: HashMap::new(), phase, phase_trivial }
+        let options = view
+            .kind
+            .is_phased()
+            .then(|| project.shown_options(Some(view)))
+            .filter(|shown| project.options_hide_any(shown));
+        Self {
+            project,
+            geom,
+            graphics: &view.graphics,
+            temporary,
+            cache: HashMap::new(),
+            phase,
+            phase_trivial,
+            options,
+        }
     }
 
     /// Whether the view draws everything as generated.
     pub fn is_trivial(&self) -> bool {
-        self.graphics.is_empty() && self.temporary.is_none_or(|t| t.is_empty()) && self.phase_trivial
+        self.graphics.is_empty()
+            && self.temporary.is_none_or(|t| t.is_empty())
+            && self.phase_trivial
+            && self.options.is_none()
     }
 
     /// The overrides of an element, or `None` when it is hidden. Ids that
@@ -108,6 +127,7 @@ impl<'a> Resolver<'a> {
         let s = match self.project.element(id) {
             None => Some(GraphicOverride::default()),
             Some(e) if self.temporary.is_some_and(|t| !t.shows(id, e.category())) => None,
+            Some(e) if self.options.as_ref().is_some_and(|shown| !self.project.option_shows(e, shown)) => None,
             Some(e) => {
                 let (project, geom) = (self.project, self.geom);
                 match self.phase.map_or(Some(GraphicOverride::default()), |ph| ph.style(project, e)) {
@@ -135,6 +155,19 @@ fn pen(lines: &LineGraphics, halftone: bool) -> Option<Pen> {
     })
 }
 
+/// `over` on top of `own`, attribute by attribute.
+fn merge(own: Option<Pen>, over: Option<Pen>) -> Option<Pen> {
+    match (own, over) {
+        (Some(o), Some(n)) => Some(Pen {
+            color: n.color.or(o.color),
+            weight: n.weight.or(o.weight),
+            pattern: n.pattern.or(o.pattern),
+            halftone: n.halftone || o.halftone,
+        }),
+        (o, n) => n.or(o),
+    }
+}
+
 fn rgb(c: [u8; 4]) -> [u8; 3] {
     [c[0], c[1], c[2]]
 }
@@ -150,6 +183,8 @@ pub fn apply(d: &mut Drawing2D, resolver: &mut Resolver, scale: u32) {
     }
     let spacing = crate::cut::spacing(scale);
     let prims = std::mem::take(&mut d.prims);
+    let project = resolver.project;
+    let patterns = &project.fill_patterns;
     for prim in prims {
         let Some(id) = prim.element() else {
             d.prims.push(prim);
@@ -162,14 +197,18 @@ pub fn apply(d: &mut Drawing2D, resolver: &mut Resolver, scale: u32) {
         }
         let halftone = g.halftone == Some(true);
         match prim {
-            Prim::Line { a, b, style, element, pen: _ } => {
+            Prim::Image { origin, u, v, image, element, faded } => {
+                d.prims.push(Prim::Image { origin, u, v, image, element, faded: faded || halftone });
+            }
+            Prim::Line { a, b, style, element, pen: own } => {
                 let lines = match style {
                     LineStyle::Hatch if g.cut_fill.pattern.is_some() => continue,
                     LineStyle::Hatch => LineGraphics { color: g.cut_fill.color, ..Default::default() },
                     LineStyle::Cut => g.cut_lines,
                     _ => g.projection_lines,
                 };
-                d.prims.push(Prim::Line { a, b, style, element, pen: pen(&lines, halftone) });
+                // Overrides replace what they set; a line's own pen (imported drawings) keeps the rest.
+                d.prims.push(Prim::Line { a, b, style, element, pen: merge(own, pen(&lines, halftone)) });
             }
             Prim::Fill { pts, color, element, cut } => {
                 // Invisible fills (pick areas, highlight-only regions) stay as they are.
@@ -200,7 +239,7 @@ pub fn apply(d: &mut Drawing2D, resolver: &mut Resolver, scale: u32) {
                 if halftone {
                     c = crate::drawing::halftone(c);
                 }
-                let lines = hatch.map(|p| crate::hatch::hatch(p, &pts, spacing)).unwrap_or_default();
+                let lines = hatch.map(|p| crate::hatch::hatch_in(patterns, p, &pts, spacing)).unwrap_or_default();
                 d.prims.push(Prim::Fill { pts, color: rgba(c, alpha), element, cut });
                 let hatch_pen = pen(&LineGraphics { color: fill.color, ..Default::default() }, halftone);
                 for (a, b) in lines {

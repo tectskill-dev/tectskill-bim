@@ -17,6 +17,9 @@ pub enum ErrorCode {
     Io,
     /// An internal error (a bug); the session is kept as it was.
     Internal,
+    /// A Lua script or plugin failed: a syntax or run-time error, or one of
+    /// its limits (instructions, memory) reached.
+    Script,
 }
 
 /// A command failure: a code for programs and a message for people.
@@ -67,6 +70,7 @@ impl From<cc_core::PersistError> for EngineError {
             E::Parse(e) => t!("err-parse", "detail" => e),
             E::Serialize(e) => t!("err-serialize", "detail" => e),
             E::Version(v) => t!("err-version", "version" => v, "max" => cc_core::FORMAT_VERSION),
+            E::TooLarge(max) => t!("err-project-too-large", "max" => max >> 20),
         })
     }
 }

@@ -10,8 +10,8 @@ use crate::registry::{Command, CommandKind};
 use crate::session::Session;
 use crate::t;
 use cc_core::{
-    Category, ElementId, ElementKind, ElementType, ElementTypeId, Project, Ramp, RampLayout, RampRules, RampShape,
-    Turn, TypeData, WallTop,
+    Category, ElementId, ElementKind, ElementType, ElementTypeId, Project, Ramp, RampLayout, RampShape, Turn, TypeData,
+    WallTop,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -46,7 +46,7 @@ pub struct RampCreate {
     /// Type id or name (default: the category's default type).
     #[serde(default, rename = "type")]
     pub type_ref: Option<Ref>,
-    /// Height when there is no level above (default 3).
+    /// Height when there is no level above (default 3; 10'-0" in imperial projects).
     #[serde(default)]
     pub height: Option<f64>,
     /// Level the ramp rises to (default: the level above).
@@ -64,18 +64,19 @@ pub struct RampCreate {
     /// Landing length, meters (default: the type's shortest landing).
     #[serde(default)]
     pub landing: Option<f64>,
-    /// Clear gap between the flights of a U-shaped ramp, meters (default 0.1).
+    /// Clear gap between the flights of a U-shaped ramp, meters (default 0.1; 4" in imperial projects).
     #[serde(default)]
     pub gap: Option<f64>,
-    /// Radius of the inner edge of a spiral ramp, meters (default 1.5).
+    /// Radius of the inner edge of a spiral ramp, meters (default 1.5; 5'-0" in imperial projects).
     #[serde(default)]
     pub inner_radius: Option<f64>,
 }
 
 impl RampCreate {
     /// The plan layout these parameters ask for.
-    pub fn layout(&self) -> Result<RampLayout> {
-        let mut layout = RampLayout::default();
+    pub fn layout(&self, defaults: &cc_core::Defaults) -> Result<RampLayout> {
+        let (gap, _, inner_radius) = defaults.flights;
+        let mut layout = RampLayout { gap, inner_radius, ..Default::default() };
         if let Some(shape) = justification(self.shape.as_deref(), &SHAPES, "shape")? {
             layout.shape = shape;
         }
@@ -103,8 +104,11 @@ impl RampCreate {
 }
 
 /// A ramp type for a project that has none: 1.20 m wide, a 15 cm slab of
-/// the stairs' material, the default rules.
+/// the stairs' material, the default rules (4'-0", a 6" slab and the
+/// customary rules in imperial projects; see [`cc_core::Defaults::ramp`]).
 pub fn new_ramp_type(p: &Project, id: ElementTypeId) -> ElementType {
+    let d = p.defaults();
+    let (key, width, thickness) = d.ramp;
     let material = p
         .default_type(Category::Stair)
         .and_then(|t| p.element_type(t))
@@ -113,8 +117,8 @@ pub fn new_ramp_type(p: &Project, id: ElementTypeId) -> ElementType {
         .unwrap_or_default();
     ElementType {
         id,
-        name: t!("tpl-type-ramp"),
-        data: TypeData::Ramp { width: 1.2, thickness: 0.15, material, rules: RampRules::default() },
+        name: crate::i18n::tr(key),
+        data: TypeData::Ramp { width, thickness, material, rules: d.ramp_rules },
         info: Default::default(),
         uid: Default::default(),
     }
@@ -129,7 +133,7 @@ impl Command for RampCreate {
         let top = top(p, self.top_level.as_ref(), None)?.unwrap_or_else(|| default_top(p, level));
         let height = match top {
             WallTop::Level { level: t, .. } => p.level_elevation(t) - p.level_elevation(level),
-            WallTop::Unconnected => self.height.unwrap_or(3.0),
+            WallTop::Unconnected => self.height.unwrap_or(p.defaults().story),
         };
         let ty = match (&self.type_ref, p.default_type(Category::Ramp)) {
             (None, None) => None,
@@ -141,7 +145,7 @@ impl Command for RampCreate {
             base_offset: 0.0,
             height: positive(height, "height")?,
             top,
-            layout: self.layout()?,
+            layout: self.layout(p.defaults())?,
         };
         let id = edit(s, t!("tx-create-ramp"), |e| {
             let type_id = match ty {
@@ -196,6 +200,16 @@ impl Command for RampCheck {
 /// A broken ramp rule in words.
 pub fn issue_text(issue: &cc_core::RampIssue) -> String {
     use cc_core::RampIssue as I;
+    if cc_views::format::imperial() {
+        let (l, slope) = (cc_views::format::meters, cc_views::format::slope);
+        return match *issue {
+            I::TooSteep { slope: v, max } => t!("ramp-imp-issue-steep", "slope" => slope(v), "limit" => slope(max)),
+            I::FlightTooHigh { rise, max } => t!("ramp-imp-issue-flight-rise", "rise" => l(rise), "limit" => l(max)),
+            I::LandingTooShort { landing, min } => {
+                t!("ramp-imp-issue-landing-short", "landing" => l(landing), "limit" => l(min))
+            }
+        };
+    }
     let pct = |v: f64| format!("{:.2}", v * 100.0);
     let m = |v: f64| format!("{v:.2}");
     match *issue {
@@ -216,19 +230,19 @@ pub struct RampTypeCreate {
     /// Type name (default: the template's ramp name).
     #[serde(default)]
     pub name: Option<String>,
-    /// Width, meters (default 1.2).
+    /// Width, meters (default 1.2; 4'-0" in imperial projects).
     #[serde(default)]
     pub width: Option<f64>,
-    /// Slab thickness, meters (default 0.15).
+    /// Slab thickness, meters (default 0.15; 6" in imperial projects).
     #[serde(default)]
     pub thickness: Option<f64>,
     /// Steepest slope, percent (default 8.33).
     #[serde(default)]
     pub max_slope: Option<f64>,
-    /// Highest rise of one flight, meters (default 0.80).
+    /// Highest rise of one flight, meters (default 0.80; 30" in imperial projects).
     #[serde(default)]
     pub max_flight_rise: Option<f64>,
-    /// Shortest landing, meters (default 1.20).
+    /// Shortest landing, meters (default 1.20; 60" in imperial projects).
     #[serde(default)]
     pub min_landing: Option<f64>,
 }
@@ -237,7 +251,8 @@ impl Command for RampTypeCreate {
     const NAME: &'static str = "ramp_type_create";
     const KIND: CommandKind = CommandKind::Edit;
     fn run(self, s: &mut Session) -> Result<Value> {
-        let mut rules = RampRules::default();
+        let defaults = s.project().defaults();
+        let mut rules = defaults.ramp_rules;
         if let Some(v) = self.max_slope {
             rules.max_slope = positive(v, "max_slope")?.min(100.0) / 100.0;
         }
@@ -247,8 +262,8 @@ impl Command for RampTypeCreate {
         if let Some(v) = self.min_landing {
             rules.min_landing = finite(v, "min_landing")?.clamp(0.0, 100.0);
         }
-        let width = positive(self.width.unwrap_or(1.2), "width")?.clamp(0.3, 50.0);
-        let thickness = positive(self.thickness.unwrap_or(0.15), "thickness")?.clamp(0.01, 5.0);
+        let width = positive(self.width.unwrap_or(defaults.ramp.1), "width")?.clamp(0.3, 50.0);
+        let thickness = positive(self.thickness.unwrap_or(defaults.ramp.2), "thickness")?.clamp(0.01, 5.0);
         let name = self.name.filter(|n| !n.trim().is_empty());
         let id = edit(s, t!("tx-create-ramp-type"), |e| {
             let id = ElementTypeId(e.alloc_id());

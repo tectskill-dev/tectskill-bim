@@ -72,7 +72,7 @@ pub struct WallCreate {
     /// Wall type id or name (default: the default wall type).
     #[serde(default, rename = "type")]
     pub type_ref: Option<Ref>,
-    /// Unconnected height in meters (default 3).
+    /// Unconnected height in meters (default 3; 10'-0" in imperial projects).
     #[serde(default)]
     pub height: Option<f64>,
     /// Level the top is attached to, instead of a height.
@@ -105,33 +105,13 @@ impl Command for WallCreate {
                 .map_err(|_| EngineError::invalid(format!("unknown location line '{name}'")))?,
             None => LocationLine::default(),
         };
-        let bulge = match (self.mid, self.bulge) {
-            (Some(m), _) => cc_core::arc::Arc::bulge_through(start, point(m)?, end)
-                .ok_or_else(|| EngineError::invalid("the three points of the arc are on a line"))?,
-            (None, Some(b)) => {
-                let b = finite(b, "bulge")?;
-                if b.abs() > cc_core::arc::MAX_BULGE {
-                    return Err(EngineError::invalid("the bulge must be between -10 and 10"));
-                }
-                b
-            }
-            (None, None) => match self.radius {
-                Some(r) => {
-                    let r = finite(r, "radius")?;
-                    let major = self.major_arc.unwrap_or(false);
-                    cc_core::arc::Arc::bulge_radius(start, end, r.abs(), r > 0.0, major).ok_or_else(|| {
-                        EngineError::invalid("the radius must be at least half the distance between the ends")
-                    })?
-                }
-                None => 0.0,
-            },
-        };
+        let bulge = arc_bulge(start, end, self.mid, self.bulge, self.radius, self.major_arc)?;
         let wall = Wall {
             start,
             end,
             bulge,
             base_offset: finite(self.base_offset.unwrap_or(0.0), "base_offset")?,
-            height: positive(self.height.unwrap_or(3.0), "height")?,
+            height: positive(self.height.unwrap_or(p.defaults().story), "height")?,
             top: top(p, self.top_level.as_ref(), self.top_offset)?.unwrap_or(WallTop::Unconnected),
             location_line,
             ..Default::default()
@@ -142,6 +122,41 @@ impl Command for WallCreate {
     }
 }
 
+/// The bulge of the line or arc from `start` to `end`: through `mid`, else
+/// `bulge`, else of `radius` (signed: positive counter-clockwise; the longer
+/// arc when `major`), else 0 (straight).
+pub(crate) fn arc_bulge(
+    start: glam::DVec2,
+    end: glam::DVec2,
+    mid: Option<Point>,
+    bulge: Option<f64>,
+    radius: Option<f64>,
+    major: Option<bool>,
+) -> Result<f64> {
+    Ok(match (mid, bulge) {
+        (Some(m), _) => cc_core::arc::Arc::bulge_through(start, point(m)?, end)
+            .ok_or_else(|| EngineError::invalid("the three points of the arc are on a line"))?,
+        (None, Some(b)) => check_bulge(finite(b, "bulge")?)?,
+        (None, None) => match radius {
+            Some(r) => {
+                let r = finite(r, "radius")?;
+                cc_core::arc::Arc::bulge_radius(start, end, r.abs(), r > 0.0, major.unwrap_or(false)).ok_or_else(
+                    || EngineError::invalid("the radius must be at least half the distance between the ends"),
+                )?
+            }
+            None => 0.0,
+        },
+    })
+}
+
+/// A bulge within the range arcs accept.
+pub(crate) fn check_bulge(bulge: f64) -> Result<f64> {
+    if !bulge.is_finite() || bulge.abs() > cc_core::arc::MAX_BULGE {
+        return Err(EngineError::invalid("the bulge must be between -10 and 10"));
+    }
+    Ok(bulge)
+}
+
 /// An arc wall must leave room inside its curve for its thickness.
 pub(crate) fn check_arc(p: &Project, type_id: cc_core::ElementTypeId, wall: &Wall) -> Result<()> {
     let Some(arc) = wall.arc() else { return Ok(()) };
@@ -149,6 +164,23 @@ pub(crate) fn check_arc(p: &Project, type_id: cc_core::ElementTypeId, wall: &Wal
     // The tightest face may be the location line moved by up to the whole thickness.
     if arc.radius <= thickness + 1e-3 {
         return Err(EngineError::rejected("the arc is too tight for the thickness of the wall"));
+    }
+    Ok(())
+}
+
+/// An arc beam is level and must leave room inside its curve for its width.
+pub(crate) fn check_beam_arc(p: &Project, type_id: cc_core::ElementTypeId, beam: &Beam) -> Result<()> {
+    let Some(arc) = beam.arc() else { return Ok(()) };
+    if beam.rise().abs() > 1e-9 {
+        return Err(EngineError::invalid("an arc beam is level: it takes no end_offset"));
+    }
+    let width = match p.element_type(type_id).map(|t| &t.data) {
+        Some(cc_core::TypeData::Beam { width, .. }) => *width,
+        _ => 0.0,
+    };
+    // The tightest face may be the location line moved by up to the whole width.
+    if arc.radius <= width + 1e-3 {
+        return Err(EngineError::rejected("the arc is too tight for the width of the beam"));
     }
     Ok(())
 }
@@ -182,6 +214,20 @@ pub struct HostedArgs {
 fn place_hosted(s: &mut Session, a: HostedArgs, category: Category) -> Result<Value> {
     let p = s.project();
     let type_id = refs::type_of(p, category, a.type_ref.as_ref())?;
+    let ty = p.element_type(type_id).ok_or_else(|| EngineError::not_found("type"))?;
+    let (hosted, level) = hosted_at(p, &a, ty)?;
+    let (kind, tx) = if category == Category::Door {
+        (ElementKind::Door(hosted), t!("tx-create-door"))
+    } else {
+        (ElementKind::Window(hosted), t!("tx-create-window"))
+    };
+    let id = edit(s, tx, |e| Ok(super::add_element(e, level, type_id, kind)))?;
+    Ok(created(s, id))
+}
+
+/// Where an element of type `ty` (a door, a window, a niche) goes in the
+/// wall the arguments name, and that wall's level.
+pub(crate) fn hosted_at(p: &Project, a: &HostedArgs, ty: &cc_core::ElementType) -> Result<(Hosted, LevelId)> {
     let host = match (a.wall, a.point) {
         (Some(w), _) => refs::element(p, w)?,
         (None, Some(q)) => nearest_wall(p, point(q)?)?,
@@ -189,8 +235,7 @@ fn place_hosted(s: &mut Session, a: HostedArgs, category: Category) -> Result<Va
     };
     let host_el = p.element(host).ok_or_else(|| EngineError::not_found("wall"))?;
     let wall = host_el.as_wall().ok_or_else(|| EngineError::invalid(format!("element {} is not a wall", host.0)))?;
-    let ty = p.element_type(type_id).ok_or_else(|| EngineError::not_found("type"))?;
-    let (width, _) = ty.opening_size().ok_or_else(|| EngineError::invalid("not a door or window type"))?;
+    let (width, _) = ty.opening_size().ok_or_else(|| EngineError::invalid("the type has no opening"))?;
     let default_sill = ty.default_sill();
     // Openings are placed along the body centerline (an arc for arc walls).
     let (start, end) = p.wall_axis(host_el, wall);
@@ -212,14 +257,7 @@ fn place_hosted(s: &mut Session, a: HostedArgs, category: Category) -> Result<Va
         flip_facing: a.flip_facing.unwrap_or(side < 0.0),
         flip_hand: a.flip_hand.unwrap_or(false),
     };
-    let level = host_el.level;
-    let (kind, tx) = if category == Category::Door {
-        (ElementKind::Door(hosted), t!("tx-create-door"))
-    } else {
-        (ElementKind::Window(hosted), t!("tx-create-window"))
-    };
-    let id = edit(s, tx, |e| Ok(super::add_element(e, level, type_id, kind)))?;
-    Ok(created(s, id))
+    Ok((hosted, host_el.level))
 }
 
 /// The wall whose axis passes nearest `q` (within half its thickness plus 0.5 m).
@@ -276,33 +314,78 @@ impl Command for WindowCreate {
 /// Parameters shared by floors, ceilings and roofs.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Default)]
 pub struct SketchArgs {
-    /// Closed outline (at least 3 points); omit with `from_walls`.
+    /// Closed outline (at least 3 points); omit with `from_walls` or `curves`.
     #[serde(default)]
     pub boundary: Option<Vec<Point>>,
+    /// The outline drawn with curves (lines, arcs, circles, ellipses, rectangles,
+    /// polygons) instead of `boundary`; loops inside the outline are openings
+    /// (floors and roofs). The element keeps the curves (see `sketch_get`).
+    #[serde(default)]
+    pub curves: Option<Vec<super::sketch::CurveArg>>,
     /// Follow the outer boundary of the walls of the level, leaving interior walls out
     /// (exterior faces; interior faces for ceilings).
     #[serde(default)]
     pub from_walls: bool,
+    /// With `from_walls`: the face of each wall the outline follows, `FinishExterior`, `FinishInterior`,
+    /// `CoreExterior`, `CoreInterior`, `CoreCenter` or `Centerline`, where exterior is the side outside the
+    /// loop of walls and the core is a wall's structure layers. Each side goes to that face of its own wall.
+    /// Without it the outline is the walls' boundary moved out (in, for ceilings) by half the thickest wall.
+    #[serde(default)]
+    pub wall_face: Option<String>,
     /// Level id or name (default: the lowest level).
     #[serde(default)]
     pub level: Option<Ref>,
     /// Type id or name (default: the category's default type).
     #[serde(default, rename = "type")]
     pub type_ref: Option<Ref>,
-    /// Floors: top above the level (default 0). Ceilings: bottom above the level (default 2.6).
+    /// Floors: top above the level (default 0). Ceilings: bottom above the level (default 2.6; 8'-0" in
+    /// imperial projects).
     /// Roofs: base above the level (default: top of the tallest wall).
     #[serde(default)]
     pub offset: Option<f64>,
 }
 
+/// The level, outline and openings of a sketched element, and the curves it
+/// was drawn with (`curves`).
+pub(crate) fn sketched(
+    s: &Session,
+    a: &SketchArgs,
+    category: Category,
+) -> Result<(LevelId, cc_core::sketch::Profile, Option<cc_core::sketch::Sketch>)> {
+    let Some(curves) = &a.curves else {
+        let (level, outline) = sketch(s, a, category)?;
+        return Ok((level, cc_core::sketch::Profile { outline, openings: Vec::new() }, None));
+    };
+    if a.boundary.is_some() || a.from_walls {
+        return Err(EngineError::invalid("give curves, a boundary or from_walls, only one"));
+    }
+    let level = refs::level_or_first(s.project(), a.level.as_ref())?;
+    let drawn = super::sketch::sketch_of(curves)?;
+    let profile = super::sketch::profile(&drawn)?;
+    Ok((level, profile, Some(drawn)))
+}
+
+/// The level and outline of an element with no openings.
 pub(crate) fn sketch(s: &Session, a: &SketchArgs, category: Category) -> Result<(LevelId, Vec<DVec2>)> {
     let p = s.project();
     let level = refs::level_or_first(p, a.level.as_ref())?;
     let pts = match (&a.boundary, a.from_walls) {
+        _ if a.curves.is_some() => {
+            let drawn = super::sketch::sketch_of(a.curves.as_deref().unwrap_or_default())?;
+            super::sketch::outline(&drawn)?
+        }
         (Some(b), _) => points(b)?,
         (None, true) => {
             let outward = if category == Category::Ceiling { -1.0 } else { 1.0 };
-            walls_loop(p, level, outward).ok_or_else(|| EngineError::rejected("the walls of the level form no loop"))?
+            let found = match &a.wall_face {
+                Some(name) => {
+                    let face = serde_json::from_value::<LocationLine>(Value::String(name.clone()))
+                        .map_err(|_| EngineError::invalid(format!("unknown wall face '{name}'")))?;
+                    crate::defaults::walls_loop_at(p, level, face)
+                }
+                None => walls_loop(p, level, outward),
+            };
+            found.ok_or_else(|| EngineError::rejected("the walls of the level form no loop"))?
         }
         (None, false) => return Err(EngineError::invalid("give a boundary or from_walls")),
     };
@@ -321,15 +404,26 @@ pub struct FloorCreate {
     /// the boundary, apart from each other.
     #[serde(default)]
     pub openings: Vec<Vec<Point>>,
+    /// A structural slab, one that takes reinforcement (default false).
+    #[serde(default)]
+    pub structural: Option<bool>,
 }
 
 impl Command for FloorCreate {
     const NAME: &'static str = "floor_create";
     const KIND: CommandKind = CommandKind::Edit;
     fn run(self, s: &mut Session) -> Result<Value> {
-        let (level, boundary) = sketch(s, &self.sketch, Category::Floor)?;
-        let mut floor = Floor::new(boundary, finite(self.sketch.offset.unwrap_or(0.0), "offset")?);
-        floor.openings = self.openings.iter().map(|o| points(o)).collect::<Result<_>>()?;
+        let (level, profile, drawn) = sketched(s, &self.sketch, Category::Floor)?;
+        if drawn.is_some() && !self.openings.is_empty() {
+            return Err(EngineError::invalid("with curves, draw the openings as loops inside the outline"));
+        }
+        let mut floor = Floor::new(profile.outline, finite(self.sketch.offset.unwrap_or(0.0), "offset")?);
+        floor.openings = match drawn {
+            Some(_) => profile.openings,
+            None => self.openings.iter().map(|o| points(o)).collect::<Result<_>>()?,
+        };
+        floor.sketch = drawn;
+        floor.structural = self.structural.unwrap_or(false);
         check_openings(&floor.boundary, &floor.openings)?;
         create(
             s,
@@ -353,8 +447,12 @@ impl Command for CeilingCreate {
     const NAME: &'static str = "ceiling_create";
     const KIND: CommandKind = CommandKind::Edit;
     fn run(self, s: &mut Session) -> Result<Value> {
-        let (level, boundary) = sketch(s, &self.sketch, Category::Ceiling)?;
-        let ceiling = Ceiling { boundary, height_offset: finite(self.sketch.offset.unwrap_or(2.6), "offset")? };
+        let (level, profile, drawn) = sketched(s, &self.sketch, Category::Ceiling)?;
+        if let Some(at) = profile.openings.first().and_then(|o| o.first()) {
+            return Err(super::sketch::sketch_error(cc_core::sketch::SketchError::Openings(*at)));
+        }
+        let height_offset = finite(self.sketch.offset.unwrap_or(s.project().defaults().ceiling_offset), "offset")?;
+        let ceiling = Ceiling { boundary: profile.outline, height_offset, cuts: Vec::new(), sketch: drawn };
         let kind = ElementKind::Ceiling(ceiling);
         create(s, t!("tx-create-ceiling"), level, Category::Ceiling, self.sketch.type_ref.as_ref(), kind)
     }
@@ -423,14 +521,21 @@ impl Command for RoofCreate {
     const NAME: &'static str = "roof_create";
     const KIND: CommandKind = CommandKind::Edit;
     fn run(self, s: &mut Session) -> Result<Value> {
-        let (level, footprint) = sketch(s, &self.sketch, Category::Roof)?;
+        let (level, profile, drawn) = sketched(s, &self.sketch, Category::Roof)?;
+        if drawn.is_some() && !self.holes.is_empty() {
+            return Err(EngineError::invalid("with curves, draw the openings as loops inside the outline"));
+        }
         let base_offset = match self.sketch.offset {
             Some(o) => finite(o, "offset")?,
             None => default_roof_base(s.project(), level),
         };
         let overhang = finite(self.overhang.unwrap_or(0.5), "overhang")?.max(0.0);
-        let mut roof = Roof::new(footprint, base_offset, overhang, RoofShape::Flat);
-        roof.holes = self.holes.iter().map(|h| points(h)).collect::<Result<_>>()?;
+        let mut roof = Roof::new(profile.outline, base_offset, overhang, RoofShape::Flat);
+        roof.holes = match drawn {
+            Some(_) => profile.openings,
+            None => self.holes.iter().map(|h| points(h)).collect::<Result<_>>()?,
+        };
+        roof.sketch = drawn;
         check_roof_holes(&roof)?;
         create(s, t!("tx-create-roof"), level, Category::Roof, self.sketch.type_ref.as_ref(), ElementKind::Roof(roof))
     }
@@ -607,7 +712,7 @@ impl Command for RoomCreate {
                 _ => None,
             }))
         });
-        let height = positive(self.height.unwrap_or_else(|| p.level_height(level, 3.0)), "height")?;
+        let height = positive(self.height.unwrap_or_else(|| p.level_height(level, p.defaults().story)), "height")?;
         let room = Room { position, number, name: self.name.unwrap_or_else(|| t!("room-default-name")), height };
         create(s, t!("tx-create-room"), level, Category::Room, None, ElementKind::Room(room))
     }
@@ -695,7 +800,7 @@ impl Command for ColumnCreate {
             position: point(self.position)?,
             rotation_deg: finite(self.rotation.unwrap_or(0.0), "rotation")?,
             base_offset: 0.0,
-            height: positive(self.height.unwrap_or_else(|| p.level_height(level, 3.0)), "height")?,
+            height: positive(self.height.unwrap_or_else(|| p.level_height(level, p.defaults().story)), "height")?,
             top: top(p, self.top_level.as_ref(), self.top_offset)?.unwrap_or_else(|| default_top(p, level)),
             structural: self.structural.unwrap_or(true),
         };
@@ -703,8 +808,10 @@ impl Command for ColumnCreate {
     }
 }
 
-/// Create a beam from `start` to `end`; its location line is `top_offset` above the level
-/// (default: the level's height), at the top of the section unless `vertical` says otherwise.
+/// Create a beam from `start` to `end`, straight or, for an arc beam, through `mid` (or with a
+/// `bulge` or a `radius`); its location line is `top_offset` above the level (default: the
+/// level's height), at the top of the section unless `vertical` says otherwise. An arc beam is
+/// level and joins columns and other beams at its ends like a straight one.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct BeamCreate {
@@ -730,6 +837,20 @@ pub struct BeamCreate {
     /// Height of the section at the location elevation: `top` (default), `center` or `bottom`.
     #[serde(default)]
     pub vertical: Option<String>,
+    /// Arc beams: a point the location line passes through between `start` and `end`.
+    #[serde(default)]
+    pub mid: Option<Point>,
+    /// Arc beams: `tan(sweep / 4)`, positive when the arc turns counter-clockwise from `start`
+    /// to `end` (1 is a half circle; at most 10 either way). Ignored when `mid` is given.
+    #[serde(default)]
+    pub bulge: Option<f64>,
+    /// Arc beams: the radius in meters, positive when the arc turns counter-clockwise from
+    /// `start` to `end`, negative when clockwise. Ignored when `mid` or `bulge` is given.
+    #[serde(default)]
+    pub radius: Option<f64>,
+    /// With `radius`: take the longer of the two arcs (default: the shorter).
+    #[serde(default)]
+    pub major_arc: Option<bool>,
 }
 
 /// A beam justification by name.
@@ -751,9 +872,12 @@ impl Command for BeamCreate {
         }
         let p = s.project();
         let level = refs::level_or_first(p, self.level.as_ref())?;
-        let top_offset = finite(self.top_offset.unwrap_or_else(|| p.level_height(level, 3.0)), "top_offset")?;
+        let top_offset =
+            finite(self.top_offset.unwrap_or_else(|| p.level_height(level, p.defaults().story)), "top_offset")?;
         let mut beam = Beam::new(start, end, top_offset);
         beam.end_offset = self.end_offset.map(|z| finite(z, "end_offset")).transpose()?;
+        beam.bulge = arc_bulge(start, end, self.mid, self.bulge, self.radius, self.major_arc)?;
+        check_beam_arc(p, refs::type_of(p, Category::Beam, self.type_ref.as_ref())?, &beam)?;
         let lateral = [("center", BeamLateral::Center), ("left", BeamLateral::Left), ("right", BeamLateral::Right)];
         let vertical = [("top", BeamVertical::Top), ("center", BeamVertical::Center), ("bottom", BeamVertical::Bottom)];
         if let Some(j) = justification(self.lateral.as_deref(), &lateral, "lateral")? {
@@ -803,7 +927,11 @@ impl Command for RailingCreate {
 /// Place a component (furniture, plumbing fixture, electrical device…) of a
 /// component type. Electrical devices default to their usual mounting height
 /// (outlets 0.30 m, switches 1.10 m, boards 1.30 m, wall lights 2.10 m,
-/// ceiling lights at the level height) and may be put on a circuit.
+/// ceiling lights at the level height, data outlets 0.30 m, racks 1.40 m,
+/// air terminals on the roof under them, earth electrodes 0.50 m below the
+/// level; in imperial projects outlets 1'-6", switches 4'-0", boards and
+/// racks 4'-6", wall lights 7'-0") and may be put on a circuit or system of their kind; lightning
+/// protection devices join the first lightning protection system by default.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentPlace {
@@ -837,14 +965,31 @@ impl Command for ComponentPlace {
             Some(cc_core::TypeData::Component { def, .. }) => def.mep.and_then(|m| m.device()),
             _ => None,
         };
-        let height = device.map_or(0.0, |d| crate::defaults::device_height(p, level, d));
-        let system = self.system.as_ref().map(|r| refs::system(p, r)).transpose()?;
+        let mut height = device.map_or(0.0, |d| crate::defaults::device_height(p, level, d));
+        // Air terminals stand on the roof under them; lightning protection
+        // devices join the project's first lightning protection system.
+        let lightning = device.is_some_and(|d| d.class() == cc_core::SystemClass::Lightning);
+        let default_system = lightning
+            .then(|| p.systems.iter().find(|(_, s)| s.kind == cc_core::SystemKind::Lightning).map(|(id, _)| *id))
+            .flatten();
+        if device == Some(cc_core::DeviceKind::AirTerminal) && self.base_offset.is_none() {
+            let at = point(self.position)?;
+            let level_z = p.level_elevation(level);
+            if let Some(top) = cc_geom::lightning::surface_top(s.geometry(), at) {
+                height = top - level_z;
+            }
+        }
+        let p = s.project();
+        let system = match self.system.as_ref().map(|r| refs::system(p, r)).transpose()? {
+            Some(id) => Some(id),
+            None => default_system,
+        };
         if let Some(id) = system {
             let mep = match p.element_type(type_id).map(|t| &t.data) {
                 Some(cc_core::TypeData::Component { def, .. }) => def.mep,
                 _ => None,
             };
-            super::mep::check_fits(p, super::mep::is_electrical(mep), id)?;
+            super::mep::check_fits(p, super::mep::mep_classes(mep), id)?;
         }
         let component = Component {
             position: point(self.position)?,
@@ -853,6 +998,7 @@ impl Command for ComponentPlace {
             overrides: Default::default(),
             properties: Vec::new(),
             system,
+            ..Default::default()
         };
         let kind = ElementKind::Component(component);
         create(s, t!("tx-create-component"), level, Category::Component, Some(&self.type_ref), kind)

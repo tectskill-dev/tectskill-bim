@@ -1,3 +1,4 @@
+use crate::drawing_index::DrawingIndex;
 use cc_core::ElementId;
 use glam::DVec2;
 
@@ -99,6 +100,8 @@ pub enum Anchor {
     #[default]
     LeftBottom,
     CenterBottom,
+    /// The end of the baseline (right-aligned).
+    RightBottom,
     Center,
 }
 
@@ -132,13 +135,64 @@ pub enum Prim {
         /// The element the text annotates (hidden with it).
         element: Option<ElementId>,
     },
+    /// A picture filling the parallelogram from `origin` (its bottom-left
+    /// corner) along `u` (its width) and `v` (its height).
+    Image {
+        origin: DVec2,
+        u: DVec2,
+        v: DVec2,
+        image: std::sync::Arc<cc_core::raster::RasterImage>,
+        element: Option<ElementId>,
+        /// Mixed two thirds with white.
+        faded: bool,
+    },
 }
 
 impl Prim {
+    /// The primitive with its points moved by the affine map `f` (an image's
+    /// sides follow from where its corners land).
+    pub fn mapped(&self, f: impl Fn(DVec2) -> DVec2) -> Prim {
+        match self {
+            Prim::Line { a, b, style, element, pen } => {
+                Prim::Line { a: f(*a), b: f(*b), style: *style, element: *element, pen: *pen }
+            }
+            Prim::Fill { pts, color, element, cut } => {
+                Prim::Fill { pts: pts.iter().map(|p| f(*p)).collect(), color: *color, element: *element, cut: *cut }
+            }
+            Prim::Text { pos, text, size, anchor, angle, element } => Prim::Text {
+                pos: f(*pos),
+                text: text.clone(),
+                size: *size,
+                anchor: *anchor,
+                angle: *angle,
+                element: *element,
+            },
+            Prim::Image { origin, u, v, image, element, faded } => {
+                let o = f(*origin);
+                Prim::Image {
+                    origin: o,
+                    u: f(*origin + *u) - o,
+                    v: f(*origin + *v) - o,
+                    image: image.clone(),
+                    element: *element,
+                    faded: *faded,
+                }
+            }
+        }
+    }
+
+    /// The four corners of an image (bottom-left first, counter-clockwise when not mirrored).
+    pub fn image_corners(origin: DVec2, u: DVec2, v: DVec2) -> [DVec2; 4] {
+        [origin, origin + u, origin + u + v, origin + v]
+    }
+
     /// The element a primitive belongs to, if any.
     pub fn element(&self) -> Option<ElementId> {
         match self {
-            Prim::Line { element, .. } | Prim::Fill { element, .. } | Prim::Text { element, .. } => *element,
+            Prim::Line { element, .. }
+            | Prim::Fill { element, .. }
+            | Prim::Text { element, .. }
+            | Prim::Image { element, .. } => *element,
         }
     }
 }
@@ -150,12 +204,128 @@ pub struct Drawing2D {
     /// Fit the view to the geometry of elements only (plans: the markers of
     /// elevations and sections stand outside the model).
     pub fit_elements: bool,
+    /// Elements drawn as background (imported CAD drawings): picked only
+    /// where nothing else is.
+    pub background: std::collections::BTreeSet<ElementId>,
+    /// Tags that can be dragged: where each is and how far it was moved.
+    pub tags: Vec<TagHandle>,
+    /// How many of the first `prims` are the plans of other levels drawn
+    /// under a plan ([`cc_core::Underlay`]): halftone, with no element, not
+    /// picked or snapped to.
+    pub underlay: usize,
+    /// How many of the last `prims` are an overlay drawn over the view (the
+    /// sun path diagram, [`crate::sun_path`]): with no element, not picked
+    /// or snapped to, but part of the extents to fit the view to.
+    pub overlay: usize,
+    /// The marks of sections in a plan: picked, moved and flipped there.
+    pub sections: Vec<SectionHandle>,
+    /// The marks of callouts drawn in the view: picked, moved and resized there.
+    pub callouts: Vec<crate::callout::CalloutHandle>,
+    /// Lookups over `prims`, built the first time they are needed (see
+    /// [`DrawingIndex`]); a copy of the drawing starts without them.
+    pub index: DrawingIndex,
+}
+
+/// A section's mark in a plan, as drawn (meters on the plan).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SectionHandle {
+    pub view: cc_core::ViewId,
+    pub start: DVec2,
+    pub end: DVec2,
+    /// The view's split line (see [`cc_core::ViewKind::Section`]).
+    pub segments: Option<[f64; 2]>,
+    /// The pieces of line drawn between the heads.
+    pub pieces: Vec<(DVec2, DVec2)>,
+    /// Radius of a head's circle.
+    pub radius: f64,
+    /// How far from each end the line starts (half the triangle's base).
+    pub head: f64,
+}
+
+impl SectionHandle {
+    /// Whether `p` lies on the mark: within `tol` of its line or in a head.
+    pub fn hits(&self, p: DVec2, tol: f64) -> bool {
+        let near = |a: DVec2, b: DVec2| cc_geom::polygon::closest_on_segment(a, b, p).0.distance(p) <= tol;
+        [self.start, self.end].iter().any(|c| c.distance(p) <= self.radius + tol)
+            || self.pieces.iter().any(|&(a, b)| near(a, b))
+    }
+
+    /// The inner ends of a split line's pieces, next to the start and to
+    /// the end: dragged closer to or away from their head.
+    pub fn segment_ends(&self) -> Option<[DVec2; 2]> {
+        let [s0, s1] = self.segments?;
+        let dir = (self.end - self.start).normalize_or_zero();
+        Some([self.start + dir * s0, self.end - dir * s1])
+    }
+}
+
+/// A tag of an element in a view, as drawn: picked within `half` of
+/// `center`; `offset` is how far the view moved it from its default spot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TagHandle {
+    pub element: ElementId,
+    pub center: DVec2,
+    pub half: DVec2,
+    pub offset: DVec2,
+}
+
+impl Drawing2D {
+    /// The primitives of the view itself, without its underlay and its overlay.
+    pub fn own_prims(&self) -> &[Prim] {
+        let end = self.prims.len().saturating_sub(self.overlay);
+        self.prims.get(self.underlay..end).unwrap_or_default()
+    }
+
+    /// The lines of the view itself that tools snap to by their ends: its
+    /// linework without the pattern lines of hatches, which are not geometry.
+    pub fn snap_lines(&self) -> Vec<(DVec2, DVec2)> {
+        self.own_prims()
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Line { a, b, style, .. } if *style != LineStyle::Hatch => Some((*a, *b)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The overlay drawn over the view (see [`Self::overlay`]).
+    pub fn overlay_prims(&self) -> &[Prim] {
+        self.prims.get(self.prims.len().saturating_sub(self.overlay)..).unwrap_or_default()
+    }
+
+    /// The drawing without its underlay (printed when the view says so).
+    pub fn without_underlay(&self) -> Drawing2D {
+        let prims = self.prims.get(self.underlay..).unwrap_or_default().to_vec();
+        Drawing2D { prims, underlay: 0, ..self.clone() }
+    }
+
+    /// The section mark at `p` (the last drawn on top), if any.
+    pub fn section_at(&self, p: DVec2, tol: f64) -> Option<&SectionHandle> {
+        self.sections.iter().rev().find(|s| s.hits(p, tol))
+    }
+
+    /// The callout mark at `p` (the last drawn on top), if any.
+    pub fn callout_at(&self, p: DVec2, tol: f64) -> Option<&crate::callout::CalloutHandle> {
+        self.callouts.iter().rev().find(|c| c.hits(p, tol))
+    }
+
+    /// The tag at `p` (the last drawn on top), if any.
+    pub fn tag_at(&self, p: DVec2) -> Option<TagHandle> {
+        self.tags.iter().rev().find(|t| (p - t.center).abs().cmple(t.half).all()).copied()
+    }
 }
 
 impl Drawing2D {
     pub fn line(&mut self, a: DVec2, b: DVec2, style: LineStyle, element: Option<ElementId>) {
         if a.distance_squared(b) > 1e-14 {
             self.prims.push(Prim::Line { a, b, style, element, pen: None });
+        }
+    }
+
+    /// A line with its own pen (view graphics still override what they set).
+    pub fn line_pen(&mut self, a: DVec2, b: DVec2, style: LineStyle, pen: Option<Pen>, element: Option<ElementId>) {
+        if a.distance_squared(b) > 1e-14 {
+            self.prims.push(Prim::Line { a, b, style, element, pen });
         }
     }
 
@@ -214,27 +384,75 @@ impl Drawing2D {
         self.polyline(&pts, false, style, element);
     }
 
+    /// A circular arc in a dashed `style` at `1:scale`, its dashes laid
+    /// along the whole arc (each a few chords, the gaps left empty), so the
+    /// pattern shows however short the chords of [`Self::arc`] would be.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dashed_arc(
+        &mut self,
+        center: DVec2,
+        radius: f64,
+        (a0, a1): (f64, f64),
+        style: LineStyle,
+        element: Option<ElementId>,
+        scale: u32,
+    ) {
+        let k = f64::from(scale.max(1)) / 1000.0;
+        let dashes: Vec<f64> = style.dashes().iter().map(|d| d * k).collect();
+        let length = radius * (a1 - a0).abs();
+        if dashes.len() < 2
+            || dashes.iter().any(|d| *d <= 0.0)
+            || !length.is_finite()
+            || length <= 0.0
+            || length / k > 1e5
+        {
+            self.arc(center, radius, a0, a1, style, element);
+            return;
+        }
+        let at = |s: f64| {
+            let a = a0 + (a1 - a0) * (s / length).clamp(0.0, 1.0);
+            center + DVec2::new(a.cos(), a.sin()) * radius
+        };
+        let (mut s, mut i) = (0.0, 0);
+        while s < length {
+            let step = dashes[i % dashes.len()];
+            if i % 2 == 0 {
+                let end = (s + step).min(length);
+                let n = ((end - s) / (radius * 0.1).max(1e-6)).ceil().clamp(1.0, 8.0) as usize;
+                let pts: Vec<DVec2> = (0..=n).map(|j| at(s + (end - s) * j as f64 / n as f64)).collect();
+                self.polyline(&pts, false, style, element);
+            }
+            s += step;
+            i += 1;
+        }
+    }
+
     /// Bounding box of geometry (text anchors included).
     pub fn bounds(&self) -> Option<(DVec2, DVec2)> {
         let mut it = self.prims.iter().flat_map(|p| match p {
             Prim::Line { a, b, .. } => vec![*a, *b],
             Prim::Fill { pts, .. } => pts.clone(),
             Prim::Text { pos, .. } => vec![*pos],
+            Prim::Image { origin, u, v, .. } => Prim::image_corners(*origin, *u, *v).to_vec(),
         });
         let first = it.next()?;
         Some(it.fold((first, first), |(lo, hi), p| (lo.min(p), hi.max(p))))
     }
 
     /// The extents to fit the view to: [`bounds`](Self::bounds), or only the
-    /// elements' geometry with `fit_elements` (all of it when there is none).
+    /// elements' geometry and the overlay with `fit_elements` (all of it
+    /// when there is none).
     pub fn fit_bounds(&self) -> Option<(DVec2, DVec2)> {
         if !self.fit_elements {
             return self.bounds();
         }
-        let mut it = self.prims.iter().filter(|p| p.element().is_some()).flat_map(|p| match p {
+        let overlay = self.prims.len().saturating_sub(self.overlay);
+        let fitted = |(i, p): &(usize, &Prim)| p.element().is_some() || *i >= overlay;
+        let mut it = self.prims.iter().enumerate().filter(fitted).flat_map(|(_, p)| match p {
             Prim::Line { a, b, .. } => vec![*a, *b],
             Prim::Fill { pts, .. } => pts.clone(),
             Prim::Text { pos, .. } => vec![*pos],
+            Prim::Image { origin, u, v, .. } => Prim::image_corners(*origin, *u, *v).to_vec(),
         });
         match it.next() {
             Some(first) => Some(it.fold((first, first), |(lo, hi), p| (lo.min(p), hi.max(p)))),
@@ -242,12 +460,114 @@ impl Drawing2D {
         }
     }
 
-    /// Topmost element under `p` within `tol` (view units).
+    /// Topmost element under `p` within `tol` (view units). Background
+    /// elements (imported drawings) are picked only where nothing else is.
     pub fn hit_test(&self, p: DVec2, tol: f64) -> Option<ElementId> {
+        match self.index.candidates(&self.prims, p, tol) {
+            Some(near) => {
+                let prims = || near.iter().filter_map(|i| self.prims.get(*i as usize));
+                self.hit_test_tier(prims(), p, tol, false).or_else(|| self.hit_test_tier(prims(), p, tol, true))
+            }
+            None => self
+                .hit_test_tier(self.prims.iter(), p, tol, false)
+                .or_else(|| self.hit_test_tier(self.prims.iter(), p, tol, true)),
+        }
+    }
+
+    /// The indices of the primitives of `ids`, in drawing order.
+    pub fn prims_of(&self, ids: &std::collections::BTreeSet<ElementId>) -> Vec<usize> {
+        match self.index.elements(&self.prims) {
+            Some(map) => {
+                let mut out: Vec<usize> =
+                    ids.iter().filter_map(|id| map.get(id)).flatten().map(|i| *i as usize).collect();
+                out.sort_unstable();
+                out
+            }
+            None => (0..self.prims.len())
+                .filter(|i| self.prims.get(*i).and_then(Prim::element).is_some_and(|e| ids.contains(&e)))
+                .collect(),
+        }
+    }
+
+    /// The element whose line passes within `tol` of `p` (the nearest),
+    /// leaving out fills and background elements: what a drag starting at
+    /// `p` grabs.
+    pub fn hit_test_line(&self, p: DVec2, tol: f64) -> Option<ElementId> {
+        match self.index.candidates(&self.prims, p, tol) {
+            Some(near) => self.nearest_line(near.iter().filter_map(|i| self.prims.get(*i as usize)), p, tol),
+            None => self.nearest_line(self.prims.iter(), p, tol),
+        }
+    }
+
+    /// The lines of elements passing within `tol` of `p`, with their
+    /// element: the model as the view draws it, for snapping. The underlay,
+    /// background elements (imported drawings), pattern lines, faded
+    /// linework and annotations are left out.
+    pub fn lines_near(&self, p: DVec2, tol: f64) -> Vec<(DVec2, DVec2, ElementId)> {
+        let near = |i: usize, prim: &Prim| match prim {
+            Prim::Line { a, b, style, element: Some(id), .. }
+                if i >= self.underlay
+                    && !matches!(style, LineStyle::Hatch | LineStyle::Faint | LineStyle::Annotation)
+                    && !self.background.contains(id)
+                    && cc_geom::polygon::closest_on_segment(*a, *b, p).0.distance(p) <= tol =>
+            {
+                Some((*a, *b, *id))
+            }
+            _ => None,
+        };
+        match self.index.candidates(&self.prims, p, tol) {
+            Some(found) => found
+                .iter()
+                .filter_map(|i| self.prims.get(*i as usize).and_then(|prim| near(*i as usize, prim)))
+                .collect(),
+            None => self.prims.iter().enumerate().filter_map(|(i, prim)| near(i, prim)).collect(),
+        }
+    }
+
+    fn nearest_line<'a>(&self, prims: impl Iterator<Item = &'a Prim>, p: DVec2, tol: f64) -> Option<ElementId> {
+        let mut best: Option<(f64, ElementId)> = None;
+        for prim in prims {
+            if let Prim::Line { a, b, element: Some(id), .. } = prim
+                && !self.background.contains(id)
+            {
+                let d = cc_geom::polygon::closest_on_segment(*a, *b, p).0.distance(p);
+                if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
+                    best = Some((d, *id));
+                }
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    /// [`Self::hit_test`] searching every primitive (tests of the index).
+    #[cfg(test)]
+    pub(crate) fn hit_test_all(&self, p: DVec2, tol: f64) -> Option<ElementId> {
+        self.hit_test_tier(self.prims.iter(), p, tol, false)
+            .or_else(|| self.hit_test_tier(self.prims.iter(), p, tol, true))
+    }
+
+    /// [`Self::hit_test_line`] searching every primitive (tests of the index).
+    #[cfg(test)]
+    pub(crate) fn nearest_line_all(&self, p: DVec2, tol: f64) -> Option<ElementId> {
+        self.nearest_line(self.prims.iter(), p, tol)
+    }
+
+    /// The pick among `prims` (in drawing order) in one tier: foreground
+    /// elements, or background ones.
+    fn hit_test_tier<'a>(
+        &self,
+        prims: impl DoubleEndedIterator<Item = &'a Prim> + Clone,
+        p: DVec2,
+        tol: f64,
+        background: bool,
+    ) -> Option<ElementId> {
+        let tier = |id: &ElementId| self.background.contains(id) == background;
         // Lines first: they are thin and drawn over fills.
         let mut best: Option<(f64, ElementId)> = None;
-        for prim in &self.prims {
-            if let Prim::Line { a, b, element: Some(id), .. } = prim {
+        for prim in prims.clone() {
+            if let Prim::Line { a, b, element: Some(id), .. } = prim
+                && tier(id)
+            {
                 let (q, _) = cc_geom::polygon::closest_on_segment(*a, *b, p);
                 let d = q.distance(p);
                 if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
@@ -258,31 +578,164 @@ impl Drawing2D {
         if let Some((_, id)) = best {
             return Some(id);
         }
-        self.prims.iter().rev().find_map(|prim| match prim {
+        prims.rev().find_map(|prim| match prim {
             // Fully transparent fills only show selection (room areas); they are not picked.
-            Prim::Fill { pts, element: Some(id), color, .. } if color[3] > 0 && cc_geom::polygon::contains(pts, p) => {
+            Prim::Fill { pts, element: Some(id), color, .. }
+                if color[3] > 0 && tier(id) && cc_geom::polygon::contains(pts, p) =>
+            {
+                Some(*id)
+            }
+            Prim::Image { origin, u, v, element: Some(id), .. }
+                if tier(id) && cc_geom::polygon::contains(&Prim::image_corners(*origin, *u, *v), p) =>
+            {
                 Some(*id)
             }
             _ => None,
         })
     }
 
-    /// Elements with any geometry inside the rectangle `lo`..`hi`.
+    /// Elements taken by the rectangle `lo`..`hi`: with `fully` (a window)
+    /// those whose lines, fills and texts all lie inside it, otherwise (a
+    /// crossing) those that any of them reaches into: a line crossing it, a
+    /// fill overlapping it, a text anchored in it. A crossing leaves out
+    /// background elements (imported drawings), which lie under everything.
     pub fn elements_in(&self, lo: DVec2, hi: DVec2, fully: bool) -> Vec<ElementId> {
+        use cc_geom::polygon::{contains, segment_meets_rect};
         use std::collections::BTreeMap;
+        let (lo, hi) = (lo.min(hi), lo.max(hi));
         let inside = |p: &DVec2| p.x >= lo.x && p.y >= lo.y && p.x <= hi.x && p.y <= hi.y;
-        // Track (any point inside, all points inside) per element.
+        let center = (lo + hi) * 0.5;
+        // Per element: (reaches in, lies wholly inside).
         let mut state: BTreeMap<ElementId, (bool, bool)> = BTreeMap::new();
         for prim in &self.prims {
-            let (pts, id): (Vec<DVec2>, _) = match prim {
-                Prim::Line { a, b, element: Some(id), .. } => (vec![*a, *b], *id),
-                Prim::Fill { pts, element: Some(id), .. } => (pts.clone(), *id),
+            let (id, reaches, within) = match prim {
+                Prim::Line { a, b, element: Some(id), .. } => {
+                    (*id, segment_meets_rect(*a, *b, lo, hi), inside(a) && inside(b))
+                }
+                Prim::Fill { pts, color, element: Some(id), .. } => {
+                    let edges = pts.iter().zip(pts.iter().cycle().skip(1));
+                    let crosses = edges.take(pts.len()).any(|(a, b)| segment_meets_rect(*a, *b, lo, hi));
+                    // A fill around the whole rectangle, unless it only shows
+                    // when selected (room areas): dragging inside a room
+                    // would otherwise always take it.
+                    let around = color[3] > 0 && pts.len() >= 3 && contains(pts, center);
+                    (*id, crosses || around || pts.iter().any(inside), !pts.is_empty() && pts.iter().all(inside))
+                }
+                Prim::Text { pos, element: Some(id), .. } => (*id, inside(pos), inside(pos)),
+                Prim::Image { origin, u, v, element: Some(id), .. } => {
+                    let c = Prim::image_corners(*origin, *u, *v);
+                    let crosses = (0..4).any(|i| segment_meets_rect(c[i], c[(i + 1) % 4], lo, hi));
+                    (*id, crosses || contains(&c, center) || c.iter().any(inside), c.iter().all(inside))
+                }
                 _ => continue,
             };
             let s = state.entry(id).or_insert((false, true));
-            s.0 |= pts.iter().any(inside);
-            s.1 &= pts.iter().all(inside);
+            s.0 |= reaches;
+            s.1 &= within;
         }
-        state.into_iter().filter(|(_, (any, all))| if fully { *all } else { *any }).map(|(id, _)| id).collect()
+        state
+            .into_iter()
+            .filter(|(id, (any, all))| if fully { *all } else { *any && !self.background.contains(id) })
+            .map(|(id, _)| id)
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(x: f64, y: f64) -> DVec2 {
+        DVec2::new(x, y)
+    }
+
+    /// A long wall line, a floor fill, a room area (transparent fill), a
+    /// text note and an imported drawing's line.
+    fn sample() -> Drawing2D {
+        let mut d = Drawing2D::default();
+        d.line(v(0.0, 0.0), v(10.0, 0.0), LineStyle::Cut, Some(ElementId(1)));
+        let square = vec![v(20.0, 0.0), v(30.0, 0.0), v(30.0, 10.0), v(20.0, 10.0)];
+        d.fill(square.clone(), [200, 200, 200, 255], Some(ElementId(2)));
+        d.fill(square.iter().map(|p| *p + v(20.0, 0.0)).collect(), [0, 0, 0, 0], Some(ElementId(3)));
+        d.prims.push(Prim::Text {
+            pos: v(5.0, 5.0),
+            text: "Nota".into(),
+            size: 2.5,
+            anchor: Anchor::LeftBottom,
+            angle: 0.0,
+            element: Some(ElementId(4)),
+        });
+        d.line(v(-50.0, -50.0), v(100.0, 50.0), LineStyle::Thin, Some(ElementId(5)));
+        d.background.insert(ElementId(5));
+        d
+    }
+
+    /// Issue #332: the pattern lines of a hatch are not snapped to; the
+    /// outline they fill, annotations and lines of no element still are.
+    #[test]
+    fn hatch_lines_are_not_snap_lines() {
+        let mut d = Drawing2D::default();
+        d.line(v(-9.0, 0.0), v(-8.0, 0.0), LineStyle::Cut, None);
+        d.underlay = 1;
+        d.line(v(0.0, 0.0), v(4.0, 0.0), LineStyle::Cut, Some(ElementId(1)));
+        d.line(v(1.0, 0.0), v(2.0, 1.0), LineStyle::Hatch, Some(ElementId(1)));
+        d.line(v(0.0, 2.0), v(4.0, 2.0), LineStyle::Annotation, None);
+        assert_eq!(d.snap_lines(), [(v(0.0, 0.0), v(4.0, 0.0)), (v(0.0, 2.0), v(4.0, 2.0))]);
+    }
+
+    fn ids(list: Vec<ElementId>) -> Vec<u64> {
+        list.into_iter().map(|e| e.0).collect()
+    }
+
+    /// Issue #93: a crossing that cuts a line between its ends, or lies
+    /// inside a floor, takes the element; it used to look at ends only.
+    #[test]
+    fn a_crossing_takes_what_it_cuts_or_lies_in() {
+        let d = sample();
+        // Across the middle of the wall line, no end inside.
+        assert_eq!(ids(d.elements_in(v(4.0, -1.0), v(6.0, 1.0), false)), [1]);
+        // Inside the floor, touching none of its edges.
+        assert_eq!(ids(d.elements_in(v(24.0, 4.0), v(26.0, 6.0), false)), [2]);
+        // Inside a room area: rooms show only when selected, so not taken.
+        assert!(d.elements_in(v(44.0, 4.0), v(46.0, 6.0), false).is_empty());
+        // Around a text note's anchor.
+        assert_eq!(ids(d.elements_in(v(4.0, 4.0), v(6.0, 6.0), false)), [4]);
+        // The imported drawing's line passes through all of these, but a crossing leaves it out.
+        assert!(!ids(d.elements_in(v(-60.0, -60.0), v(110.0, 60.0), false)).contains(&5));
+    }
+
+    #[test]
+    fn a_window_takes_only_what_lies_wholly_inside() {
+        let d = sample();
+        assert!(d.elements_in(v(4.0, -1.0), v(6.0, 1.0), true).is_empty());
+        assert_eq!(ids(d.elements_in(v(-1.0, -1.0), v(11.0, 6.0), true)), [1, 4]);
+        // A window around everything takes the imported drawing too.
+        assert_eq!(ids(d.elements_in(v(-60.0, -60.0), v(110.0, 60.0), true)), [1, 2, 3, 4, 5]);
+    }
+
+    /// A drag grabs an element by its lines only, never by a fill or an imported drawing.
+    #[test]
+    fn drags_grab_lines() {
+        let d = sample();
+        assert_eq!(d.hit_test_line(v(5.0, 0.05), 0.1), Some(ElementId(1)));
+        assert_eq!(d.hit_test_line(v(25.0, 5.0), 0.1), None, "inside the floor");
+        assert_eq!(d.hit_test(v(25.0, 5.0), 0.1), Some(ElementId(2)), "a click still picks it");
+        assert_eq!(d.hit_test_line(v(25.0, 12.5), 0.1), None, "on the imported line");
+    }
+
+    /// Tags are picked within their box, the last drawn first.
+    #[test]
+    fn tags_are_picked_in_their_box() {
+        let mut d = Drawing2D::default();
+        let tag = |id: u64, x: f64| TagHandle {
+            element: ElementId(id),
+            center: v(x, 0.0),
+            half: v(1.0, 0.5),
+            offset: DVec2::ZERO,
+        };
+        d.tags = vec![tag(1, 0.0), tag(2, 1.5)];
+        assert_eq!(d.tag_at(v(-0.9, 0.4)).map(|t| t.element.0), Some(1));
+        assert_eq!(d.tag_at(v(0.8, 0.0)).map(|t| t.element.0), Some(2), "both boxes: the one on top");
+        assert_eq!(d.tag_at(v(0.0, 0.6)), None);
     }
 }

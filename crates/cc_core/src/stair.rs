@@ -16,16 +16,20 @@ pub enum StairShape {
     LShaped,
     /// Two parallel flights going opposite ways, joined by a landing.
     UShaped,
+    /// Three flights turning twice at right angles, with a landing at each
+    /// corner: the third comes back beside the first.
+    ThreeFlight,
     /// Treads around a center (spiral or helical stair).
     Spiral,
 }
 
 impl StairShape {
-    pub const ALL: [StairShape; 5] = [
+    pub const ALL: [StairShape; 6] = [
         StairShape::Straight,
         StairShape::StraightLanding,
         StairShape::LShaped,
         StairShape::UShaped,
+        StairShape::ThreeFlight,
         StairShape::Spiral,
     ];
 
@@ -35,18 +39,22 @@ impl StairShape {
             StairShape::StraightLanding => "stair-shape-straight-landing",
             StairShape::LShaped => "stair-shape-l",
             StairShape::UShaped => "stair-shape-u",
+            StairShape::ThreeFlight => "stair-shape-three-flight",
             StairShape::Spiral => "stair-shape-spiral",
         }
     }
 
     /// Whether the stair turns (so the side it turns to matters).
     pub fn turns(self) -> bool {
-        matches!(self, StairShape::LShaped | StairShape::UShaped | StairShape::Spiral)
+        matches!(self, StairShape::LShaped | StairShape::UShaped | StairShape::ThreeFlight | StairShape::Spiral)
     }
 
-    /// Whether the stair has two flights split by a landing (or winders).
+    /// Whether the stair has flights split by landings (or winders).
     pub fn has_split(self) -> bool {
-        matches!(self, StairShape::StraightLanding | StairShape::LShaped | StairShape::UShaped)
+        matches!(
+            self,
+            StairShape::StraightLanding | StairShape::LShaped | StairShape::UShaped | StairShape::ThreeFlight
+        )
     }
 }
 
@@ -93,8 +101,16 @@ impl Turn {
 pub struct StairLayout {
     pub shape: StairShape,
     pub turn: Turn,
-    /// Risers of the first flight (0: half of them).
+    /// Risers of the first flight (0: half of them; a third on a three-flight stair).
     pub split: u32,
+    /// Risers of the second flight of a three-flight stair (0: half of those
+    /// left after the first).
+    pub split2: u32,
+    /// Riser count (0: the fewest within the type's maximum riser); the
+    /// riser height is the stair's height over it.
+    pub risers: u32,
+    /// Tread depth (0: the type's, or Blondel's formula when its rules say so).
+    pub tread: f64,
     /// Landing depth along the first flight (0: the stair width); straight
     /// and U-shaped stairs.
     pub landing: f64,
@@ -104,7 +120,19 @@ pub struct StairLayout {
     pub winders: u32,
     /// Radius of the inner edge of a spiral stair (0: treads meet at the center).
     pub inner_radius: f64,
+    /// Posts under the landings of an assembled stair, down to its base: one
+    /// set per landing, in order up the stair.
+    pub posts: [LandingPosts; 2],
+    /// Number the steps in plans: the treads (winders included, landings
+    /// not) from `number_start` up, and the floor the stair arrives at.
+    pub numbers: bool,
+    /// Number of the first tread (another value continues a count from a
+    /// stair below, for instance).
+    pub number_start: i32,
 }
+
+/// Largest step number, either way from zero.
+pub const MAX_STEP_NUMBER: i32 = 9999;
 
 impl Default for StairLayout {
     fn default() -> Self {
@@ -112,10 +140,16 @@ impl Default for StairLayout {
             shape: StairShape::Straight,
             turn: Turn::Left,
             split: 0,
+            split2: 0,
+            risers: 0,
+            tread: 0.0,
             landing: 0.0,
             gap: 0.1,
             winders: 0,
             inner_radius: 0.15,
+            posts: [LandingPosts::default(); 2],
+            numbers: false,
+            number_start: 1,
         }
     }
 }
@@ -140,13 +174,42 @@ impl StairLayout {
             self.winders = MAX_WINDERS;
             n += 1;
         }
-        if self.split > 200 {
-            self.split = 0;
+        for v in [&mut self.split, &mut self.split2, &mut self.risers] {
+            if *v > MAX_RISERS {
+                *v = 0;
+                n += 1;
+            }
+        }
+        if !self.tread.is_finite() || !(0.0..=2.0).contains(&self.tread) {
+            self.tread = 0.0;
+            n += 1;
+        }
+        if !(-MAX_STEP_NUMBER..=MAX_STEP_NUMBER).contains(&self.number_start) {
+            self.number_start = 1;
             n += 1;
         }
         n
     }
+
+    /// Riser count, riser height and tread depth of a stair of `height` of a
+    /// type with `max_riser`, `tread` and `rules`, with this layout's riser
+    /// count and tread when it sets them.
+    pub fn steps(&self, height: f64, max_riser: f64, tread: f64, rules: &StairRules) -> (usize, f64, f64) {
+        let (risers, riser, g) = match self.risers {
+            0 => stair_steps(height, max_riser, tread, rules),
+            n => {
+                let n = n.min(MAX_RISERS) as usize;
+                let riser = if height.is_finite() { height.max(0.0) / n as f64 } else { 0.0 };
+                (n, riser, rules.tread_for(riser, tread.max(0.0)))
+            }
+        };
+        let g = if self.tread > 1e-3 && self.tread.is_finite() { self.tread } else { g };
+        (risers, riser, g)
+    }
 }
+
+/// Most risers in one stair.
+pub const MAX_RISERS: u32 = 200;
 
 /// How a stair is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -196,6 +259,137 @@ impl Stringers {
     }
 }
 
+/// How the beams under a landing of an assembled stair with a central
+/// stringer run (with side stringers they frame the landing's edge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum LandingBeams {
+    /// The lines of the stringers of the flights the landing joins carried
+    /// across it, crossing (a beam across the middle on straight and
+    /// U-shaped landings).
+    #[default]
+    Cross,
+    /// One beam across the landing and the other springing from it: on a
+    /// corner, the beam of the arriving flight's stringer, with the leaving
+    /// flight's from its middle to the edge the flight leaves; on a
+    /// U-shaped landing, a beam across the middle with the stringers'
+    /// beams from the front up to it.
+    Tee,
+}
+
+impl LandingBeams {
+    pub const ALL: [LandingBeams; 2] = [LandingBeams::Cross, LandingBeams::Tee];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            LandingBeams::Cross => "stair-landing-beams-cross",
+            LandingBeams::Tee => "stair-landing-beams-tee",
+        }
+    }
+}
+
+/// A place round the edge of a landing where a post can stand: a corner or
+/// the middle of an edge, named walking onto the landing (front: the edge
+/// the stair arrives at; inner: the side the stair turns to).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostAt {
+    FrontOuter,
+    Front,
+    FrontInner,
+    Inner,
+    BackInner,
+    Back,
+    BackOuter,
+    Outer,
+}
+
+impl PostAt {
+    /// Round the edge, from the front corner on the outer side.
+    pub const ALL: [PostAt; 8] = [
+        PostAt::FrontOuter,
+        PostAt::Front,
+        PostAt::FrontInner,
+        PostAt::Inner,
+        PostAt::BackInner,
+        PostAt::Back,
+        PostAt::BackOuter,
+        PostAt::Outer,
+    ];
+
+    /// The name in commands and files.
+    pub fn name(self) -> &'static str {
+        match self {
+            PostAt::FrontOuter => "front_outer",
+            PostAt::Front => "front",
+            PostAt::FrontInner => "front_inner",
+            PostAt::Inner => "inner",
+            PostAt::BackInner => "back_inner",
+            PostAt::Back => "back",
+            PostAt::BackOuter => "back_outer",
+            PostAt::Outer => "outer",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<PostAt> {
+        PostAt::ALL.into_iter().find(|p| p.name() == name)
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            PostAt::FrontOuter => "stair-post-front-outer",
+            PostAt::Front => "stair-post-front",
+            PostAt::FrontInner => "stair-post-front-inner",
+            PostAt::Inner => "stair-post-inner",
+            PostAt::BackInner => "stair-post-back-inner",
+            PostAt::Back => "stair-post-back",
+            PostAt::BackOuter => "stair-post-back-outer",
+            PostAt::Outer => "stair-post-outer",
+        }
+    }
+}
+
+/// Where posts stand under one landing (only places where the landing's
+/// beams reach its edge take one, see `cc_geom::StairLanding::post_spots`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LandingPosts {
+    pub front_outer: bool,
+    pub front: bool,
+    pub front_inner: bool,
+    pub inner: bool,
+    pub back_inner: bool,
+    pub back: bool,
+    pub back_outer: bool,
+    pub outer: bool,
+}
+
+impl LandingPosts {
+    fn slot(&mut self, at: PostAt) -> &mut bool {
+        match at {
+            PostAt::FrontOuter => &mut self.front_outer,
+            PostAt::Front => &mut self.front,
+            PostAt::FrontInner => &mut self.front_inner,
+            PostAt::Inner => &mut self.inner,
+            PostAt::BackInner => &mut self.back_inner,
+            PostAt::Back => &mut self.back,
+            PostAt::BackOuter => &mut self.back_outer,
+            PostAt::Outer => &mut self.outer,
+        }
+    }
+
+    pub fn get(mut self, at: PostAt) -> bool {
+        *self.slot(at)
+    }
+
+    pub fn set(&mut self, at: PostAt, on: bool) {
+        *self.slot(at) = on;
+    }
+
+    pub fn any(self) -> bool {
+        PostAt::ALL.into_iter().any(|at| self.get(at))
+    }
+}
+
 /// Construction of a stair type.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -211,6 +405,12 @@ pub struct StairBuild {
     pub tread_thickness: f64,
     /// Riser boards closing the gap between treads (assembled stairs).
     pub closed_risers: bool,
+    /// Layout of the beams under the landings of an assembled stair with a
+    /// central stringer (they are as wide and deep as the stringers, under
+    /// a deck as thick as the treads).
+    pub landing_beams: LandingBeams,
+    /// Side of the square posts under the landings of an assembled stair.
+    pub post_width: f64,
 }
 
 impl Default for StairBuild {
@@ -223,6 +423,8 @@ impl Default for StairBuild {
             stringer_depth: 0.25,
             tread_thickness: 0.04,
             closed_risers: false,
+            landing_beams: LandingBeams::Cross,
+            post_width: 0.08,
         }
     }
 }
@@ -237,6 +439,7 @@ impl StairBuild {
             (&mut self.stringer_width, d.stringer_width),
             (&mut self.stringer_depth, d.stringer_depth),
             (&mut self.tread_thickness, d.tread_thickness),
+            (&mut self.post_width, d.post_width),
         ] {
             if !v.is_finite() || *v < 0.005 || *v > 2.0 {
                 *v = default;
@@ -463,6 +666,23 @@ mod tests {
             keys,
             ["stair-issue-riser-low", "stair-issue-tread-short", "stair-issue-blondel", "stair-issue-landing-short"]
         );
+    }
+
+    #[test]
+    fn a_layout_can_set_the_risers_and_tread() {
+        let rules = StairRules::default();
+        let auto = StairLayout::default();
+        assert_eq!(auto.steps(2.88, 0.18, 0.28, &rules), stair_steps(2.88, 0.18, 0.28, &rules));
+        let set = StairLayout { risers: 18, tread: 0.3, ..Default::default() };
+        let (n, riser, tread) = set.steps(2.88, 0.18, 0.28, &rules);
+        assert_eq!(n, 18);
+        assert!((riser - 0.16).abs() < 1e-12 && (tread - 0.3).abs() < 1e-12);
+        // Bad heights give flat steps, not NaN.
+        assert_eq!(set.steps(f64::NAN, 0.18, 0.28, &rules).1, 0.0);
+        let mut bad =
+            StairLayout { risers: 900, split2: 900, tread: f64::NAN, number_start: i32::MIN, ..Default::default() };
+        assert_eq!(bad.repair(), 4);
+        assert_eq!((bad.risers, bad.split2, bad.tread, bad.number_start), (0, 0, 0.0, 1));
     }
 
     #[test]

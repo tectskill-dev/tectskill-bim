@@ -1,7 +1,6 @@
 //! Vector export of drawings in paper millimeters (composed sheets) to SVG
 //! and PDF. Both writers are self-contained: the PDF uses the standard
-//! Helvetica font for the text it can show, and embeds subsets of Inter,
-//! Sarabun and the system's fallback fonts for the rest (Thai, Lao, CJK).
+//! Helvetica font, so no font is embedded.
 
 use crate::{Anchor, Drawing2D, Prim};
 use glam::DVec2;
@@ -15,6 +14,7 @@ fn anchor_offsets(anchor: Anchor) -> (f64, f64) {
     match anchor {
         Anchor::LeftBottom => (0.28, 0.0),
         Anchor::CenterBottom => (0.28, 0.5),
+        Anchor::RightBottom => (0.28, 1.0),
         Anchor::Center => (-0.35, 0.5),
     }
 }
@@ -127,6 +127,23 @@ fn svg(drawing: &Drawing2D, paper: DVec2, fonts: &[skrifa::FontRef]) -> String {
                     g = TEXT_GRAY
                 );
             }
+            Prim::Image { origin, u, v, image, faded, .. } => {
+                // The picture's unit square, top-left corner first, onto the flipped page.
+                let top_left = *origin + *v;
+                let opacity = if *faded { r#" opacity="0.34""# } else { "" };
+                let _ = writeln!(
+                    s,
+                    r#"<image width="1" height="1" preserveAspectRatio="none" transform="matrix({} {} {} {} {} {})"{opacity} href="data:{};base64,{}"/>"#,
+                    num(u.x),
+                    num(-u.y),
+                    num(-v.x),
+                    num(v.y),
+                    num(top_left.x),
+                    y(top_left.y),
+                    image.format.mime(),
+                    cc_core::raster::base64_encode(&image.data)
+                );
+            }
         }
     }
     s.push_str("</g>\n</svg>\n");
@@ -197,6 +214,8 @@ fn rgb(c: [u8; 3]) -> String {
 pub fn to_pdf(drawing: &Drawing2D, paper: DVec2) -> Vec<u8> {
     const PT_PER_MM: f64 = 72.0 / 25.4;
     let mut alphas: Vec<u8> = Vec::new();
+    // Pictures as image objects: size, compressed RGB and, when not opaque, compressed alpha.
+    let mut pictures: Vec<PdfPicture> = Vec::new();
     let mut content: Vec<u8> = Vec::new();
     // Read only when some text needs it.
     let mut embedded: Option<crate::pdf_fonts::EmbeddedFonts> = None;
@@ -271,6 +290,30 @@ pub fn to_pdf(drawing: &Drawing2D, paper: DVec2) -> Vec<u8> {
                 content.extend(pdf_string(&bytes));
                 content.extend(b" Tj ET\n");
             }
+            Prim::Image { origin, u, v, image, faded, .. } => {
+                let Some(mut rgba) = crate::raster::decode(image, PDF_IMAGE_SIDE) else { continue };
+                if *faded {
+                    crate::raster::fade(&mut rgba.pixels);
+                }
+                let rgb: Vec<u8> =
+                    rgba.pixels.as_chunks::<4>().0.iter().flat_map(|[r, g, b, _]| [*r, *g, *b]).collect();
+                let alpha: Vec<u8> = rgba.pixels.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
+                let alpha =
+                    alpha.iter().any(|a| *a < 255).then(|| miniz_oxide::deflate::compress_to_vec_zlib(&alpha, 6));
+                // The image's unit square (bottom-left at 0, 0) onto the parallelogram.
+                let _ = writeln!(
+                    Utf8(&mut content),
+                    "q {} {} {} {} {} {} cm /Im{} Do Q",
+                    num(u.x),
+                    num(u.y),
+                    num(v.x),
+                    num(v.y),
+                    num(origin.x),
+                    num(origin.y),
+                    pictures.len()
+                );
+                pictures.push((rgba.width, rgba.height, miniz_oxide::deflate::compress_to_vec_zlib(&rgb, 6), alpha));
+            }
         }
     }
 
@@ -279,14 +322,18 @@ pub fn to_pdf(drawing: &Drawing2D, paper: DVec2) -> Vec<u8> {
     for (i, a) in alphas.iter().enumerate() {
         let _ = write!(ext, "/GS{i} << /Type /ExtGState /ca {} >> ", num(*a as f64 / 255.0));
     }
-    // Embedded fonts follow Helvetica (object 5).
+    // Objects 1 to 5 are fixed; each picture takes two numbers from 6 (the image, then its alpha mask).
+    let picture_object = |i: usize| 6 + 2 * i;
+    let xobjects: String = (0..pictures.len()).map(|i| format!("/Im{i} {} 0 R ", picture_object(i))).collect();
+    // Embedded fonts follow the pictures.
     let embedded = embedded.filter(|e| !e.is_empty());
-    let font_resources = embedded.as_ref().map(|e| e.resources(6)).unwrap_or_default();
+    let first_font = picture_object(pictures.len());
+    let font_resources = embedded.as_ref().map(|e| e.resources(first_font)).unwrap_or_default();
     let mut objects: Vec<Vec<u8>> = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
         format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Resources << /Font << /F1 5 0 R {font_resources}>> /ExtGState << {ext}>> >> /Contents 4 0 R >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Resources << /Font << /F1 5 0 R {font_resources}>> /ExtGState << {ext}>> /XObject << {xobjects}>> >> /Contents 4 0 R >>",
             num(w),
             num(h)
         )
@@ -297,10 +344,29 @@ pub fn to_pdf(drawing: &Drawing2D, paper: DVec2) -> Vec<u8> {
     stream.extend(b"\nendstream");
     objects.push(stream);
     objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec());
-    if let Some(e) = &embedded {
-        objects.extend(e.objects(6));
+    for (i, (pw, ph, rgb, alpha)) in pictures.iter().enumerate() {
+        let image_stream = |extra: &str, color: &str, data: &[u8]| {
+            let mut o = format!(
+                "<< /Type /XObject /Subtype /Image /Width {pw} /Height {ph} /ColorSpace {color} /BitsPerComponent 8 /Filter /FlateDecode {extra}/Length {} >>\nstream\n",
+                data.len()
+            )
+            .into_bytes();
+            o.extend(data);
+            o.extend(b"\nendstream");
+            o
+        };
+        let mask = format!("/SMask {} 0 R ", picture_object(i) + 1);
+        objects.push(image_stream(if alpha.is_some() { &mask } else { "" }, "/DeviceRGB", rgb));
+        // Every picture keeps two numbers; an opaque one's second is an unused empty dictionary.
+        objects.push(match alpha {
+            Some(a) => image_stream("", "/DeviceGray", a),
+            None => b"<< >>".to_vec(),
+        });
     }
-    objects.push(b"<< /Producer (ConstructCAD) >>".to_vec());
+    if let Some(e) = &embedded {
+        objects.extend(e.objects(first_font));
+    }
+    objects.push(b"<< /Producer (TectSkill BIM) >>".to_vec());
 
     let mut out: Vec<u8> = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n".to_vec();
     let mut offsets = Vec::new();
@@ -383,6 +449,12 @@ impl std::fmt::Write for Utf8<'_> {
 /// The largest raster export, in pixels (about 20000 x 5000, or an A0
 /// sheet at 300 dpi).
 pub const MAX_PIXELS: u64 = 160_000_000;
+
+/// A picture of a PDF: width, height, compressed RGB and, when not opaque, compressed alpha.
+type PdfPicture = (u32, u32, Vec<u8>, Option<Vec<u8>>);
+
+/// Longest side of a picture in an exported PDF, pixels (larger ones are reduced).
+const PDF_IMAGE_SIDE: u32 = 6000;
 
 pub(crate) const INTER: &[u8] = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
 
@@ -490,6 +562,11 @@ pub fn view_on_paper(drawing: &Drawing2D, scale: u32, margin: f64) -> (Drawing2D
                 let width = ems * size;
                 grow(*pos * k, DVec2::splat(width.max(*size)));
             }
+            Prim::Image { origin, u, v, .. } => {
+                for p in Prim::image_corners(*origin, *u, *v) {
+                    grow(p * k, DVec2::ZERO);
+                }
+            }
         }
     }
     if !(lo.is_finite() && hi.is_finite()) {
@@ -497,33 +574,27 @@ pub fn view_on_paper(drawing: &Drawing2D, scale: u32, margin: f64) -> (Drawing2D
     }
     let origin = lo - DVec2::splat(margin);
     let map = |p: DVec2| p * k - origin;
-    let prims = drawing
-        .prims
-        .iter()
-        .map(|prim| match prim {
-            Prim::Line { a, b, style, element, pen } => {
-                Prim::Line { a: map(*a), b: map(*b), style: *style, element: *element, pen: *pen }
-            }
-            Prim::Fill { pts, color, element, cut } => {
-                Prim::Fill { pts: pts.iter().map(|p| map(*p)).collect(), color: *color, element: *element, cut: *cut }
-            }
-            Prim::Text { pos, text, size, anchor, angle, element } => Prim::Text {
-                pos: map(*pos),
-                text: text.clone(),
-                size: *size,
-                anchor: *anchor,
-                angle: *angle,
-                element: *element,
-            },
-        })
-        .collect();
-    (Drawing2D { prims, fit_elements: drawing.fit_elements }, hi - lo + DVec2::splat(2.0 * margin))
+    let prims = drawing.prims.iter().map(|prim| prim.mapped(map)).collect();
+    (
+        Drawing2D {
+            prims,
+            fit_elements: drawing.fit_elements,
+            background: drawing.background.clone(),
+            tags: Vec::new(),
+            sections: Vec::new(),
+            callouts: Vec::new(),
+            underlay: drawing.underlay,
+            overlay: drawing.overlay,
+            index: Default::default(),
+        },
+        hi - lo + DVec2::splat(2.0 * margin),
+    )
 }
 
 /// PNG image of `drawing` on a sheet of `paper` millimeters at `dpi` dots
 /// per inch, on white; text is drawn as outlines of Inter (embedded), with
-/// Sarabun (embedded, Thai) and the system's fallback fonts
-/// (`fonts::fallbacks`: CJK, Lao) for the characters Inter lacks.
+/// the system's fallback fonts (`fonts::fallbacks`: CJK, Lao) for the
+/// characters Inter lacks.
 pub fn to_png(drawing: &Drawing2D, paper: DVec2, dpi: f64) -> Result<Vec<u8>, String> {
     use resvg::{tiny_skia, usvg};
     if !(dpi.is_finite() && dpi > 0.0) {

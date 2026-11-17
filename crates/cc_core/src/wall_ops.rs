@@ -4,12 +4,18 @@
 //! and other arcs where the circles cross.
 //!
 //! Picks are plan points on the element: the picked part is the part kept.
+//!
+//! Detail lines take part too, through their curve and
+//! [`crate::sketch_edit`]: they trim and extend to other detail lines and
+//! to the lines of walls, beams and grids, split and offset.
 
 use crate::arc::{Arc, MAX_BULGE};
+use crate::sketch::SketchCurve;
+use crate::sketch_edit;
 use crate::{EditCtx, Element, ElementId, ElementKind, Project};
 use glam::DVec2;
 
-/// Where a linear element runs: a straight line, or an arc (arc walls).
+/// Where a linear element runs: a straight line, or an arc (arc walls and arc beams).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Path {
     Line(DVec2, DVec2),
@@ -18,10 +24,35 @@ pub enum Path {
 
 /// The path of a linear element, if it has one.
 pub fn path_of(e: &Element) -> Option<Path> {
+    if let ElementKind::DetailLine(l) = &e.kind {
+        return match l.curve {
+            SketchCurve::Line { a, b } => Some(Path::Line(a, b)),
+            SketchCurve::Arc { a, b, bulge } => Some(Arc::from_bulge(a, b, bulge).map_or(Path::Line(a, b), Path::Arc)),
+            _ => None,
+        };
+    }
     let (a, b) = line_of(e)?;
-    match e.as_wall().and_then(|w| w.arc()) {
+    match arc_of(e) {
         Some(arc) => Some(Path::Arc(arc)),
         None => Some(Path::Line(a, b)),
+    }
+}
+
+/// The arc of an arc wall's or arc beam's location line.
+fn arc_of(e: &Element) -> Option<Arc> {
+    match &e.kind {
+        ElementKind::Wall(w) => w.arc(),
+        ElementKind::Beam(b) => b.arc(),
+        _ => None,
+    }
+}
+
+/// The bulge of a wall's or beam's location line.
+fn bulge_mut(e: &mut Element) -> Option<&mut f64> {
+    match &mut e.kind {
+        ElementKind::Wall(w) => Some(&mut w.bulge),
+        ElementKind::Beam(b) => Some(&mut b.bulge),
+        _ => None,
     }
 }
 
@@ -137,6 +168,25 @@ fn circle_circle(c0: DVec2, r0: f64, c1: DVec2, r1: f64) -> Vec<DVec2> {
     if h < 1e-9 { vec![foot] } else { vec![foot + u.perp() * h, foot - u.perp() * h] }
 }
 
+/// The curve of an element as a sketch curve: a detail line's own, or the
+/// location line of a wall or beam (an arc for arc walls and arc beams) or grid.
+pub fn curve_of(e: &Element) -> Option<SketchCurve> {
+    match &e.kind {
+        ElementKind::DetailLine(l) => Some(l.curve),
+        ElementKind::Wall(w) if w.bulge != 0.0 => Some(SketchCurve::Arc { a: w.start, b: w.end, bulge: w.bulge }),
+        ElementKind::Beam(b) if b.bulge != 0.0 => Some(SketchCurve::Arc { a: b.start, b: b.end, bulge: b.bulge }),
+        _ => line_of(e).map(|(a, b)| SketchCurve::Line { a, b }),
+    }
+}
+
+/// The curve of a detail line.
+fn detail_curve(project: &Project, id: ElementId) -> Option<SketchCurve> {
+    match project.element(id).map(|e| &e.kind) {
+        Some(ElementKind::DetailLine(l)) => Some(l.curve),
+        _ => None,
+    }
+}
+
 /// Location line of a linear element, if it has one.
 pub fn line_of(e: &Element) -> Option<(DVec2, DVec2)> {
     match &e.kind {
@@ -234,8 +284,8 @@ impl EditCtx<'_> {
     fn apply_trimmed(&mut self, id: ElementId, t: Trimmed) {
         if let Some(el) = self.element_mut(id) {
             set_line(el, t.start, t.end);
-            if let ElementKind::Wall(w) = &mut el.kind {
-                w.bulge = t.bulge;
+            if let Some(bulge) = bulge_mut(el) {
+                *bulge = t.bulge;
             }
         }
         let length =
@@ -243,11 +293,46 @@ impl EditCtx<'_> {
         keep_openings(self, id, t.shift, length);
     }
 
+    fn set_detail_curve(&mut self, id: ElementId, curve: SketchCurve) {
+        if let Some(ElementKind::DetailLine(l)) = self.element_mut(id).map(|e| &mut e.kind) {
+            l.curve = curve;
+        }
+    }
+
+    /// A copy of detail line `id` with `curve`.
+    fn add_detail_copy(&mut self, id: ElementId, curve: SketchCurve) -> Result<ElementId, EditError> {
+        let Some(mut copy) = self.project().element(id).cloned() else { return Err(EditError::NotLinear) };
+        copy.id = ElementId(self.alloc_id());
+        copy.uid = Default::default();
+        if let ElementKind::DetailLine(l) = &mut copy.kind {
+            l.curve = curve;
+        }
+        Ok(self.add_element(copy))
+    }
+
+    /// Trim or extend detail line `id` to the curve `boundary` (where its
+    /// line, circle or ellipse runs), keeping the picked part.
+    pub fn trim_detail(&mut self, id: ElementId, pick: DVec2, boundary: &SketchCurve) -> Result<(), EditError> {
+        let c = detail_curve(self.project(), id).ok_or(EditError::NotLinear)?;
+        let new = sketch_edit::trim_extend(&c, pick, boundary).ok_or(EditError::Degenerate)?;
+        self.set_detail_curve(id, new);
+        Ok(())
+    }
+
     /// Trim or extend two elements so they meet at a corner, keeping the
     /// picked parts. Lines meet where they cross; an arc wall meets a line
     /// or another arc where its circle crosses it (of two crossings, the one
     /// on the elements themselves, else the one that changes them least).
     pub fn trim_corner(&mut self, a: ElementId, pick_a: DVec2, b: ElementId, pick_b: DVec2) -> Result<(), EditError> {
+        let (ca, cb) = (detail_curve(self.project(), a), detail_curve(self.project(), b));
+        if ca.is_some() || cb.is_some() {
+            // Detail lines meet detail lines only (a model element is not trimmed to a drawing).
+            let (Some(ca), Some(cb)) = (ca, cb) else { return Err(EditError::NotLinear) };
+            let (na, nb) = sketch_edit::trim_corner(&ca, pick_a, &cb, pick_b).ok_or(EditError::Degenerate)?;
+            self.set_detail_curve(a, na);
+            self.set_detail_curve(b, nb);
+            return Ok(());
+        }
         let (pa, pb) = (path(self.project(), a)?, path(self.project(), b)?);
         let crossings = pa.crossings(&pb);
         if crossings.is_empty() {
@@ -269,6 +354,17 @@ impl EditCtx<'_> {
     /// Trim or extend `id` to the `reference` path (a line, or an arc's
     /// circle), keeping the picked part.
     pub fn trim_to(&mut self, id: ElementId, pick: DVec2, reference: Path) -> Result<(), EditError> {
+        if detail_curve(self.project(), id).is_some() {
+            let boundary = match reference {
+                Path::Line(a, b) => SketchCurve::Line { a, b },
+                Path::Arc(c) => SketchCurve::Arc {
+                    a: c.point(0.0),
+                    b: c.point(c.length()),
+                    bulge: c.bulge_between(0.0, c.length()),
+                },
+            };
+            return self.trim_detail(id, pick, &boundary);
+        }
         let p = path(self.project(), id)?;
         let crossings = p.crossings(&reference);
         if crossings.is_empty() {
@@ -287,11 +383,16 @@ impl EditCtx<'_> {
     /// new element (the part after the split). Openings past the split go
     /// to the new wall.
     pub fn split(&mut self, id: ElementId, at: DVec2) -> Result<ElementId, EditError> {
+        if let Some(c) = detail_curve(self.project(), id) {
+            let (first, second) = sketch_edit::split(&c, at).ok_or(EditError::Degenerate)?;
+            self.set_detail_curve(id, first);
+            return self.add_detail_copy(id, second);
+        }
         let (a, b) = line(self.project(), id)?;
         let dir = (b - a).normalize_or_zero();
-        let arc = self.project().element(id).and_then(|e| e.as_wall()).and_then(|w| w.arc());
+        let arc = self.project().element(id).and_then(arc_of);
         let len = arc.map_or(a.distance(b), |c| c.length());
-        // Arc walls split on the arc, each part keeping its share of the sweep.
+        // Arc walls and arc beams split on the arc, each part keeping its share of the sweep.
         let t = arc.map_or((at - a).dot(dir), |c| c.locate(at).0);
         if t < 1e-3 || t > len - 1e-3 {
             return Err(EditError::Degenerate);
@@ -305,8 +406,8 @@ impl EditCtx<'_> {
             g.name = format!("{}'", g.name);
         }
         set_line(&mut second, p, b);
-        if let (Some(c), ElementKind::Wall(w)) = (arc, &mut second.kind) {
-            w.bulge = c.bulge_between(t, len);
+        if let (Some(c), Some(bulge)) = (arc, bulge_mut(&mut second)) {
+            *bulge = c.bulge_between(t, len);
         }
         // A sloped beam keeps its slope: the split point's elevation joins the parts.
         let split_z = match &original.kind {
@@ -318,8 +419,8 @@ impl EditCtx<'_> {
         }
         if let Some(el) = self.element_mut(id) {
             set_line(el, a, p);
-            if let (Some(c), ElementKind::Wall(w)) = (arc, &mut el.kind) {
-                w.bulge = c.bulge_between(0.0, t);
+            if let (Some(c), Some(bulge)) = (arc, bulge_mut(el)) {
+                *bulge = c.bulge_between(0.0, t);
             }
             if let (Some(z), ElementKind::Beam(x)) = (split_z, &mut el.kind) {
                 x.end_offset = Some(z);
@@ -364,6 +465,13 @@ impl EditCtx<'_> {
     /// A copy of `id` moved `distance` perpendicular to its line (positive
     /// to the left of start→end). Openings are not copied.
     pub fn offset_copy(&mut self, id: ElementId, distance: f64) -> Result<ElementId, EditError> {
+        if let Some(c) = detail_curve(self.project(), id) {
+            if distance.abs() < 1e-6 {
+                return Err(EditError::Degenerate);
+            }
+            let moved = sketch_edit::offset_left(&c, distance).ok_or(EditError::Degenerate)?;
+            return self.add_detail_copy(id, moved);
+        }
         let (a, b) = line(self.project(), id)?;
         let n = (b - a).normalize_or_zero().perp();
         if n == DVec2::ZERO || distance.abs() < 1e-6 {
@@ -380,6 +488,14 @@ impl EditCtx<'_> {
                     return Err(EditError::Degenerate);
                 }
                 (w.start, w.end) = w.offset_line(distance);
+            }
+            // An arc beam's too: the same bulge on a concentric circle.
+            ElementKind::Beam(b) if b.arc().is_some() => {
+                let arc = b.arc().ok_or(EditError::NotLinear)?;
+                if arc.radius_at(distance) < 1e-3 {
+                    return Err(EditError::Degenerate);
+                }
+                (b.start, b.end) = (arc.at(0.0, distance), arc.at(arc.length(), distance));
             }
             _ => copy.translate(n * distance),
         }
@@ -451,6 +567,8 @@ mod tests {
                         uid: Default::default(),
                         phase_created: Default::default(),
                         phase_demolished: None,
+                        design_option: None,
+                        paints: Vec::new(),
                     })
                 })
                 .collect()
@@ -499,6 +617,8 @@ mod tests {
                 uid: Default::default(),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             })
         });
         // Split at x = 6: the door (at 8) moves to the second wall at 2.
@@ -642,6 +762,8 @@ mod tests {
                 uid: Default::default(),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             })
         });
         let outer = path(&doc.project, ids[1]).unwrap();

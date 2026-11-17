@@ -192,8 +192,9 @@ mod tests {
                     overrides: Default::default(),
                     properties: Vec::new(),
                     system,
+                    ..Default::default()
                 };
-                e.add_element(Element { id, level, type_id, mark: String::new(), comments: String::new(), uid: Default::default(), kind: ElementKind::Component(c), phase_created: Default::default(), phase_demolished: None  });
+                e.add_element(Element { id, level, type_id, mark: String::new(), comments: String::new(), uid: Default::default(), kind: ElementKind::Component(c), phase_created: Default::default(), phase_demolished: None, design_option: None, paints: Vec::new() });
                 id
             };
             let panel = add(e, panel_t, None);

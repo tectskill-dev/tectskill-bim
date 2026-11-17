@@ -36,7 +36,8 @@ fn copy(s: &mut Session, ids: &[u64], transforms: &[PlanTransform], tx: String) 
     Ok(json!({ "created": ids_json(&created) }))
 }
 
-/// Delete elements (doors and windows of deleted walls go too; pinned elements stay).
+/// Delete elements (doors and windows of deleted walls go too, piles with their caps; pinned
+/// elements stay, and so do the piles of a cap that is not deleted).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ElementsDelete {
@@ -49,6 +50,9 @@ impl Command for ElementsDelete {
     const KIND: CommandKind = CommandKind::Edit;
     fn run(self, s: &mut Session) -> Result<Value> {
         let ids = refs::elements(s.project(), &self.ids)?;
+        // A cap's piles go only with their cap (it would put them back).
+        let owned = super::piles::owned_piles(s.project(), &ids);
+        let ids: Vec<_> = ids.into_iter().filter(|id| !owned.contains(id)).collect();
         let (free, pinned) = unpinned(s.project(), ids);
         edit(s, t!("tx-delete"), |e| {
             for id in &free {
@@ -56,7 +60,11 @@ impl Command for ElementsDelete {
             }
             Ok(())
         })?;
-        Ok(json!({ "deleted": ids_json(&free), "pinned_skipped": ids_json(&pinned) }))
+        Ok(json!({
+            "deleted": ids_json(&free),
+            "pinned_skipped": ids_json(&pinned),
+            "cap_piles_skipped": ids_json(&owned),
+        }))
     }
 }
 
@@ -459,7 +467,8 @@ impl Command for GroupUngroup {
 
 /// Trim or extend two linear elements (walls, beams, grids) to meet at a
 /// corner; each pick point marks the part of its element to keep. Arc walls
-/// meet lines and other arcs where their circles cross them.
+/// meet lines and other arcs where their circles cross them. Two detail
+/// lines meet where their lines, circles or ellipses cross.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TrimCorner {
@@ -488,7 +497,9 @@ impl Command for TrimCorner {
 
 /// Trim or extend a linear element to the line of a reference element (the
 /// circle of an arc wall); the pick point marks the part to keep. Arc walls
-/// trim and extend along their circle.
+/// trim and extend along their circle. A detail line trims or extends to
+/// another detail line (also a circle or an ellipse) or to the line of a
+/// wall, beam or grid.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TrimExtend {
@@ -512,14 +523,27 @@ impl Command for TrimExtend {
     fn run(self, s: &mut Session) -> Result<Value> {
         let id = refs::element(s.project(), self.id)?;
         not_pinned(s.project(), id)?;
-        let reference = path(s, self.reference)?;
         let pick = point(self.pick)?;
+        // A detail line trims to any curve: another detail line's (a circle,
+        // an ellipse) or the line of a wall, beam or grid.
+        if matches!(s.project().element(id).map(|e| &e.kind), Some(ElementKind::DetailLine(_))) {
+            let p = s.project();
+            let boundary = p
+                .element(refs::element(p, self.reference)?)
+                .and_then(cc_core::wall_ops::curve_of)
+                .ok_or_else(|| EngineError::invalid(format!("element {} has no line", self.reference)))?;
+            edit(s, t!("tx-trim"), |e| Ok(e.trim_detail(id, pick, &boundary)?))?;
+            return Ok(super::created(s, id));
+        }
+        let reference = path(s, self.reference)?;
         edit(s, t!("tx-trim"), |e| Ok(e.trim_to(id, pick, reference)?))?;
         Ok(super::created(s, id))
     }
 }
 
-/// Split a linear element (wall, beam, grid) at a point; returns the new element.
+/// Split a linear element (wall, beam, grid) or a detail line at a point;
+/// returns the new element. A detail circle or whole ellipse splits into
+/// halves, from the point and from the one opposite.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ElementSplit {
@@ -541,7 +565,10 @@ impl Command for ElementSplit {
     }
 }
 
-/// Copy a linear element parallel at `distance` (positive: to the left of its direction).
+/// Copy a linear element parallel at `distance` (positive: to the left of
+/// its direction). Detail lines too: an arc's or a circle's copy is
+/// concentric (positive: towards the center of a circle); ellipses have no
+/// offset.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ElementOffset {
@@ -562,12 +589,14 @@ impl Command for ElementOffset {
     }
 }
 
-/// Move a linear element parallel onto the line of a reference element, or
-/// an arc wall onto the circle of a concentric arc wall (its radius changes).
-/// Elements without a location line (columns, components) align by an edge
-/// of their plan outline, the one nearest to a picked point. Alignment is in
-/// plan, so the elements may be on different levels (a column above onto
-/// the face of the column below).
+/// Align an element onto a line of a reference element, in plan: the edge
+/// picked on the element (a wall's face, a column's side) moves onto the
+/// line picked on the reference (a face or side, or the location line of a
+/// grid or of an element picked without a point). When the two are not
+/// parallel the element first turns about the picked point of its edge. An
+/// arc wall moves onto the circle of a concentric arc wall (its radius
+/// changes). Alignment is in plan, so the elements may be on different
+/// levels (a column above onto the face of the column below).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ElementAlign {
@@ -575,41 +604,69 @@ pub struct ElementAlign {
     pub id: u64,
     /// Element whose line it moves onto.
     pub reference: u64,
-    /// Plan point `[x, y]` near the edge of `id` that moves onto the reference line, for an element
-    /// without a location line (the outline edge nearest to it, parallel to the reference line).
-    /// Without it such an element moves its insertion point onto the line.
+    /// Plan point `[x, y]` near the edge of `id` that moves onto the reference line (the edge of
+    /// its plan outline nearest to it). Without it a linear element moves its location line, and
+    /// other elements their insertion point, onto the line.
     #[serde(default)]
     pub pick: Option<Point>,
-    /// Plan point `[x, y]` near the edge of `reference` to align to; needed when the reference has
-    /// no location line (a column or component: the outline edge nearest to it).
+    /// Plan point `[x, y]` near the line of `reference` to align to (the edge of its plan outline
+    /// nearest to it, such as a wall face). Without it the reference's location line is used,
+    /// which a column or component does not have.
     #[serde(default)]
     pub reference_pick: Option<Point>,
+}
+
+/// The line of element `id` that Align uses: the edge of its plan outline
+/// nearest to `pick` (a wall face, a column side), else its location line
+/// (grids have only that). An arc wall gives its arc.
+pub fn align_line(
+    project: &cc_core::Project,
+    geom: &cc_geom::ModelGeometry,
+    id: ElementId,
+    pick: Option<DVec2>,
+) -> Option<cc_core::wall_ops::Path> {
+    use cc_core::wall_ops::{Path, path_of};
+    let path = project.element(id).and_then(path_of);
+    if let Some(Path::Arc(_)) = path {
+        return path;
+    }
+    pick.and_then(|at| geom.nearest_plan_edge(id, at)).map(|(a, b)| Path::Line(a, b)).or(path)
+}
+
+/// The turn (radians, within ±90°) that makes direction `from` parallel to `to`.
+fn turn_to_parallel(from: DVec2, to: DVec2) -> f64 {
+    let angle = from.perp_dot(to).atan2(from.dot(to));
+    let half = std::f64::consts::FRAC_PI_2;
+    if angle > half {
+        angle - std::f64::consts::PI
+    } else if angle <= -half {
+        angle + std::f64::consts::PI
+    } else {
+        angle
+    }
 }
 
 impl Command for ElementAlign {
     const NAME: &'static str = "element_align";
     const KIND: CommandKind = CommandKind::Edit;
     fn run(self, s: &mut Session) -> Result<Value> {
-        use cc_core::wall_ops::{EditError, Path, path_of};
+        use cc_core::wall_ops::{EditError, Path};
         let id = refs::element(s.project(), self.id)?;
         not_pinned(s.project(), id)?;
         let reference_id = refs::element(s.project(), self.reference)?;
         let pick = self.pick.map(point).transpose()?;
         let reference_pick = self.reference_pick.map(point).transpose()?;
-        let reference = match s.project().element(reference_id).and_then(path_of) {
-            Some(path) => path,
-            None => {
-                let at = reference_pick.ok_or_else(|| {
-                    EngineError::invalid(format!(
-                        "element {} has no line: give reference_pick near the edge to align to",
-                        self.reference
-                    ))
-                })?;
-                let (a, b) = outline_edge(s, reference_id, at)?;
-                Path::Line(a, b)
-            }
-        };
-        if s.project().element(id).and_then(path_of).is_some() {
+        s.geometry();
+        let (project, geom) = (&s.doc.project, s.geom());
+        let reference = align_line(project, geom, reference_id, reference_pick).ok_or_else(|| {
+            EngineError::invalid(format!(
+                "element {} has no line: give reference_pick near the edge to align to",
+                self.reference
+            ))
+        })?;
+        let moved = align_line(project, geom, id, pick);
+        // Arc walls onto concentric arcs.
+        if let (Some(Path::Arc(_)), Path::Arc(_)) = (&moved, &reference) {
             edit(s, t!("tx-align"), |e| Ok(e.align_to(id, reference)?))?;
             return Ok(super::created(s, id));
         }
@@ -618,32 +675,33 @@ impl Command for ElementAlign {
         if v == DVec2::ZERO {
             return Err(EditError::Degenerate.into());
         }
-        // The point of the element that lands on the reference line.
-        let on = match pick {
-            Some(at) => {
-                let (a, b) = outline_edge(s, id, at)?;
-                if (b - a).normalize_or_zero().perp_dot(v).abs() > 0.02 {
-                    return Err(EngineError::rejected(t!("msg-not-parallel")));
+        // The point of the element that lands on the reference line, and the
+        // direction of its edge (none for a lone insertion point).
+        let (on, dir) = match moved {
+            Some(Path::Line(a, b)) => {
+                let u = (b - a).normalize_or_zero();
+                if u == DVec2::ZERO {
+                    return Err(EditError::Degenerate.into());
                 }
-                a
+                let at = pick.map_or(a, |p| a + u * (p - a).dot(u));
+                (at, Some(u))
             }
-            None => insertion_point(s, id)?,
+            Some(Path::Arc(_)) => return Err(EditError::Curved.into()),
+            None => (insertion_point(s, id)?, None),
         };
+        let turn = dir.map_or(0.0, |u| turn_to_parallel(u, v));
         let n = v.perp();
         let shift = n * (r0 - on).dot(n);
+        let mut t = PlanTransform::translate(shift);
+        if turn.abs() > 1e-9 {
+            t = PlanTransform::rotate_about(on, turn).then(t);
+        }
         edit(s, t!("tx-align"), |e| {
-            e.transform_elements(&[id], &PlanTransform::translate(shift));
+            e.transform_elements(&[id], &t);
             Ok(())
         })?;
         Ok(super::created(s, id))
     }
-}
-
-/// The plan edge of an element's outline nearest to `at`.
-fn outline_edge(s: &mut Session, id: ElementId, at: DVec2) -> Result<(DVec2, DVec2)> {
-    s.geometry()
-        .nearest_plan_edge(id, at)
-        .ok_or_else(|| EngineError::invalid(format!("element {} has no outline to align by", id.0)))
 }
 
 /// Where an element without a location line stands in plan: a column's or
@@ -791,6 +849,7 @@ impl Command for ElementsTurn {
                             | ElementKind::Column(_)
                             | ElementKind::Door(_)
                             | ElementKind::Window(_)
+                            | ElementKind::Niche(_)
                     )
                 )
             })
@@ -801,7 +860,9 @@ impl Command for ElementsTurn {
                 match &mut el.kind {
                     ElementKind::Component(c) => c.rotation_deg = (c.rotation_deg + 90.0).rem_euclid(360.0),
                     ElementKind::Column(c) => c.rotation_deg = (c.rotation_deg + 90.0).rem_euclid(360.0),
-                    ElementKind::Door(h) | ElementKind::Window(h) => h.flip_facing = !h.flip_facing,
+                    ElementKind::Door(h) | ElementKind::Window(h) | ElementKind::Niche(h) => {
+                        h.flip_facing = !h.flip_facing
+                    }
                     _ => {}
                 }
             }
@@ -845,17 +906,133 @@ pub struct ElementsPaste {
     /// Level id or name to paste on (default: each element's own level).
     #[serde(default)]
     pub level: Option<crate::refs::Ref>,
+    /// View id or name to paste the elements drawn in a view into (detail
+    /// lines, filled and masking regions, text notes, dimensions, level
+    /// marks, detail components and imported drawings), at the same drawing
+    /// coordinates and on its level (default: each one's own view). Every
+    /// such element must be one the view takes. Elements of the model ignore it.
+    #[serde(default)]
+    pub view: Option<crate::refs::Ref>,
 }
 
 impl Command for ElementsPaste {
     const NAME: &'static str = "elements_paste";
     const KIND: CommandKind = CommandKind::Edit;
     fn run(self, s: &mut Session) -> Result<Value> {
-        let set: Vec<cc_core::Element> = serde_json::from_value(self.elements)
+        let mut set: Vec<cc_core::Element> = serde_json::from_value(self.elements)
             .map_err(|e| EngineError::invalid(format!("invalid elements: {e}")))?;
         let t = PlanTransform::translate(self.delta.map(point).transpose()?.unwrap_or(DVec2::ZERO));
         let level = self.level.as_ref().map(|l| refs::level(s.project(), l)).transpose()?;
+        if let Some(view) = &self.view {
+            let view = refs::view(s.project(), view)?;
+            retarget(s.project(), &mut set, view)?;
+        }
         let created = edit(s, t!("tx-paste"), |e| Ok(e.paste_elements(&set, &[t], level)))?;
         Ok(json!({ "created": ids_json(&created) }))
+    }
+}
+
+/// Move the view-owned elements of a copied set (see
+/// [`cc_core::Element::owner_view`]) into `view`, onto its level (or the
+/// lowest). Refused unless the view takes every one of them, as the
+/// commands that create them would. A dimension moved between views that
+/// do not share a drawing frame (two plans) stops measuring elements and
+/// stays where it is drawn.
+pub(crate) fn retarget(p: &Project, set: &mut [cc_core::Element], view: cc_core::ViewId) -> Result<()> {
+    let target = p.view(view).ok_or_else(|| EngineError::not_found("view"))?;
+    let level =
+        target.level().or_else(|| p.levels.first().map(|l| l.id)).ok_or_else(|| EngineError::rejected("no levels"))?;
+    for e in set.iter_mut() {
+        let Some(from) = e.owner_view() else { continue };
+        if !view_takes(target, &e.kind) {
+            let category = refs::category_name(e.category());
+            return Err(EngineError::invalid(format!("the view '{}' does not take {category} elements", target.name)));
+        }
+        let same_frame = from == view || (target.is_plan() && p.view(from).is_some_and(|v| v.is_plan()));
+        if let ElementKind::Dimension(d) = &mut e.kind
+            && !same_frame
+        {
+            for r in d.all_refs_mut() {
+                *r = None;
+            }
+        }
+        e.set_owner_view(view);
+        e.level = level;
+    }
+    Ok(())
+}
+
+/// Whether `view` takes a view-owned element of this kind, as the command
+/// that creates it would.
+fn view_takes(view: &cc_core::View, e: &ElementKind) -> bool {
+    use cc_core::ViewKind as V;
+    match e {
+        ElementKind::Text(_) => !matches!(view.kind, V::Schedule { .. } | V::Sheet { .. }),
+        ElementKind::Dimension(_) => view.takes_dimensions(),
+        ElementKind::BarTag(_) => super::bar_marks::takes_tags(view),
+        ElementKind::LevelMark(_) => {
+            matches!(view.kind, V::FloorPlan { .. } | V::CeilingPlan { .. } | V::Elevation { .. } | V::Section { .. })
+        }
+        _ => cc_views::hosts_cad(&view.kind),
+    }
+}
+
+/// Attach the tops of walls to a roof, ceiling or floor (`top`), or take
+/// them off it (`detach`). Under the element a wall rises or drops to its
+/// underside, following its slope (a gable wall ends in a triangle);
+/// elsewhere it keeps its own top. The walls follow the element when it
+/// changes.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WallAttach {
+    /// Wall ids.
+    pub ids: Vec<u64>,
+    /// The roof, ceiling or floor to attach the tops to.
+    #[serde(default)]
+    pub top: Option<u64>,
+    /// Take the tops off what they are attached to.
+    #[serde(default)]
+    pub detach: bool,
+}
+
+impl Command for WallAttach {
+    const NAME: &'static str = "wall_attach";
+    const KIND: CommandKind = CommandKind::Edit;
+    fn run(self, s: &mut Session) -> Result<Value> {
+        let p = s.project();
+        let target = match (self.top, self.detach) {
+            (Some(_), true) => return Err(EngineError::invalid("give top or detach, not both")),
+            (None, false) => {
+                return Err(EngineError::invalid("give the roof, ceiling or floor to attach to, or detach"));
+            }
+            (Some(t), false) => {
+                let t = refs::element(p, t)?;
+                match p.element(t).map(|e| &e.kind) {
+                    Some(ElementKind::Roof(_) | ElementKind::Ceiling(_) | ElementKind::Floor(_)) => Some(t),
+                    _ => return Err(EngineError::invalid(format!("element {} is not a roof, ceiling or floor", t.0))),
+                }
+            }
+            (None, true) => None,
+        };
+        if self.ids.is_empty() {
+            return Err(EngineError::invalid("no walls given"));
+        }
+        let mut walls = Vec::with_capacity(self.ids.len());
+        for id in &self.ids {
+            let id = refs::element(p, *id)?;
+            if !matches!(p.element(id).map(|e| &e.kind), Some(ElementKind::Wall(_))) {
+                return Err(EngineError::invalid(format!("element {} is not a wall", id.0)));
+            }
+            walls.push(id);
+        }
+        edit(s, t!("tx-wall-attach"), |e| {
+            for id in &walls {
+                if let Some(ElementKind::Wall(w)) = e.element_mut(*id).map(|x| &mut x.kind) {
+                    w.attach_top = target;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(json!({ "ids": walls.iter().map(|id| id.0).collect::<Vec<_>>(), "top": target.map(|t| t.0) }))
     }
 }

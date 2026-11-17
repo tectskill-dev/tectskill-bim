@@ -68,6 +68,30 @@ fn scripts_run_in_order_and_stop_at_errors() {
 }
 
 #[test]
+fn scripts_refer_to_earlier_steps_and_the_given_level() {
+    let script = r#"
+{"command": "level_create", "args": {"name": "Upper", "elevation": 3}}
+{"command": "wall_create", "args": {"level": {"$level": "active"}, "start": [0, 0], "end": [6, 0]}}
+{"command": "window_create", "args": {"wall": {"$step": 2}, "offset": 2, "sill": 1}}
+"#;
+    // No level given: the lowest.
+    let (code, out, err) = ccad(&["script", "-"], script);
+    assert_eq!(code, 0, "{err}");
+    let lowest = out[1]["result"]["level"]["name"].clone();
+    assert_eq!(out[2]["result"]["params"]["host"], out[1]["result"]["id"]);
+    // A level created before the script runs, by name.
+    let file = scratch("levels.ccad");
+    let (code, _, err) = ccad(&["--save-as", &file, "run", "level_create", "name=Upper", "elevation=3"], "");
+    assert_eq!(code, 0, "{err}");
+    let (code, out, err) = ccad(&["-p", &file, "script", "-", "level=Upper"], &script.replace("Upper", "Upper 2"));
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out[1]["result"]["level"]["name"], "Upper");
+    assert_ne!(lowest, "Upper");
+    assert_eq!(ccad(&["-p", &file, "script", "-", "level=Nowhere"], script).0, 1);
+    assert_eq!(ccad(&["script", "-", "oops"], script).0, 2);
+}
+
+#[test]
 fn catalog_and_schemas() {
     let (code, list, _) = ccad(&["commands"], "");
     assert_eq!(code, 0);
@@ -112,6 +136,13 @@ fn mcp_session() {
     assert_eq!(tools.len(), cc_count());
     let list = tools.iter().find(|t| t["name"] == "elements_list").unwrap();
     assert_eq!(list["annotations"]["readOnlyHint"], true);
+    assert_eq!(list["annotations"]["openWorldHint"], false);
+    // Commands that read a file a parameter names are neither read-only nor closed-world.
+    for name in ["cad_import", "graph_check", "project_save"] {
+        let tool = tools.iter().find(|t| t["name"] == name).unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], false, "{name}");
+        assert_eq!(tool["annotations"]["openWorldHint"], true, "{name}");
+    }
     assert_eq!(by_id(3)["result"]["isError"], false);
     assert_eq!(by_id(3)["result"]["structuredContent"]["category"], "wall");
     // The wall stays in the session for the next call.
@@ -141,4 +172,91 @@ fn version() {
             ))
         );
     }
+}
+
+#[test]
+fn lua_scripts() {
+    let script = r#"
+local n = ccad.args.n
+for i = 1, n do ccad.run("wall_create", { start = { i * 2, 0 }, ["end"] = { i * 2 + 1, 0 } }) end
+print("made " .. n)
+return { walls = #ccad.run("elements_list", { category = "wall" }) }
+"#;
+    let (code, out, err) = ccad(&["lua", "-", "n=3"], script);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, Value::String("made 3\n{\n  \"walls\": 3\n}\n".into()));
+    let (code, _, err) = ccad(&["lua", "-"], "error('nope')");
+    assert_eq!(code, 1);
+    assert!(err.contains("script") && err.contains("nope"), "{err}");
+}
+
+#[test]
+fn plugins_add_commands() {
+    let dir = std::env::temp_dir().join(format!("ccad-cli-{}-plugins", std::process::id()));
+    let plugin = dir.join("tools");
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(plugin.join("plugin.toml"), "id = \"tools\"\nname = \"Tools\"\nversion = \"1.0\"\n").unwrap();
+    std::fs::write(
+        plugin.join("main.lua"),
+        r#"ccad.command { name = "pair", description = "Two walls",
+             run = function(a)
+               ccad.run("wall_create", { start = { 0, 0 }, ["end"] = { 1, 0 } })
+               ccad.run("wall_create", { start = { 0, 1 }, ["end"] = { 1, 1 } })
+               print("pair done")
+               return { ok = true }
+             end }"#,
+    )
+    .unwrap();
+    let folder = dir.to_string_lossy().into_owned();
+    let (code, list, err) = ccad(&["--plugins", &folder, "commands"], "");
+    assert_eq!(code, 0, "{err}");
+    let names: Vec<&str> = list.as_array().unwrap().iter().filter_map(|c| c["name"].as_str()).collect();
+    assert!(names.contains(&"tools__pair"));
+    assert_eq!(names.len(), cc_count() + 1);
+    let (code, out, err) = ccad(&["--plugins", &folder, "run", "tools__pair"], "");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, json!({"ok": true}));
+    assert!(err.contains("[tools] pair done"), "{err}");
+    let (code, summary, err) = ccad(&["--plugins", &folder, "plugins"], "");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(summary[0]["id"], "tools");
+    assert_eq!(summary[0]["commands"][0]["name"], "tools__pair");
+    // A plugin that fails to load is reported, the others still run.
+    std::fs::create_dir_all(dir.join("broken")).unwrap();
+    std::fs::write(dir.join("broken").join("plugin.toml"), "id = 7").unwrap();
+    let (code, _, err) = ccad(&["--plugins", &folder, "run", "tools__pair"], "");
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("plugin not loaded"), "{err}");
+    // Over MCP, the plugin's command is a tool.
+    let messages = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "tools__pair", "arguments": {}}}),
+    ];
+    let input: String = messages.iter().map(|m| format!("{m}\n")).collect();
+    let (_, out, _) = ccad(&["--plugins", &folder, "mcp"], &input);
+    let replies: Vec<Value> = out.as_str().unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert!(replies[0]["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "tools__pair"));
+    assert_eq!(replies[1]["result"]["isError"], false);
+}
+
+#[test]
+fn plugins_install_and_remove() {
+    let dir = std::env::temp_dir().join(format!("ccad-cli-{}-store", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let plugin = dir.join("tools");
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(plugin.join("plugin.toml"), "id = \"tools\"\nname = \"Tools\"\nversion = \"1.0\"\n").unwrap();
+    std::fs::write(plugin.join("main.lua"), "").unwrap();
+    let folder = dir.to_string_lossy().into_owned();
+    let not_zip = dir.join("not.zip");
+    std::fs::write(&not_zip, "this is not a zip archive at all, honestly").unwrap();
+    let (code, _, err) = ccad(&["plugins", "install", &not_zip.to_string_lossy(), &folder], "");
+    assert_eq!(code, 1);
+    assert!(err.contains("not a zip"), "{err}");
+    let (code, out, err) = ccad(&["plugins", "remove", "tools", &folder], "");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out["removed"], "tools");
+    assert!(!plugin.exists());
+    assert_eq!(ccad(&["plugins", "remove", "tools", &folder], "").0, 1);
+    assert_eq!(ccad(&["plugins", "frobnicate"], "").0, 2);
 }

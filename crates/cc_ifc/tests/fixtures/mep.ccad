@@ -1427,6 +1427,26 @@
         ),
         uid: "992b57c6641d488682077f58f274833c",
       ),
+      (116): (
+        id: (116),
+        name: "Eletrocalha 200x100",
+        data: CableTray(
+          width: 0.2,
+          height: 0.1,
+          style: Perforated,
+          material: "Aço",
+        ),
+        uid: "5c0d3a1e6b2f4e7a9d1c8b3f2a4e6d01",
+      ),
+      (117): (
+        id: (117),
+        name: "Registro de gaveta",
+        data: Valve(
+          kind: Gate,
+          material: "Aço",
+        ),
+        uid: "5c0d3a1e6b2f4e7a9d1c8b3f2a4e6d02",
+      ),
       (38): (
         id: (38),
         name: "Ambiente",
@@ -3009,6 +3029,50 @@
         )),
         uid: "4b31eed037a34c9c83f1cb9d7d009a28",
       ),
+      (118): (
+        id: (118),
+        level: (1),
+        type_id: (116),
+        mark: "",
+        comments: "",
+        kind: CableTray((
+          start: (0.5, 1.0),
+          end: (5.0, 1.0),
+          start_offset: 2.7,
+          end_offset: 2.7,
+          systems: [
+            (97),
+            (98),
+          ],
+        )),
+        uid: "5c0d3a1e6b2f4e7a9d1c8b3f2a4e6d03",
+      ),
+      (119): (
+        id: (119),
+        level: (1),
+        type_id: (116),
+        mark: "",
+        comments: "",
+        kind: CableTray((
+          start: (5.0, 1.0),
+          end: (5.0, 3.5),
+          start_offset: 2.7,
+          end_offset: 2.7,
+        )),
+        uid: "5c0d3a1e6b2f4e7a9d1c8b3f2a4e6d04",
+      ),
+      (120): (
+        id: (120),
+        level: (1),
+        type_id: (117),
+        mark: "V1",
+        comments: "",
+        kind: Valve((
+          host: (93),
+          at: 0.4,
+        )),
+        uid: "5c0d3a1e6b2f4e7a9d1c8b3f2a4e6d05",
+      ),
     },
     views: {
       (65): (
@@ -3372,6 +3436,6 @@
         voltage: 220.0,
       ),
     },
-    next_id: 116,
+    next_id: 121,
   ),
 )

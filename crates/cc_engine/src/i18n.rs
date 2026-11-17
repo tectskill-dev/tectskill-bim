@@ -19,10 +19,12 @@ pub enum Language {
     Th,
     Uk,
     ZhTw,
+    ZhCn,
+    Ja,
 }
 
 impl Language {
-    pub const ALL: [Language; 11] = [
+    pub const ALL: [Language; 13] = [
         Language::PtBr,
         Language::En,
         Language::Es,
@@ -34,6 +36,8 @@ impl Language {
         Language::Th,
         Language::Uk,
         Language::ZhTw,
+        Language::ZhCn,
+        Language::Ja,
     ];
 
     /// BCP 47 code, used for persistence.
@@ -50,6 +54,8 @@ impl Language {
             Language::Th => "th",
             Language::Uk => "uk-UA",
             Language::ZhTw => "zh-TW",
+            Language::ZhCn => "zh-CN",
+            Language::Ja => "ja",
         }
     }
 
@@ -67,15 +73,27 @@ impl Language {
             Language::Th => "ภาษาไทย",
             Language::Uk => "Українська",
             Language::ZhTw => "繁體中文",
+            Language::ZhCn => "简体中文",
+            Language::Ja => "日本語",
         }
     }
 
     pub fn from_code(code: &str) -> Option<Language> {
         let code = code.to_ascii_lowercase();
-        // Chinese only in its traditional forms (zh-TW, zh-HK, zh-Hant…).
-        let traditional = code
-            .get(2..)
-            .is_some_and(|rest| rest.split(['-', '_']).any(|part| matches!(part, "tw" | "hk" | "mo" | "hant")));
+        // Chinese: traditional forms for Taiwan, Hong Kong, Macau and Hant
+        // (zh-TW, zh-HK, zh-Hant…); simplified for the rest (zh, zh-CN,
+        // zh-SG, zh-Hans…). An explicit script wins over the region
+        // (zh-Hans-HK is simplified, zh-Hant-CN traditional).
+        // POSIX locales may carry an encoding or modifier (zh_TW.UTF-8).
+        let tag = code.split(['.', '@']).next().unwrap_or("");
+        let parts: Vec<&str> = tag.get(2..).unwrap_or("").split(['-', '_']).filter(|p| !p.is_empty()).collect();
+        let traditional = if parts.contains(&"hant") {
+            true
+        } else if parts.contains(&"hans") {
+            false
+        } else {
+            parts.iter().any(|part| matches!(*part, "tw" | "hk" | "mo"))
+        };
         let lang = match code.get(..2)? {
             "pt" => Language::PtBr,
             "en" => Language::En,
@@ -88,6 +106,8 @@ impl Language {
             "th" => Language::Th,
             "uk" => Language::Uk,
             "zh" if traditional => Language::ZhTw,
+            "zh" => Language::ZhCn,
+            "ja" => Language::Ja,
             _ => return None,
         };
         Some(lang)
@@ -112,6 +132,8 @@ impl Language {
             Language::Th => include_str!("../../../assets/i18n/th.ftl"),
             Language::Uk => include_str!("../../../assets/i18n/uk-UA.ftl"),
             Language::ZhTw => include_str!("../../../assets/i18n/zh-TW.ftl"),
+            Language::ZhCn => include_str!("../../../assets/i18n/zh-CN.ftl"),
+            Language::Ja => include_str!("../../../assets/i18n/ja.ftl"),
         }
     }
 
@@ -121,7 +143,7 @@ impl Language {
 
     /// Whether numbers use a decimal comma.
     pub fn decimal_comma(self) -> bool {
-        !matches!(self, Language::En | Language::Th | Language::ZhTw)
+        !matches!(self, Language::En | Language::Th | Language::ZhTw | Language::ZhCn | Language::Ja)
     }
 }
 
@@ -172,6 +194,37 @@ pub fn tr_args(key: &str, args: &[(&str, String)]) -> String {
     s
 }
 
+/// A date written the way the current language writes it.
+pub fn format_date(y: i32, m: u32, d: u32) -> String {
+    match language() {
+        Language::En | Language::Ja | Language::ZhCn | Language::ZhTw => format!("{y:04}-{m:02}-{d:02}"),
+        Language::De | Language::Pl | Language::Uk => format!("{d:02}.{m:02}.{y:04}"),
+        Language::PtBr | Language::Es | Language::Fr | Language::It | Language::Lo | Language::Th => {
+            format!("{d:02}/{m:02}/{y:04}")
+        }
+    }
+}
+
+/// Today's date (UTC), from the system clock.
+pub fn today() -> (i32, u32, u32) {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    civil_from_days((secs / 86_400) as i64)
+}
+
+/// Year, month, day of a count of days since 1970-01-01 (proleptic Gregorian).
+pub fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = (yoe + era * 400 + i64::from(m <= 2)) as i32;
+    (y, m, d)
+}
+
 /// `t!("key")` or `t!("key", "name" => value, ...)`.
 #[macro_export]
 macro_rules! t {
@@ -187,6 +240,14 @@ macro_rules! t {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(20_398), (2025, 11, 6));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+    }
 
     #[test]
     fn placeholders() {
@@ -211,10 +272,19 @@ mod tests {
         assert_eq!(Language::from_code("zh-TW"), Some(Language::ZhTw));
         assert_eq!(Language::from_code("zh_HK"), Some(Language::ZhTw));
         assert_eq!(Language::from_code("zh-Hant-TW"), Some(Language::ZhTw));
-        assert_eq!(Language::from_code("zh-CN"), None);
-        assert_eq!(Language::from_code("zh-Hans"), None);
-        assert_eq!(Language::from_code("zh"), None);
-        assert_eq!(Language::from_code("ja-JP"), None);
+        assert_eq!(Language::from_code("zh-MO"), Some(Language::ZhTw));
+        assert_eq!(Language::from_code("zh_TW.UTF-8"), Some(Language::ZhTw));
+        assert_eq!(Language::from_code("zh-Hant-CN"), Some(Language::ZhTw));
+        assert_eq!(Language::from_code("zh-CN"), Some(Language::ZhCn));
+        assert_eq!(Language::from_code("zh_CN.UTF-8"), Some(Language::ZhCn));
+        assert_eq!(Language::from_code("zh-SG"), Some(Language::ZhCn));
+        assert_eq!(Language::from_code("zh-Hans"), Some(Language::ZhCn));
+        assert_eq!(Language::from_code("zh-Hans-CN"), Some(Language::ZhCn));
+        assert_eq!(Language::from_code("zh-Hans-HK"), Some(Language::ZhCn));
+        assert_eq!(Language::from_code("zh"), Some(Language::ZhCn));
+        assert_eq!(Language::from_code("ja-JP"), Some(Language::Ja));
+        assert_eq!(Language::from_code("ja_JP.UTF-8"), Some(Language::Ja));
+        assert_eq!(Language::from_code("ko-KR"), None);
         assert_eq!(Language::from_code("p"), None);
         for l in Language::ALL {
             assert_eq!(Language::from_code(l.code()), Some(l));
@@ -256,6 +326,34 @@ mod tests {
         for t in project.types.values() {
             for layer in t.layers() {
                 assert!(project.materials.iter().any(|m| m.name == layer.material), "{}", layer.material);
+            }
+        }
+    }
+
+    /// The imperial template is named in every language, and no type name
+    /// there states a metric size.
+    #[test]
+    fn imperial_template_names_in_every_language() {
+        let metric_units = [" cm", " mm", " см", " мм", " ຊມ", " ມມ", "公分", "公尺"];
+        let metric_ends = [" m", " м", " ມ"];
+        for lang in Language::ALL {
+            let messages = parse_messages(lang.source());
+            let asked = std::cell::RefCell::new(Vec::new());
+            let project = cc_core::Project::from_template_system(cc_core::MeasurementSystem::Imperial, &|k| {
+                asked.borrow_mut().push(k.to_string());
+                messages.get(k).cloned()
+            });
+            let missing: Vec<_> = asked.borrow().iter().filter(|k| !messages.contains_key(*k)).cloned().collect();
+            assert!(missing.is_empty(), "{lang:?}: missing template names: {missing:?}");
+            for t in project.types.values() {
+                let name = &t.name;
+                assert!(
+                    !metric_units.iter().any(|u| name.contains(u)) && !metric_ends.iter().any(|u| name.ends_with(u)),
+                    "{lang:?}: {name}"
+                );
+                for layer in t.layers() {
+                    assert!(project.materials.iter().any(|m| m.name == layer.material), "{}", layer.material);
+                }
             }
         }
     }

@@ -331,7 +331,7 @@ pub fn options(ui: &mut Ui, state: &mut AppState, adding_leader: bool) {
         ui.selectable_value(&mut o.multiline, true, t!("text-multiline"));
         if o.multiline {
             ui.label(t!("prop-text-width"));
-            ui.add(egui::DragValue::new(&mut o.width).speed(1.0).range(5.0..=1000.0).suffix(" mm"));
+            ui.add(crate::properties::paper_drag(&mut o.width).speed(1.0).range(5.0..=1000.0));
         }
         ui.separator();
     }

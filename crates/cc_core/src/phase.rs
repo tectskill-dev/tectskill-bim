@@ -246,17 +246,33 @@ pub const TEMPLATE_PHASES: [&str; 2] = ["tpl-phase-existing", "tpl-phase-new"];
 impl Category {
     /// Whether elements of the category belong to phases (annotations do not).
     pub fn is_phased(self) -> bool {
-        !matches!(self, Category::Dimension | Category::Text | Category::Grid)
+        !matches!(
+            self,
+            Category::Dimension
+                | Category::Text
+                | Category::LevelMark
+                | Category::BarTag
+                | Category::DetailComponent
+                | Category::Grid
+                | Category::CadImport
+                | Category::TitleBlock
+        )
     }
 }
 
 /// The element that decides an element's phases: the wall of a door or
-/// window, the beam or column of a rebar set, the stair of a railing.
+/// window, the beam or column of a rebar set, the stair of a railing, the
+/// wall of a wall framing, the member of a connection, the cap of a pile.
 pub fn phase_host(e: &Element) -> Option<ElementId> {
     match &e.kind {
-        ElementKind::Door(h) | ElementKind::Window(h) => Some(h.host),
+        ElementKind::Door(h) | ElementKind::Window(h) | ElementKind::Niche(h) => Some(h.host),
         ElementKind::Rebar(r) => Some(r.host),
+        ElementKind::Pad(p) => Some(p.host),
+        ElementKind::Valve(v) => Some(v.host),
         ElementKind::Railing(r) => r.stair.map(|h| h.host),
+        ElementKind::WallFraming(f) => Some(f.wall),
+        ElementKind::Connection(c) => Some(c.member),
+        ElementKind::Pile(p) => p.cap.map(|c| c.cap),
         _ => None,
     }
 }
@@ -448,6 +464,8 @@ mod tests {
             uid: Default::default(),
             phase_created: created,
             phase_demolished: demolished,
+            design_option: None,
+            paints: Vec::new(),
         };
         e.uid = crate::Uid::generate();
         p.elements.insert(id, e);

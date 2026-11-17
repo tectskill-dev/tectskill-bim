@@ -24,7 +24,7 @@ fn top_ok(top: WallTop) -> bool {
 fn element_is_valid(e: &Element) -> bool {
     match &e.kind {
         ElementKind::Wall(w) => finite(&[w.base_offset, w.height]) && finite_points(&[w.start, w.end]) && top_ok(w.top),
-        ElementKind::Door(h) | ElementKind::Window(h) => finite(&[h.offset, h.sill_height]),
+        ElementKind::Door(h) | ElementKind::Window(h) | ElementKind::Niche(h) => finite(&[h.offset, h.sill_height]),
         ElementKind::Floor(f) => f.height_offset.is_finite() && f.boundary.len() >= 3 && finite_points(&f.boundary),
         ElementKind::Ceiling(c) => c.height_offset.is_finite() && c.boundary.len() >= 3 && finite_points(&c.boundary),
         ElementKind::Roof(r) => {
@@ -40,12 +40,17 @@ fn element_is_valid(e: &Element) -> bool {
         ElementKind::Grid(g) => finite_points(&[g.start, g.end]),
         ElementKind::Dimension(d) => {
             let kind = match d.kind {
-                crate::DimensionKind::Linear { dir } => dir.is_finite() && dir.length() > 1e-9,
+                crate::DimensionKind::Linear { dir } | crate::DimensionKind::Ordinate { dir } => {
+                    dir.is_finite() && dir.length() > 1e-9
+                }
                 crate::DimensionKind::Angular { vertex, .. } => vertex.is_finite(),
                 _ => true,
             };
             kind && d.offset.is_finite() && finite_points(&[d.a, d.b])
         }
+        ElementKind::LevelMark(m) => m.position.is_finite(),
+        ElementKind::BarTag(t) => t.is_valid(),
+        ElementKind::Pile(p) => p.is_valid(),
         ElementKind::Text(t) => {
             let leaders = t.leaders.iter().all(|l| l.end.is_finite() && l.elbow.is_none_or(|e| e.is_finite()));
             let width = t.width.is_none_or(|w| w.is_finite() && w > 0.0);
@@ -57,19 +62,14 @@ fn element_is_valid(e: &Element) -> bool {
         ElementKind::Beam(b) => {
             b.top_offset.is_finite() && b.end_offset.is_none_or(f64::is_finite) && finite_points(&[b.start, b.end])
         }
-        ElementKind::Rebar(r) => {
-            let layout = match r.layout {
-                crate::RebarLayout::Longitudinal { count, .. } => (1..=200).contains(&count),
-                crate::RebarLayout::Stirrups { spacing } => spacing.is_finite() && spacing >= 0.02,
-            };
-            layout && r.cover.is_finite() && r.cover >= 0.0
-        }
+        ElementKind::Rebar(r) => r.is_valid(),
+        ElementKind::ShapedRebar(r) => r.is_valid(),
         ElementKind::Foundation(f) => {
             let shape = match &f.shape {
                 crate::FoundationShape::Pad { position, rotation_deg } => {
                     position.is_finite() && rotation_deg.is_finite()
                 }
-                crate::FoundationShape::Strip { start, end } => finite_points(&[*start, *end]),
+                crate::FoundationShape::Strip { start, end, .. } => finite_points(&[*start, *end]),
                 crate::FoundationShape::Slab { boundary } => boundary.len() >= 3 && finite_points(boundary),
             };
             shape && f.top_offset.is_finite()
@@ -82,11 +82,35 @@ fn element_is_valid(e: &Element) -> bool {
         }
         ElementKind::Railing(r) => r.base_offset.is_finite() && r.path.len() >= 2 && finite_points(&r.path),
         ElementKind::Component(c) => finite(&[c.rotation_deg, c.base_offset]) && c.position.is_finite(),
-        ElementKind::Pipe(s) | ElementKind::Conduit(s) => {
+        ElementKind::Pipe(s) | ElementKind::Conduit(s) | ElementKind::CableTray(s) => {
             finite(&[s.start_offset, s.end_offset])
                 && finite_points(&[s.start, s.end])
                 && (s.plan_length() >= 1e-3 || s.rise().abs() >= 1e-3)
         }
+        ElementKind::LightningConductor(c) => {
+            let s = &c.run;
+            finite(&[s.start_offset, s.end_offset])
+                && finite_points(&[s.start, s.end])
+                && (s.plan_length() >= 1e-3 || s.rise().abs() >= 1e-3)
+        }
+        ElementKind::Valve(v) => v.at.is_finite() && v.at >= 0.0,
+        ElementKind::CadImport(c) => c.is_valid(),
+        ElementKind::DetailLine(l) => l.is_valid(),
+        ElementKind::DetailComponent(c) => c.is_valid(),
+        ElementKind::FilledRegion(r) | ElementKind::MaskingRegion(r) => r.is_valid(),
+        ElementKind::Mass(m) => m.is_valid(),
+        ElementKind::Sweep(s) => s.is_valid(),
+        ElementKind::Shaft(s) => s.is_valid() && top_ok(s.top),
+        // Out-of-range values are reset by `repair_member_hosts`, which keeps the members.
+        ElementKind::SteelBuilding(_) => true,
+        ElementKind::Truss(t) => t.start.is_finite() && t.end.is_finite(),
+        ElementKind::Bracing(b) => b.start.is_finite() && b.end.is_finite(),
+        // Its numbers are reset by repair_member_hosts; its wall is checked with the hosts.
+        ElementKind::WallFraming(_) => true,
+        // Out-of-range values are reset by `repair_connections`.
+        ElementKind::Connection(_) => true,
+        ElementKind::Topography(t) => t.is_valid(),
+        ElementKind::Pad(p) => p.is_valid(),
     }
 }
 
@@ -110,7 +134,8 @@ fn fix_positive(value: &mut f64, fallback: f64) -> bool {
 impl Project {
     /// Remove or reset invalid data; returns the number of repairs made.
     pub fn repair(&mut self) -> usize {
-        let mut repairs = usize::from(self.units.repair());
+        let mut repairs = usize::from(self.ensure_next_id());
+        repairs += usize::from(self.units.repair());
         repairs += self.materials.iter_mut().map(|m| m.repair()).sum::<usize>();
         for level in &mut self.levels {
             if !level.elevation.is_finite() {
@@ -120,12 +145,47 @@ impl Project {
         }
         self.sort_levels();
 
+        let before = self.info.fields.len();
+        let mut seen = std::collections::BTreeSet::new();
+        self.info.fields.retain(|f| !f.name.trim().is_empty() && seen.insert(f.name.clone()));
+        repairs += before - self.info.fields.len();
+
+        if let Some(site) = &mut self.info.site {
+            let (valid, fixes) = site.repair();
+            repairs += fixes;
+            if !valid {
+                self.info.site = None;
+                repairs += 1;
+            }
+        }
+
+        // Curtain panels may only be component types.
+        // What a pile cap's piles may be.
+        let pile_types: std::collections::BTreeSet<crate::ElementTypeId> =
+            self.types.values().filter(|t| matches!(t.data, TypeData::Pile { .. })).map(|t| t.id).collect();
+        let components: std::collections::BTreeSet<crate::ElementTypeId> =
+            self.types.values().filter(|t| matches!(t.data, TypeData::Component { .. })).map(|t| t.id).collect();
+        let is_component = |id: crate::ElementTypeId| components.contains(&id);
         for ty in self.types.values_mut() {
             match &mut ty.data {
-                TypeData::Wall { layers, .. } | TypeData::Floor { layers } | TypeData::Roof { layers } => {
+                TypeData::Wall { layers, curtain, .. } => {
                     for layer in layers.iter_mut() {
                         repairs += usize::from(fix_positive(&mut layer.thickness, 0.01));
                     }
+                    if let Some(c) = curtain {
+                        repairs += c.repair(&is_component);
+                    }
+                }
+                TypeData::Floor { layers } => {
+                    for layer in layers.iter_mut() {
+                        repairs += usize::from(fix_positive(&mut layer.thickness, 0.01));
+                    }
+                }
+                TypeData::Roof { layers, framing, .. } => {
+                    for layer in layers.iter_mut() {
+                        repairs += usize::from(fix_positive(&mut layer.thickness, 0.01));
+                    }
+                    repairs += framing.repair();
                 }
                 TypeData::Door { width, height, .. } => {
                     repairs += usize::from(fix_positive(width, 0.9)) + usize::from(fix_positive(height, 2.1));
@@ -139,9 +199,47 @@ impl Project {
                 }
                 TypeData::Ceiling { thickness, .. } => repairs += usize::from(fix_positive(thickness, 0.02)),
                 TypeData::Grid { bubble } => repairs += usize::from(fix_positive(bubble, 8.0)),
-                TypeData::Dimension { text_size } => repairs += usize::from(fix_positive(text_size, 2.5)),
+                TypeData::Dimension { text_size, style } => {
+                    repairs += usize::from(fix_positive(text_size, 2.5)) + style.repair()
+                }
                 TypeData::Text { size, .. } => repairs += usize::from(fix_positive(size, 2.5)),
-                TypeData::Room {} => {}
+                TypeData::LevelMark { text_size, datum, .. } => {
+                    repairs += crate::level_mark::repair_type(text_size, datum)
+                }
+                TypeData::BarTag { text_size } => repairs += crate::bar_tag::repair_type(text_size),
+                TypeData::Pile { section, .. } => repairs += usize::from(section.repair()),
+                TypeData::Room {}
+                | TypeData::CadImport {}
+                | TypeData::DetailLine {}
+                | TypeData::FilledRegion { .. }
+                | TypeData::MaskingRegion {}
+                | TypeData::Mass { .. }
+                | TypeData::Shaft {}
+                | TypeData::SteelBuilding {}
+                | TypeData::Truss {}
+                | TypeData::Bracing {}
+                | TypeData::Connection {}
+                | TypeData::WallFraming {} => {}
+                TypeData::Pad { cut_slope, fill_slope } => {
+                    for (r, d) in
+                        [(cut_slope, crate::pad::DEFAULT_CUT_SLOPE), (fill_slope, crate::pad::DEFAULT_FILL_SLOPE)]
+                    {
+                        if !crate::pad::slope_ok(*r) {
+                            *r = crate::pad::clamp_slope(*r, d);
+                            repairs += 1;
+                        }
+                    }
+                }
+                TypeData::Topography { contour_interval, major_every, .. } => {
+                    if !(contour_interval.is_finite() && *contour_interval >= crate::topography::MIN_CONTOUR_INTERVAL) {
+                        *contour_interval = crate::types::default_contour_interval();
+                        repairs += 1;
+                    }
+                    if *major_every == 0 {
+                        *major_every = 1;
+                        repairs += 1;
+                    }
+                }
                 TypeData::Column { section, .. } => match section {
                     crate::ColumnSection::Rectangular { width, depth } => {
                         repairs += usize::from(fix_positive(width, 0.2)) + usize::from(fix_positive(depth, 0.2));
@@ -165,14 +263,68 @@ impl Project {
                     repairs += usize::from(fix_positive(width, 0.15)) + usize::from(fix_positive(height, 0.4));
                     repairs += fit_shape(shape, *width, *height);
                 }
-                TypeData::Rebar { diameter, .. } => repairs += usize::from(fix_positive(diameter, 0.01)),
+                TypeData::Rebar { diameter, grade, mass_per_meter, .. } => {
+                    repairs += usize::from(fix_positive(diameter, 0.01));
+                    // A mass per meter that is no mass is left to the diameter; a long grade is cut.
+                    if mass_per_meter.is_some_and(|m| !(m.is_finite() && m > 0.0 && m <= 1000.0)) {
+                        *mass_per_meter = None;
+                        repairs += 1;
+                    }
+                    if let Some((end, _)) = grade.char_indices().nth(crate::bar_marks::MAX_MARK_TEXT) {
+                        grade.truncate(end);
+                        repairs += 1;
+                    }
+                }
+                TypeData::CableTray { width, height, .. } => {
+                    repairs += usize::from(fix_positive(width, 0.2)) + usize::from(fix_positive(height, 0.1));
+                    for (v, max) in [(width, crate::mep::MAX_TRAY_WIDTH), (height, crate::mep::MAX_TRAY_HEIGHT)] {
+                        if *v > max {
+                            *v = max;
+                            repairs += 1;
+                        }
+                    }
+                }
+                TypeData::Valve { .. } => {}
+                TypeData::LightningConductor { diameter, .. } => {
+                    use crate::lightning::{MAX_CONDUCTOR_DIAMETER, MIN_CONDUCTOR_DIAMETER};
+                    repairs += usize::from(fix_positive(diameter, 0.008));
+                    let fitted = diameter.clamp(MIN_CONDUCTOR_DIAMETER, MAX_CONDUCTOR_DIAMETER);
+                    if fitted != *diameter {
+                        *diameter = fitted;
+                        repairs += 1;
+                    }
+                }
                 TypeData::Pipe { diameter, .. } | TypeData::Conduit { diameter, .. } => {
                     repairs += usize::from(fix_positive(diameter, 0.025));
                 }
-                TypeData::Foundation { width, length, thickness, .. } => {
+                TypeData::Foundation { kind, width, length, thickness, haunch, pile_cap, .. } => {
                     repairs += usize::from(fix_positive(width, 1.0))
                         + usize::from(fix_positive(length, 1.0))
                         + usize::from(fix_positive(thickness, 0.4));
+                    // A haunch that makes no section: a plain strip.
+                    if haunch.is_some_and(|h| !h.fits(*width, *thickness)) {
+                        *haunch = None;
+                        repairs += 1;
+                    }
+                    // Pile caps have their piles' layout, other kinds none.
+                    match (*kind == crate::FoundationKind::PileCap, pile_cap.as_mut()) {
+                        (true, Some(cap)) => {
+                            repairs += cap.repair();
+                            if cap.pile_type.is_some_and(|t| !pile_types.contains(&t)) {
+                                cap.pile_type = None;
+                                repairs += 1;
+                            }
+                        }
+                        (true, None) => {
+                            *pile_cap = Some(Default::default());
+                            repairs += 1;
+                        }
+                        (false, Some(_)) => {
+                            *pile_cap = None;
+                            repairs += 1;
+                        }
+                        (false, None) => {}
+                    }
                 }
                 TypeData::Stair { width, max_riser, tread, build, rules, .. } => {
                     repairs += usize::from(fix_positive(width, 1.0))
@@ -183,6 +335,17 @@ impl Project {
                 TypeData::Ramp { width, thickness, rules, .. } => {
                     repairs += usize::from(fix_positive(width, 1.2)) + usize::from(fix_positive(thickness, 0.15));
                     repairs += rules.repair();
+                }
+                TypeData::Sweep { profile, sketch, .. } => {
+                    if crate::profile_sweep::check_profile(profile).is_err() {
+                        *profile = crate::profile_sweep::baseboard();
+                        repairs += 1;
+                    }
+                    // Curves that no longer draw the profile are left behind.
+                    if sketch.as_ref().is_some_and(|s| !s.makes(profile, &[])) {
+                        *sketch = None;
+                        repairs += 1;
+                    }
                 }
                 TypeData::Railing { height, post_spacing, .. } => {
                     repairs += usize::from(fix_positive(height, 1.1)) + usize::from(fix_positive(post_spacing, 1.2));
@@ -197,6 +360,8 @@ impl Project {
                             repairs += 1;
                         }
                     }
+                    repairs += repair_scripted(def);
+                    repairs += crate::title_block::repair_def(def);
                     let fix_nonnegative = |v: &mut f64| {
                         let bad = !(v.is_finite() && *v >= 0.0);
                         if bad {
@@ -208,10 +373,67 @@ impl Project {
                         Some(crate::MepData::Fixture { drain_units, supply_weight, .. }) => {
                             repairs += fix_nonnegative(drain_units) + fix_nonnegative(supply_weight);
                         }
-                        Some(crate::MepData::Device { power, .. }) => repairs += fix_nonnegative(power),
+                        Some(crate::MepData::Device { power, ports, .. }) => {
+                            repairs += fix_nonnegative(power);
+                            let fitted = (*ports).clamp(1, crate::mep::MAX_PORTS);
+                            if fitted != *ports {
+                                *ports = fitted;
+                                repairs += 1;
+                            }
+                        }
                         None => {}
                     }
                 }
+            }
+        }
+
+        // Imported drawings: invalid primitives and layer references go (copied
+        // only when something is wrong, since the drawing is shared).
+        for e in self.elements.values_mut() {
+            if let ElementKind::CadImport(c) = &mut e.kind
+                && c.drawing.needs_repair()
+            {
+                repairs += std::sync::Arc::make_mut(&mut c.drawing).repair();
+            }
+        }
+
+        // Line styles: ids that match their keys, weights in range, a bounded
+        // count; detail lines and region boundaries that use a style that is
+        // gone fall back to the thin built-in style.
+        repairs += self.repair_line_styles();
+
+        // Browser schemes: distinct ids, names, bounded criteria, a scheme in use that exists.
+        repairs += self.browser.repair();
+
+        // Bar marking: numbers in range, usable frozen marks.
+        repairs += self.bar_marking.repair();
+
+        // Sun presets: named, distinct, bounded, their values in range.
+        repairs += crate::sun::repair_presets(&mut self.sun_presets);
+
+        // Fill patterns: valid patterns, and references to patterns that are gone dropped.
+        repairs += self.repair_fill_patterns();
+        repairs += self.repair_profiles();
+        // Column and beam types pointing to profiles that are gone keep their box.
+        repairs += self.repair_type_profiles();
+
+        // Sketches that are invalid or no longer make their element's outline.
+        repairs += self.elements.values_mut().map(|e| usize::from(e.drop_stale_sketch())).sum::<usize>();
+
+        // Painted faces with bad numbers or of materials that are gone.
+        let materials: std::collections::BTreeSet<String> = self.materials.iter().map(|m| m.name.clone()).collect();
+        for e in self.elements.values_mut().filter(|e| !e.paints.is_empty()) {
+            repairs += crate::paint::repair(&mut e.paints, &|m| materials.contains(m));
+        }
+
+        // Mass floors on levels that are gone.
+        let levels: std::collections::BTreeSet<_> = self.levels.iter().map(|l| l.id).collect();
+        for e in self.elements.values_mut() {
+            if let ElementKind::Mass(m) = &mut e.kind {
+                let before = m.floors.len();
+                m.floors.retain(|l| levels.contains(l));
+                m.floors.dedup();
+                repairs += before - m.floors.len();
             }
         }
 
@@ -224,19 +446,68 @@ impl Project {
                     let type_ok = self.element_type(e.type_id).is_some_and(|t| t.category() == e.category());
                     let level_ok = self.level(e.level).is_some();
                     let host_ok = match &e.kind {
-                        ElementKind::Door(h) | ElementKind::Window(h) => {
+                        ElementKind::Door(h) | ElementKind::Window(h) | ElementKind::Niche(h) => {
                             self.element(h.host).is_some_and(|w| w.as_wall().is_some())
                         }
-                        ElementKind::Rebar(r) => self
-                            .element(r.host)
-                            .is_some_and(|h| matches!(h.kind, ElementKind::Beam(_) | ElementKind::Column(_))),
+                        // Wall bars in walls, slab bars in floors and foundation
+                        // slabs, the other layouts in beams and columns.
+                        ElementKind::Rebar(r) => self.element(r.host).is_some_and(|h| match &h.kind {
+                            ElementKind::Wall(_) => r.layout.in_wall(),
+                            ElementKind::Floor(_) => r.layout.in_slab(),
+                            ElementKind::Foundation(f) => match f.shape {
+                                crate::FoundationShape::Slab { .. } => r.layout.in_slab(),
+                                crate::FoundationShape::Strip { .. } => r.layout.fits_strip(),
+                                crate::FoundationShape::Pad { .. } => false,
+                            },
+                            ElementKind::Beam(_) | ElementKind::Column(_) => {
+                                !r.layout.in_wall() && !r.layout.in_slab() && !r.layout.in_strip()
+                            }
+                            _ => false,
+                        }),
                         ElementKind::Dimension(d) => self.view(d.view).is_some(),
                         ElementKind::Text(t) => self.view(t.view).is_some(),
+                        ElementKind::LevelMark(m) => self.view(m.view).is_some(),
+                        // A cap's pile needs its cap, and a place in its layout.
+                        ElementKind::Pile(p) => p.cap.is_none_or(|c| {
+                            self.element(c.cap)
+                                .and_then(|cap| self.pile_cap(cap))
+                                .is_some_and(|cap| c.index < cap.cap.layout.count())
+                        }),
+                        // A bar tag needs its view and its set.
+                        ElementKind::BarTag(t) => {
+                            self.view(t.view).is_some()
+                                && self.element(t.set).is_some_and(|s| {
+                                    matches!(s.kind, ElementKind::Rebar(_) | ElementKind::ShapedRebar(_))
+                                })
+                        }
+                        ElementKind::CadImport(c) => self.view(c.view).is_some(),
+                        ElementKind::DetailLine(l) => self.view(l.view).is_some(),
+                        ElementKind::DetailComponent(c) => self.view(c.view).is_some(),
+                        ElementKind::FilledRegion(r) | ElementKind::MaskingRegion(r) => self.view(r.view).is_some(),
+                        ElementKind::Pad(p) => {
+                            self.element(p.host).is_some_and(|t| matches!(t.kind, ElementKind::Topography(_)))
+                        }
+                        ElementKind::Valve(v) => {
+                            self.element(v.host).is_some_and(|h| matches!(h.kind, ElementKind::Pipe(_)))
+                        }
+                        ElementKind::WallFraming(f) => self.element(f.wall).is_some_and(|w| w.as_wall().is_some()),
+                        ElementKind::Connection(c) => self.element(c.member).is_some_and(|m| c.fits(&m.kind)),
                         _ => true,
                     };
                     !(type_ok && level_ok && host_ok && element_is_valid(e))
                 })
                 .map(|e| e.id)
+                .collect();
+            // Two piles at one place of a cap: the later goes.
+            let mut places = std::collections::BTreeSet::new();
+            let invalid: Vec<_> = invalid
+                .into_iter()
+                .chain(self.elements.values().filter_map(|e| match &e.kind {
+                    ElementKind::Pile(crate::pile::Pile { cap: Some(c), .. }) if !places.insert(*c) => Some(e.id),
+                    _ => None,
+                }))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
                 .collect();
             if invalid.is_empty() {
                 break;
@@ -246,6 +517,12 @@ impl Project {
                 self.elements.remove(&id);
             }
         }
+        // One framing per wall.
+        repairs += self.repair_wall_framings();
+        // Member hosts: numbers, types and members (after invalid elements went).
+        repairs += self.repair_member_hosts();
+        // Connections: one per member end, numbers in range.
+        repairs += self.repair_connections();
         // Dimension ends referencing missing elements or bad numbers become free.
         let ids: std::collections::BTreeSet<_> = self.elements.keys().copied().collect();
         let level_ids: Vec<_> = self.levels.iter().map(|l| l.id).collect();
@@ -269,9 +546,35 @@ impl Project {
             .filter(|e| matches!(e.kind, ElementKind::Stair(_) | ElementKind::Ramp(_)))
             .map(|e| e.id)
             .collect();
+        // What a wall's top may be attached to.
+        let slabs: std::collections::BTreeSet<crate::ElementId> = self
+            .elements
+            .values()
+            .filter(|e| matches!(e.kind, ElementKind::Floor(_) | ElementKind::Ceiling(_) | ElementKind::Roof(_)))
+            .map(|e| e.id)
+            .collect();
         for e in self.elements.values_mut() {
+            if let ElementKind::Wall(w) = &mut e.kind
+                && w.attach_top.is_some_and(|t| !slabs.contains(&t))
+            {
+                w.attach_top = None;
+                repairs += 1;
+            }
+            // Shaft cuts are derived; bad ones from a file go (the next edit writes them again).
+            if let Some(cuts) = e.shaft_cuts_mut() {
+                let before = cuts.len();
+                cuts.retain(|c| {
+                    c.len() >= 3 && c.len() <= crate::shaft::MAX_OUTLINE && c.iter().all(|p| p.is_finite())
+                });
+                repairs += before - cuts.len();
+            }
             match &mut e.kind {
+                ElementKind::Topography(t) => repairs += t.repair(),
+                ElementKind::Pad(p) => repairs += p.repair(),
                 ElementKind::Stair(s) => repairs += s.layout.repair(),
+                ElementKind::LevelMark(m) => repairs += m.repair(),
+                ElementKind::BarTag(t) => repairs += t.repair(),
+                ElementKind::Pile(p) => repairs += p.repair(),
                 ElementKind::Ramp(r) => repairs += r.layout.repair(),
                 ElementKind::Railing(r) => {
                     if r.stair.is_some_and(|h| !stairs.contains(&h.host)) {
@@ -293,6 +596,11 @@ impl Project {
         let elements = &self.elements;
         self.pinned.retain(|id| elements.contains_key(id));
         repairs += before - self.pinned.len();
+        // Graph bindings need their element, and one element per graph call.
+        let before = self.graph_bindings.len();
+        let mut calls = std::collections::BTreeSet::new();
+        self.graph_bindings.retain(|id, b| elements.contains_key(id) && b.is_valid() && calls.insert(b.clone()));
+        repairs += before - self.graph_bindings.len();
         // Joins need two distinct elements with a body, joined once.
         let before = self.joins.len();
         let mut seen = std::collections::BTreeSet::new();
@@ -312,9 +620,11 @@ impl Project {
         // Component overrides and imported properties must be finite.
         for e in self.elements.values_mut() {
             if let ElementKind::Component(c) = &mut e.kind {
-                let before = c.overrides.len();
+                let before = c.overrides.len() + c.text_overrides.len() + c.hotspots.len();
                 c.overrides.retain(|_, v| v.is_finite());
-                repairs += before - c.overrides.len();
+                c.text_overrides.retain(|_, v| v.len() <= crate::component_script::MAX_TEXT_LEN);
+                c.hotspots.retain(|_, p| p.iter().all(|v| v.is_finite()));
+                repairs += before - (c.overrides.len() + c.text_overrides.len() + c.hotspots.len());
                 repairs += crate::properties::repair_sets(&mut c.properties);
             }
         }
@@ -347,19 +657,60 @@ impl Project {
                 r.edge_slopes.pop();
             }
         }
-        // Arc walls: a bulge that is not a number makes the wall straight, one
-        // past a nearly full circle is clamped, a negligible one is dropped.
+        // Arc walls, arc beams and arc strip footings: a bulge that is not a number makes
+        // them straight, one past a nearly full circle is clamped, a negligible
+        // one is dropped.
         for e in self.elements.values_mut() {
-            let ElementKind::Wall(w) = &mut e.kind else { continue };
-            let fixed = if !w.bulge.is_finite() || w.bulge.abs() < 1e-6 {
+            let bulge = match &mut e.kind {
+                ElementKind::Wall(w) => &mut w.bulge,
+                ElementKind::Beam(b) => &mut b.bulge,
+                ElementKind::Foundation(crate::Foundation {
+                    shape: crate::FoundationShape::Strip { bulge, .. },
+                    ..
+                }) => bulge,
+                _ => continue,
+            };
+            let fixed = if !bulge.is_finite() || bulge.abs() < 1e-6 {
                 0.0
             } else {
-                w.bulge.clamp(-crate::arc::MAX_BULGE, crate::arc::MAX_BULGE)
+                bulge.clamp(-crate::arc::MAX_BULGE, crate::arc::MAX_BULGE)
             };
-            if fixed.to_bits() != w.bulge.to_bits() {
-                w.bulge = fixed;
+            if fixed.to_bits() != bulge.to_bits() {
+                *bulge = fixed;
                 repairs += 1;
             }
+        }
+        // Bars by face out of range: spread around the section again.
+        for e in self.elements.values_mut() {
+            if let ElementKind::Rebar(r) = &mut e.kind
+                && (r.faces.len() > crate::FaceBars::MAX_FACES || r.faces.iter().any(|f| !f.is_valid()))
+            {
+                r.faces.clear();
+                repairs += 1;
+            }
+        }
+        // Lap splices out of range: whole bars.
+        for e in self.elements.values_mut() {
+            if let ElementKind::Rebar(r) = &mut e.kind
+                && r.splice.is_some_and(|s| !s.is_valid())
+            {
+                r.splice = None;
+                repairs += 1;
+            }
+        }
+        // An arc beam is level.
+        for e in self.elements.values_mut() {
+            if let ElementKind::Beam(b) = &mut e.kind
+                && b.bulge != 0.0
+                && b.end_offset.take().is_some()
+            {
+                repairs += 1;
+            }
+        }
+        // Curtain wall adjustments: finite positions, bounded lists, panels of component types.
+        for e in self.elements.values_mut() {
+            let ElementKind::Wall(w) = &mut e.kind else { continue };
+            repairs += w.curtain.repair(&is_component);
         }
         // Systems: circuits fed by a missing board lose it, voltages are positive;
         // elements drop references to missing systems (a pipe keeps one system).
@@ -372,9 +723,16 @@ impl Project {
         }
         let systems = &self.systems;
         for e in self.elements.values_mut() {
-            let max = if matches!(e.kind, ElementKind::Pipe(_)) { 1 } else { usize::MAX };
+            let max = if matches!(e.kind, ElementKind::Pipe(_) | ElementKind::LightningConductor(_)) {
+                1
+            } else {
+                usize::MAX
+            };
             match &mut e.kind {
-                ElementKind::Pipe(s) | ElementKind::Conduit(s) => {
+                ElementKind::Pipe(s)
+                | ElementKind::Conduit(s)
+                | ElementKind::CableTray(s)
+                | ElementKind::LightningConductor(crate::LightningConductor { run: s, .. }) => {
                     let before = s.systems.len();
                     let mut seen = std::collections::BTreeSet::new();
                     s.systems.retain(|id| systems.contains_key(id) && seen.insert(*id));
@@ -423,12 +781,40 @@ impl Project {
         }
         let view_ids: Vec<_> = self.views.keys().copied().collect();
         let type_ids: Vec<_> = self.types.keys().copied().collect();
+        let title_blocks = self.title_blocks();
         for view in self.views.values_mut() {
             match &mut view.kind {
-                ViewKind::Sheet { viewports, .. } => {
+                // A schedule's filters, sorting, formats and appearance within their limits.
+                ViewKind::Schedule { def, .. } => {
+                    repairs += def.repair();
+                }
+                ViewKind::Sheet { viewports, size, title_block, issue_date, fields, .. } => {
+                    if title_block.is_some_and(|t| !title_blocks.contains(&t)) {
+                        *title_block = title_blocks.first().copied();
+                        repairs += 1;
+                    }
+                    if !issue_date.is_empty() && !crate::title_block::is_iso_date(issue_date) {
+                        issue_date.clear();
+                        repairs += 1;
+                    }
+                    let kept = fields.len();
+                    fields
+                        .retain(|k, v| !k.trim().is_empty() && v.chars().count() <= crate::title_block::MAX_SHEET_TEXT);
+                    repairs += kept - fields.len();
                     let before = viewports.len();
                     viewports.retain(|vp| view_ids.contains(&vp.view) && vp.center.is_finite());
                     repairs += before - viewports.len();
+                    if !size.is_valid() {
+                        *size = crate::SheetSize::A3;
+                        repairs += 1;
+                    }
+                }
+                ViewKind::Section { segments, .. } => {
+                    let valid = |v: &f64| v.is_finite() && (0.0..=crate::view::MAX_SECTION_SEGMENT).contains(v);
+                    if segments.is_some_and(|s| !s.iter().all(valid)) {
+                        *segments = None;
+                        repairs += 1;
+                    }
                 }
                 ViewKind::Legend { types } => {
                     let before = types.len();
@@ -437,11 +823,36 @@ impl Project {
                 }
                 _ => {}
             }
+            if let Some(u) = view.kind.underlay_mut() {
+                repairs += u.repair(|l| levels.contains(&l));
+            }
+            // The sun: only on views that take one, its values in range, on a level that exists.
+            if view.sun.is_some() && !view.kind.takes_sun() {
+                view.sun = None;
+                repairs += 1;
+            }
+            if let Some(sun) = &mut view.sun {
+                repairs += sun.repair();
+                if sun.ground.is_some_and(|l| !levels.contains(&l)) {
+                    sun.ground = None;
+                    repairs += 1;
+                }
+            }
+            // Render settings: only on views that take them, their values in range.
+            if view.render.is_some() && !view.kind.takes_render() {
+                view.render = None;
+                repairs += 1;
+            }
+            if let Some(render) = &mut view.render {
+                repairs += usize::from(render.repair());
+            }
             if view.scale == 0 {
                 view.scale = 100;
                 repairs += 1;
             }
         }
+
+        repairs += self.repair_callouts();
 
         // View graphics: filters, templates and the elements they refer to.
         for f in self.filters.values_mut() {
@@ -450,13 +861,17 @@ impl Project {
             repairs += before - f.rules.len();
         }
         repairs += self.repair_phases();
+        repairs += self.repair_options();
         for t in self.templates.values_mut() {
-            repairs += t.repair(&self.filters, &self.phase_filters);
+            repairs += t.repair(&self.filters, &self.phase_filters, &levels);
         }
         let elements = &self.elements;
         let exists = |id: crate::ElementId| elements.contains_key(&id);
         for view in self.views.values_mut() {
             repairs += view.graphics.repair(&self.filters, Some(&exists));
+            let tags = view.tag_offsets.len();
+            view.tag_offsets.retain(|id, o| exists(*id) && o.is_finite() && o.length() < 1e4);
+            repairs += tags - view.tag_offsets.len();
             match view.template.map(|t| self.templates.get(&t)) {
                 Some(None) => {
                     view.template = None;
@@ -532,10 +947,267 @@ impl Project {
     }
 }
 
+impl Project {
+    /// See [`crate::detail`]: returns how many things it changed.
+    fn repair_line_styles(&mut self) -> usize {
+        let mut repairs = 0;
+        if self.line_styles.len() > crate::detail::MAX_LINE_STYLES {
+            repairs += self.line_styles.len() - crate::detail::MAX_LINE_STYLES;
+            let keep: Vec<_> = self.line_styles.keys().take(crate::detail::MAX_LINE_STYLES).copied().collect();
+            self.line_styles.retain(|k, _| keep.contains(k));
+        }
+        for (id, style) in self.line_styles.iter_mut() {
+            if style.id != *id {
+                style.id = *id;
+                repairs += 1;
+            }
+            repairs += usize::from(style.repair());
+        }
+        let styles = &self.line_styles;
+        for e in self.elements.values_mut() {
+            let style = match &mut e.kind {
+                ElementKind::DetailLine(l) => &mut l.style,
+                ElementKind::FilledRegion(r) | ElementKind::MaskingRegion(r) => match &mut r.boundary {
+                    Some(b) => b,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            if !style.exists(styles) {
+                *style = crate::LineStyleRef::default();
+                repairs += 1;
+            }
+        }
+        repairs
+    }
+}
+
+impl Project {
+    /// How many repairs [`Project::repair`] would make, without changing the
+    /// project: it repairs a copy. The copy leaves out the vertices and faces
+    /// of fixed mesh pieces, which repair never reads, so that checking every
+    /// edit of a model with imported meshes does not copy them.
+    pub fn repairs_needed(&self) -> usize {
+        self.copy_with_types(self.types.iter().map(|(id, ty)| (*id, type_for_repair(ty))).collect()).repair()
+    }
+}
+
+/// A copy of a type whose fixed mesh pieces are empty (see [`Project::repairs_needed`]).
+fn type_for_repair(ty: &crate::ElementType) -> crate::ElementType {
+    use crate::{ComponentDef, ComponentItem, ComponentShape};
+    let crate::ElementType { id, name, data, info, uid } = ty;
+    let TypeData::Component { component, def } = data else { return ty.clone() };
+    if !def.items.iter().any(|i| matches!(i.shape, ComponentShape::Mesh { .. })) {
+        return ty.clone();
+    }
+    let ComponentDef {
+        kind,
+        params,
+        items,
+        ifc,
+        mep,
+        opening,
+        connectors,
+        ref_planes,
+        ref_lines,
+        dimensions,
+        equals,
+        hotspots,
+        sheet,
+    } = def;
+    let items = items
+        .iter()
+        .map(|i| {
+            let ComponentItem { name, shape, material, in_plan, void, plan_only, detail } = i;
+            let shape = match shape {
+                ComponentShape::Mesh { .. } => {
+                    ComponentShape::Mesh { vertices: Default::default(), faces: Default::default() }
+                }
+                other => other.clone(),
+            };
+            ComponentItem {
+                name: name.clone(),
+                shape,
+                material: material.clone(),
+                in_plan: *in_plan,
+                void: *void,
+                plan_only: *plan_only,
+                detail: *detail,
+            }
+        })
+        .collect();
+    let def = ComponentDef {
+        kind: *kind,
+        params: params.clone(),
+        items,
+        ifc: ifc.clone(),
+        mep: *mep,
+        opening: opening.clone(),
+        connectors: connectors.clone(),
+        ref_planes: ref_planes.clone(),
+        ref_lines: ref_lines.clone(),
+        dimensions: dimensions.clone(),
+        equals: equals.clone(),
+        hotspots: hotspots.clone(),
+        sheet: sheet.clone(),
+    };
+    crate::ElementType {
+        id: *id,
+        name: name.clone(),
+        data: TypeData::Component { component: component.clone(), def },
+        info: info.clone(),
+        uid: *uid,
+    }
+}
+
+/// Script sources, text values, choices and hotspots of a component
+/// definition within their limits; the number of repairs.
+fn repair_scripted(def: &mut crate::ComponentDef) -> usize {
+    use crate::component_script::{MAX_CHOICES, MAX_HOTSPOTS, MAX_SCRIPT_LEN, MAX_TEXT_LEN, truncate};
+    let mut repairs = 0;
+    for item in &mut def.items {
+        if let crate::ComponentShape::Script { source } = &mut item.shape
+            && source.len() > MAX_SCRIPT_LEN
+        {
+            source.clear();
+            repairs += 1;
+        }
+    }
+    for p in &mut def.params {
+        repairs += usize::from(truncate(&mut p.label, MAX_TEXT_LEN)) + usize::from(truncate(&mut p.text, MAX_TEXT_LEN));
+        if p.choices.len() > MAX_CHOICES {
+            p.choices.truncate(MAX_CHOICES);
+            repairs += 1;
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let before = p.choices.len();
+        p.choices
+            .retain(|c| c.key.len() <= MAX_TEXT_LEN && c.label.len() <= MAX_TEXT_LEN && seen.insert(c.key.clone()));
+        repairs += before - p.choices.len();
+        match p.kind {
+            crate::ParamKind::Boolean if p.value != 0.0 && p.value != 1.0 => {
+                p.value = 1.0;
+                repairs += 1;
+            }
+            crate::ParamKind::Choice if !p.accepts_text(&p.text) => {
+                p.text = p.choices.first().map(|c| c.key.clone()).unwrap_or_default();
+                repairs += 1;
+            }
+            _ => {}
+        }
+    }
+    if def.hotspots.len() > MAX_HOTSPOTS {
+        def.hotspots.truncate(MAX_HOTSPOTS);
+        repairs += 1;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let before = def.hotspots.len();
+    def.hotspots.retain(|h| seen.insert(h.name.clone()));
+    repairs += before - def.hotspots.len();
+    for h in &mut def.hotspots {
+        repairs += usize::from(truncate(&mut h.label, MAX_TEXT_LEN));
+        for v in &mut h.position {
+            if !v.is_finite() {
+                *v = 0.0;
+                repairs += 1;
+            }
+        }
+    }
+    repairs
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::{Category, Element, ElementId, ElementKind, Hosted, Project, Wall};
+    use crate::{Category, Element, ElementId, ElementKind, Hosted, Project, ProjectField, Wall};
     use glam::DVec2;
+
+    #[test]
+    fn project_fields_drop_empty_and_repeated_names() {
+        let mut p = Project::from_template();
+        p.info.fields = vec![
+            ProjectField { name: "A".into(), value: "1".into() },
+            ProjectField { name: " ".into(), value: "2".into() },
+            ProjectField { name: "A".into(), value: "3".into() },
+        ];
+        assert_eq!(p.repair(), 2);
+        assert_eq!(p.info.fields, vec![ProjectField { name: "A".into(), value: "1".into() }]);
+    }
+
+    /// A sweep type's curves that do not draw its profile (a crafted or
+    /// hand-edited file) are dropped on load; curves that do are kept.
+    #[test]
+    fn sweep_profile_curves_that_do_not_draw_the_profile_are_dropped() {
+        use crate::TypeData;
+        use crate::sketch::Sketch;
+        let mut p = Project::from_template();
+        let id = crate::ElementTypeId(p.alloc_id());
+        let square = vec![DVec2::ZERO, DVec2::new(0.1, 0.0), DVec2::new(0.1, 0.1), DVec2::new(0.0, 0.1)];
+        let data = |sketch| TypeData::Sweep { profile: square.clone(), material: String::new(), sketch };
+        let ty =
+            |data| crate::ElementType { id, name: "S".into(), data, info: Default::default(), uid: Default::default() };
+        p.types.insert(id, ty(data(Some(Sketch::from_polygons(&square, &[])))));
+        assert_eq!(p.repair(), 0, "curves that draw it stay");
+        let other = Sketch::from_polygons(&[DVec2::ZERO, DVec2::new(1.0, 0.0), DVec2::new(0.0, 1.0)], &[]);
+        p.types.insert(id, ty(data(Some(other))));
+        assert_eq!(p.repair(), 1);
+        assert!(matches!(p.element_type(id).map(|t| &t.data), Some(TypeData::Sweep { sketch: None, .. })));
+    }
+
+    #[test]
+    fn sheets_drop_title_blocks_that_are_gone_or_not_title_blocks() {
+        use crate::{Category, ViewKind};
+        let mut p = Project::from_template();
+        let wall_type = p.types.values().find(|t| t.category() == Category::Wall).map(|t| t.id).unwrap();
+        let mut n = 0;
+        for v in p.views.values_mut() {
+            if let ViewKind::Sheet { title_block, issue_date, fields, .. } = &mut v.kind {
+                *title_block = Some(wall_type);
+                *issue_date = "06/11/2026".into();
+                fields.insert(" ".into(), "x".into());
+                n += 3;
+            }
+        }
+        // A second title block type, on a second sheet, is valid and stays.
+        let standard = p.title_blocks().first().copied().unwrap();
+        let mut other = p.element_type(standard).unwrap().clone();
+        other.id = crate::ElementTypeId(p.alloc_id());
+        other.name = "Other".into();
+        let other_id = other.id;
+        p.types.insert(other_id, other);
+        let kept = crate::ViewId(p.alloc_id());
+        let kind = ViewKind::Sheet {
+            number: "B1".into(),
+            size: crate::SheetSize::A3,
+            portrait: false,
+            viewports: Vec::new(),
+            title_block: Some(other_id),
+            fields: Default::default(),
+            issue_date: String::new(),
+        };
+        p.views.insert(kept, crate::View::new(kept, "B1", 1, kind));
+        let fixes = p.repair();
+        assert!(fixes >= n);
+        for v in p.views.values() {
+            if let ViewKind::Sheet { title_block, issue_date, fields, .. } = &v.kind {
+                let expected = if v.id == kept { other_id } else { standard };
+                assert_eq!(*title_block, Some(expected), "{}", v.name);
+                assert!(issue_date.is_empty() && fields.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn bad_custom_paper_resets_to_a3() {
+        use crate::{SheetSize, ViewKind};
+        let mut p = Project::from_template();
+        let sheet = p.views.values_mut().find(|v| matches!(v.kind, ViewKind::Sheet { .. }));
+        let Some(sheet) = sheet else { return };
+        if let ViewKind::Sheet { size, .. } = &mut sheet.kind {
+            *size = SheetSize::Custom { width: f64::NAN, height: 10.0 };
+        }
+        assert!(p.repair() >= 1);
+        assert!(p.views.values().any(|v| matches!(v.kind, ViewKind::Sheet { size: SheetSize::A3, .. })));
+    }
 
     #[test]
     fn invalid_elements_and_references_are_removed() {
@@ -557,6 +1229,8 @@ mod tests {
                     uid: Default::default(),
                     phase_created: Default::default(),
                     phase_demolished: None,
+                    design_option: None,
+                    paints: Vec::new(),
                 },
             );
             id
@@ -580,6 +1254,79 @@ mod tests {
         assert_eq!(p.repair(), 0, "repair is idempotent");
     }
 
+    /// Crafted line styles and regions: a style stored under another id and
+    /// with a weight out of range, detail lines and region boundaries using
+    /// a style that is gone, and a region with a NaN point.
+    #[test]
+    fn line_styles_and_regions_are_repaired() {
+        use crate::region::Region;
+        use crate::{LinePattern, LineStyleDef, LineStyleId, LineStyleRef, TypeData};
+        let mut p = Project::from_template();
+        let level = p.levels[0].id;
+        let view = *p.views.keys().next().unwrap();
+        let ty = |p: &mut Project, data| {
+            let id = crate::ElementTypeId(p.alloc_id());
+            p.types.insert(
+                id,
+                crate::ElementType { id, name: "T".into(), data, info: Default::default(), uid: Default::default() },
+            );
+            id
+        };
+        let line_t = ty(&mut p, TypeData::DetailLine {});
+        let region_t = ty(&mut p, TypeData::FilledRegion { fill: Default::default() });
+        let kept = LineStyleId(p.alloc_id());
+        p.line_styles.insert(
+            kept,
+            LineStyleDef {
+                id: LineStyleId(1),
+                name: "A".into(),
+                weight_mm: 99.0,
+                color: [0; 3],
+                pattern: LinePattern::Dash,
+            },
+        );
+        let add = |p: &mut Project, type_id, kind| {
+            let id = ElementId(p.alloc_id());
+            p.elements.insert(
+                id,
+                Element {
+                    id,
+                    level,
+                    type_id,
+                    mark: String::new(),
+                    comments: String::new(),
+                    kind,
+                    uid: Default::default(),
+                    phase_created: Default::default(),
+                    phase_demolished: None,
+                    design_option: None,
+                    paints: Vec::new(),
+                },
+            );
+            id
+        };
+        let gone = LineStyleRef::Project(LineStyleId(9999));
+        let curve = crate::sketch::SketchCurve::Line { a: DVec2::ZERO, b: DVec2::X };
+        let line = add(&mut p, line_t, ElementKind::DetailLine(crate::DetailLine { view, curve, style: gone }));
+        let square = vec![DVec2::ZERO, DVec2::X, DVec2::ONE, DVec2::Y];
+        let region = |boundary| Region { view, outline: square.clone(), openings: vec![], sketch: None, boundary };
+        let good = add(&mut p, region_t, ElementKind::FilledRegion(region(Some(gone))));
+        let mut nan = region(None);
+        nan.outline[1].y = f64::NAN;
+        let bad = add(&mut p, region_t, ElementKind::FilledRegion(nan));
+        // The style's id and weight, the line's and the region's style, the NaN region.
+        assert_eq!(p.repair(), 5);
+        assert_eq!(p.line_style(kept).map(|s| (s.id, s.weight_mm)), Some((kept, crate::detail::MAX_WEIGHT_MM)));
+        assert!(
+            matches!(&p.element(line).unwrap().kind, ElementKind::DetailLine(l) if l.style == LineStyleRef::default())
+        );
+        assert!(
+            matches!(&p.element(good).unwrap().kind, ElementKind::FilledRegion(r) if r.boundary == Some(LineStyleRef::default()))
+        );
+        assert!(p.element(bad).is_none());
+        assert_eq!(p.repair(), 0, "repair is idempotent");
+    }
+
     /// Crafted arc walls: a NaN, an infinite, a huge and a negligible bulge.
     #[test]
     fn degenerate_arc_walls_are_repaired() {
@@ -600,6 +1347,8 @@ mod tests {
                 uid: Default::default(),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             };
             p.elements.insert(id, e);
             ids.push(id);
@@ -610,6 +1359,112 @@ mod tests {
         assert_eq!(p.repair(), 0);
         // Collinear three points give no arc.
         assert!(crate::arc::Arc::bulge_through(DVec2::ZERO, DVec2::X, DVec2::new(2.0, 0.0)).is_none());
+    }
+
+    /// Crafted arc beams: their bulges are repaired like walls', an arc
+    /// beam is level, and lap splices out of range are dropped.
+    #[test]
+    fn arc_beams_and_splices_are_repaired() {
+        use crate::{Beam, Rebar, RebarLayout, Splice};
+        let mut p = Project::from_template();
+        let level = p.levels[0].id;
+        let beam_t = p.default_type(Category::Beam).unwrap();
+        let bar_t = p.default_type(Category::Rebar).unwrap();
+        let add = |p: &mut Project, type_id, kind| {
+            let id = ElementId(p.alloc_id());
+            let e = Element {
+                id,
+                level,
+                type_id,
+                mark: String::new(),
+                comments: String::new(),
+                kind,
+                uid: Default::default(),
+                phase_created: Default::default(),
+                phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
+            };
+            p.elements.insert(id, e);
+            id
+        };
+        let mut ids = Vec::new();
+        for bulge in [f64::NAN, 1e6, 1e-9, 0.5] {
+            let mut beam = Beam::new(DVec2::ZERO, DVec2::new(4.0, 0.0), 3.0);
+            beam.bulge = bulge;
+            beam.end_offset = Some(3.5);
+            ids.push(add(&mut p, beam_t, ElementKind::Beam(beam)));
+        }
+        let mut bars = Vec::new();
+        for splice in [
+            Splice { max_length: 12.0, lap: 0.5 },
+            Splice { max_length: f64::NAN, lap: 0.5 },
+            Splice { max_length: 2.0, lap: 1.5 },
+        ] {
+            let layout = RebarLayout::Sides { count: 1, spacing: 0.0 };
+            let rebar = Rebar { splice: Some(splice), ..Rebar::new(ids[0], layout, 0.025) };
+            bars.push(add(&mut p, bar_t, ElementKind::Rebar(rebar)));
+        }
+        assert!(p.repair() >= 5);
+        let beams: Vec<(f64, Option<f64>)> = ids
+            .iter()
+            .map(|id| match &p.element(*id).unwrap().kind {
+                ElementKind::Beam(b) => (b.bulge, b.end_offset),
+                _ => panic!("a beam"),
+            })
+            .collect();
+        // Straight beams keep their slope; arc beams lose it.
+        assert_eq!(beams, vec![(0.0, Some(3.5)), (crate::arc::MAX_BULGE, None), (0.0, Some(3.5)), (0.5, None)]);
+        let splices: Vec<bool> = bars
+            .iter()
+            .map(|id| match &p.element(*id).unwrap().kind {
+                ElementKind::Rebar(r) => r.splice.is_some(),
+                _ => panic!("rebar"),
+            })
+            .collect();
+        assert_eq!(splices, vec![true, false, false]);
+        assert_eq!(p.repair(), 0);
+    }
+
+    /// Crafted arc strip footings: their bulges are repaired like walls'.
+    #[test]
+    fn degenerate_arc_strips_are_repaired() {
+        let mut p = Project::from_template();
+        let level = p.levels[0].id;
+        let type_id = p.default_type(Category::Foundation).unwrap();
+        let mut ids = Vec::new();
+        for bulge in [f64::NAN, f64::NEG_INFINITY, 1e6, 1e-9, -0.5] {
+            let id = ElementId(p.alloc_id());
+            let shape = crate::FoundationShape::Strip { start: DVec2::ZERO, end: DVec2::new(4.0, 0.0), bulge };
+            let e = Element {
+                id,
+                level,
+                type_id,
+                mark: String::new(),
+                comments: String::new(),
+                kind: ElementKind::Foundation(crate::Foundation::new(shape, 0.0)),
+                uid: Default::default(),
+                phase_created: Default::default(),
+                phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
+            };
+            p.elements.insert(id, e);
+            ids.push(id);
+        }
+        assert_eq!(p.repair(), 4);
+        let bulges: Vec<f64> = ids
+            .iter()
+            .map(|id| match &p.element(*id).unwrap().kind {
+                ElementKind::Foundation(crate::Foundation {
+                    shape: crate::FoundationShape::Strip { bulge, .. },
+                    ..
+                }) => *bulge,
+                k => panic!("{k:?}"),
+            })
+            .collect();
+        assert_eq!(bulges, vec![0.0, 0.0, crate::arc::MAX_BULGE, 0.0, -0.5]);
+        assert_eq!(p.repair(), 0);
     }
 
     /// Crafted roof edge slopes: more than edges, a NaN and a negative one.
@@ -632,6 +1487,8 @@ mod tests {
             uid: Default::default(),
             phase_created: Default::default(),
             phase_demolished: None,
+            design_option: None,
+            paints: Vec::new(),
         };
         p.elements.insert(id, e);
         assert_eq!(p.repair(), 3, "one too many, a NaN, a negative slope");
@@ -661,6 +1518,8 @@ mod tests {
                 uid: Default::default(),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             };
             p.elements.insert(id, e);
             id
@@ -688,7 +1547,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        outlet.mep = Some(crate::MepData::Device { device: crate::DeviceKind::Outlet, power: f64::NAN });
+        outlet.mep = Some(crate::MepData::Device { device: crate::DeviceKind::Outlet, power: f64::NAN, ports: 1 });
         // The missing system, the second system, the empty run, the board, the voltage, the power.
         assert_eq!(p.repair(), 6);
         let Some(ElementKind::Pipe(s)) = p.element(pipe).map(|e| &e.kind) else { panic!("pipe removed") };
@@ -717,6 +1576,7 @@ mod tests {
                 overrides,
                 properties: Vec::new(),
                 system: None,
+                ..Default::default()
             });
             p.elements.insert(
                 id,
@@ -730,6 +1590,8 @@ mod tests {
                     uid: Default::default(),
                     phase_created: Default::default(),
                     phase_demolished: None,
+                    design_option: None,
+                    paints: Vec::new(),
                 },
             );
         }
@@ -744,5 +1606,60 @@ mod tests {
         old.ensure_annotation_types();
         assert_eq!(old.types_of(Category::Component).count(), 16);
         assert!(old.materials.iter().any(|m| m.name == "Tecido"));
+    }
+
+    #[test]
+    fn scripted_components_are_kept_within_limits() {
+        use crate::component_script::{Hotspot, MAX_SCRIPT_LEN, ParamChoice};
+        let mut p = Project::from_template();
+        let ty = p.default_type(Category::Component).unwrap();
+        let Some(crate::TypeData::Component { def, .. }) = p.types.get_mut(&ty).map(|t| &mut t.data) else {
+            panic!("no component type")
+        };
+        def.items[0].shape = crate::ComponentShape::Script { source: "x".repeat(MAX_SCRIPT_LEN + 1) };
+        let choice = |key: &str| ParamChoice { key: key.into(), label: String::new() };
+        def.params.push(crate::ComponentParam {
+            name: "finish".into(),
+            kind: crate::ParamKind::Choice,
+            text: "missing".into(),
+            choices: vec![choice("a"), choice("b"), choice("a")],
+            ..Default::default()
+        });
+        def.params.push(crate::ComponentParam::number("on", 7.0, crate::ParamKind::Boolean));
+        let spot = |name: &str, x: f64| Hotspot { name: name.into(), position: [x, 0.0, 0.0], ..Default::default() };
+        def.hotspots = vec![spot("h", f64::NAN), spot("h", 1.0)];
+        // Long source, duplicate choice, choice value, boolean, duplicate hotspot, NaN position.
+        assert_eq!(p.repair(), 6);
+        let Some(crate::TypeData::Component { def, .. }) = p.types.get(&ty).map(|t| &t.data) else { panic!() };
+        assert!(matches!(&def.items[0].shape, crate::ComponentShape::Script { source } if source.is_empty()));
+        let finish = def.param("finish").unwrap();
+        assert_eq!((finish.text.as_str(), finish.choices.len()), ("a", 2));
+        assert_eq!(def.param("on").unwrap().value, 1.0);
+        assert_eq!(def.hotspots.len(), 1);
+        assert_eq!(def.hotspots[0].position, [0.0; 3]);
+        assert_eq!(p.repair(), 0, "repair is idempotent");
+    }
+
+    #[test]
+    fn repairs_needed_counts_without_copying_meshes() {
+        let mut p = Project::from_template();
+        let ty = p.default_type(Category::Component).unwrap();
+        let Some(crate::TypeData::Component { def, .. }) = p.types.get_mut(&ty).map(|t| &mut t.data) else {
+            panic!("no component type")
+        };
+        let vertices = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let faces = vec![vec![0, 2, 1], vec![0, 1, 3], vec![1, 2, 3], vec![0, 3, 2]];
+        def.items[0].shape = crate::ComponentShape::Mesh { vertices: vertices.into(), faces: faces.into() };
+        assert_eq!(p.repairs_needed(), 0);
+        assert_eq!(p.repairs_needed(), p.clone().repair());
+
+        let Some(crate::TypeData::Component { def, .. }) = p.types.get_mut(&ty).map(|t| &mut t.data) else {
+            panic!("no component type")
+        };
+        def.params[0].value = f64::NAN;
+        let before = format!("{p:?}");
+        assert_eq!(p.repairs_needed(), 1);
+        assert_eq!(p.repairs_needed(), p.clone().repair());
+        assert_eq!(format!("{p:?}"), before, "the project is left as it was");
     }
 }

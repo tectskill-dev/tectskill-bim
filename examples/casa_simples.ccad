@@ -1,14 +1,14 @@
 (
-  format_version: 12,
-  generator: "ConstructCAD 0.5.0",
+  format_version: 27,
+  generator: "ConstructCraft 0.10.0",
   project: (
     info: (
-      uid: "f21ffb513ec24f2ebdcaaa0926fc8c02",
+      uid: "d7fb97e97d0d4b3d8bd0bd995bae7168",
       name: "Casa simples",
       number: "0001",
       client: "Exemplo",
       address: "",
-      author: "ConstructCAD",
+      author: "ConstructCraft",
     ),
     levels: [
       (
@@ -541,9 +541,9 @@
         ),
         physical: (
           behavior: Isotropic,
-          density: None,
-          thermal_conductivity: None,
-          specific_heat: None,
+          density: Some(7850.0),
+          thermal_conductivity: Some(50.0),
+          specific_heat: Some(490.0),
           thermal_expansion: None,
           youngs_modulus: None,
           poisson: None,
@@ -599,6 +599,54 @@
           tensile_strength: None,
         ),
       ),
+      (
+        name: "Terra",
+        color: (150, 122, 88),
+        identity: (
+          description: "",
+          class: Earth,
+          comments: "",
+          keywords: "",
+          manufacturer: "",
+          model: "",
+          cost: None,
+          url: "",
+          keynote: "",
+          mark: "",
+        ),
+        graphics: (
+          use_appearance: false,
+          transparency: 0.0,
+          surface: (
+            foreground: r#None,
+            foreground_color: (0, 0, 0),
+            background: r#None,
+            background_color: (255, 255, 255),
+          ),
+          cut: (
+            foreground: Earth,
+            foreground_color: (0, 0, 0),
+            background: r#None,
+            background_color: (255, 255, 255),
+          ),
+        ),
+        appearance: (
+          color: (150, 122, 88),
+          finish: Matte,
+          description: "",
+        ),
+        physical: (
+          behavior: Isotropic,
+          density: Some(1800.0),
+          thermal_conductivity: Some(1.5),
+          specific_heat: Some(1000.0),
+          thermal_expansion: None,
+          youngs_modulus: None,
+          poisson: None,
+          compressive_strength: None,
+          tensile_strength: None,
+        ),
+      ),
     ],
     types: {
       (3): (
@@ -636,7 +684,7 @@
           comments: "",
           cost: None,
         ),
-        uid: "81efd861979a4a77bbc6e85094d08328",
+        uid: "995dbe82f18f4f128ff4c1a7b9029e54",
       ),
       (4): (
         id: (4),
@@ -673,7 +721,7 @@
           comments: "",
           cost: None,
         ),
-        uid: "48417a51509242f7b8013f86dbc2d841",
+        uid: "1ca667dcc62048f5889b66460e65d0e1",
       ),
       (5): (
         id: (5),
@@ -700,7 +748,7 @@
           comments: "",
           cost: None,
         ),
-        uid: "7c93f723eb65432e8b17027e264014a4",
+        uid: "dc3e67f267544bf6923866db7e11c9c9",
       ),
       (6): (
         id: (6),
@@ -767,7 +815,7 @@
           comments: "",
           cost: None,
         ),
-        uid: "aeabfb63ba61456d9dddf7fa8ab64e5e",
+        uid: "b1ff01d496474f5b8006c5d99ed159a8",
       ),
       (7): (
         id: (7),
@@ -834,7 +882,7 @@
           comments: "",
           cost: None,
         ),
-        uid: "3d7997bc925a4caea5a2cbd4393e2759",
+        uid: "6c26fde0527348deba118aafe579b658",
       ),
       (8): (
         id: (8),
@@ -920,7 +968,7 @@
           comments: "",
           cost: None,
         ),
-        uid: "d90980477bbc4ef7b5eb05ec5244a594",
+        uid: "e51f33ca2f594a1da70ad4b8d0625314",
       ),
       (9): (
         id: (9),
@@ -1006,10 +1054,400 @@
           comments: "",
           cost: None,
         ),
-        uid: "ae5b6c6a81b341eda679663aa6b2e474",
+        uid: "443d22f0c1094b98ba9a8be54790c630",
       ),
       (10): (
         id: (10),
+        name: "Janela de abrir 60x100",
+        data: Component(
+          component: "Janela de abrir",
+          def: (
+            kind: Window,
+            params: [
+              (
+                name: "Largura",
+                value: 0.6,
+                kind: Length,
+                instance: false,
+              ),
+              (
+                name: "Altura",
+                value: 1.0,
+                kind: Length,
+                instance: false,
+              ),
+              (
+                name: "Peitoril",
+                value: 1.1,
+                kind: Length,
+                instance: false,
+              ),
+            ],
+            items: [
+              (
+                name: "Caixilho",
+                shape: Box(x: "-Largura / 2", y: "-0.04", z: "0", width: "0.05", depth: "0.08", height: "Altura"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "Largura / 2 - 0.05", y: "-0.04", z: "0", width: "0.05", depth: "0.08", height: "Altura"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-0.04", z: "0", width: "Largura - 2 * 0.05", depth: "0.08", height: "0.05"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-0.04", z: "Altura - 0.05", width: "Largura - 2 * 0.05", depth: "0.08", height: "0.05"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Pingadeira",
+                shape: Box(x: "-Largura / 2", y: "-WallThickness / 2 - 0.02", z: "-0.02", width: "Largura", depth: "WallThickness + 0.02", height: "0.02"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Vidro",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-0.006", z: "0.05", width: "Largura - 2 * 0.05", depth: "0.012", height: "Altura - 2 * 0.05"),
+                material: "Vidro",
+                in_plan: false,
+              ),
+            ],
+            opening: Some((
+              width: "Largura",
+              height: "Altura",
+              sill: "Peitoril",
+              operation: SideHungLeft,
+            )),
+          ),
+        ),
+        info: (
+          type_mark: "",
+          description: "",
+          manufacturer: "",
+          model: "",
+          url: "",
+          keynote: "",
+          classification: "",
+          fire_rating: "",
+          comments: "",
+          cost: None,
+        ),
+        uid: "6b6bd31a124446a2820fa6627ae13727",
+      ),
+      (11): (
+        id: (11),
+        name: "Janela de abrir 2 folhas 120x120",
+        data: Component(
+          component: "Janela de abrir 2 folhas",
+          def: (
+            kind: Window,
+            params: [
+              (
+                name: "Largura",
+                value: 1.2,
+                kind: Length,
+                instance: false,
+              ),
+              (
+                name: "Altura",
+                value: 1.2,
+                kind: Length,
+                instance: false,
+              ),
+              (
+                name: "Peitoril",
+                value: 1.0,
+                kind: Length,
+                instance: false,
+              ),
+            ],
+            items: [
+              (
+                name: "Caixilho",
+                shape: Box(x: "-Largura / 2", y: "-0.04", z: "0", width: "0.05", depth: "0.08", height: "Altura"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "Largura / 2 - 0.05", y: "-0.04", z: "0", width: "0.05", depth: "0.08", height: "Altura"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-0.04", z: "0", width: "Largura - 2 * 0.05", depth: "0.08", height: "0.05"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-0.04", z: "Altura - 0.05", width: "Largura - 2 * 0.05", depth: "0.08", height: "0.05"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Pingadeira",
+                shape: Box(x: "-Largura / 2", y: "-WallThickness / 2 - 0.02", z: "-0.02", width: "Largura", depth: "WallThickness + 0.02", height: "0.02"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "-0.05", y: "-0.04", z: "0.05", width: "2 * 0.05", depth: "0.08", height: "Altura - 2 * 0.05"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Vidro",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-0.006", z: "0.05", width: "Largura / 2 - 2 * 0.05", depth: "0.012", height: "Altura - 2 * 0.05"),
+                material: "Vidro",
+                in_plan: false,
+              ),
+              (
+                name: "Vidro",
+                shape: Box(x: "0.05", y: "-0.006", z: "0.05", width: "Largura / 2 - 2 * 0.05", depth: "0.012", height: "Altura - 2 * 0.05"),
+                material: "Vidro",
+                in_plan: false,
+              ),
+            ],
+            opening: Some((
+              width: "Largura",
+              height: "Altura",
+              sill: "Peitoril",
+              operation: DoubleSideHung,
+            )),
+          ),
+        ),
+        info: (
+          type_mark: "",
+          description: "",
+          manufacturer: "",
+          model: "",
+          url: "",
+          keynote: "",
+          classification: "",
+          fire_rating: "",
+          comments: "",
+          cost: None,
+        ),
+        uid: "7f17e337f8f1426f9d9a9d2adf46af97",
+      ),
+      (12): (
+        id: (12),
+        name: "Janela maxim-ar 60x60",
+        data: Component(
+          component: "Janela maxim-ar",
+          def: (
+            kind: Window,
+            params: [
+              (
+                name: "Largura",
+                value: 0.6,
+                kind: Length,
+                instance: false,
+              ),
+              (
+                name: "Altura",
+                value: 0.6,
+                kind: Length,
+                instance: false,
+              ),
+              (
+                name: "Peitoril",
+                value: 1.5,
+                kind: Length,
+                instance: false,
+              ),
+            ],
+            items: [
+              (
+                name: "Caixilho",
+                shape: Box(x: "-Largura / 2", y: "-0.04", z: "0", width: "0.05", depth: "0.08", height: "Altura"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "Largura / 2 - 0.05", y: "-0.04", z: "0", width: "0.05", depth: "0.08", height: "Altura"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-0.04", z: "0", width: "Largura - 2 * 0.05", depth: "0.08", height: "0.05"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-0.04", z: "Altura - 0.05", width: "Largura - 2 * 0.05", depth: "0.08", height: "0.05"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Pingadeira",
+                shape: Box(x: "-Largura / 2", y: "-WallThickness / 2 - 0.02", z: "-0.02", width: "Largura", depth: "WallThickness + 0.02", height: "0.02"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Vidro",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-0.006", z: "0.05", width: "Largura - 2 * 0.05", depth: "0.012", height: "Altura - 2 * 0.05"),
+                material: "Vidro",
+                in_plan: false,
+              ),
+            ],
+            opening: Some((
+              width: "Largura",
+              height: "Altura",
+              sill: "Peitoril",
+              operation: TopHung,
+            )),
+          ),
+        ),
+        info: (
+          type_mark: "",
+          description: "",
+          manufacturer: "",
+          model: "",
+          url: "",
+          keynote: "",
+          classification: "",
+          fire_rating: "",
+          comments: "",
+          cost: None,
+        ),
+        uid: "919aa16331df40f1838539db906a262e",
+      ),
+      (13): (
+        id: (13),
+        name: "Janela de correr 150x120",
+        data: Component(
+          component: "Janela de correr",
+          def: (
+            kind: Window,
+            params: [
+              (
+                name: "Largura",
+                value: 1.5,
+                kind: Length,
+                instance: false,
+              ),
+              (
+                name: "Altura",
+                value: 1.2,
+                kind: Length,
+                instance: false,
+              ),
+              (
+                name: "Peitoril",
+                value: 1.0,
+                kind: Length,
+                instance: false,
+              ),
+            ],
+            items: [
+              (
+                name: "Caixilho",
+                shape: Box(x: "-Largura / 2", y: "-0.04", z: "0", width: "0.05", depth: "0.08", height: "Altura"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "Largura / 2 - 0.05", y: "-0.04", z: "0", width: "0.05", depth: "0.08", height: "Altura"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-0.04", z: "0", width: "Largura - 2 * 0.05", depth: "0.08", height: "0.05"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-0.04", z: "Altura - 0.05", width: "Largura - 2 * 0.05", depth: "0.08", height: "0.05"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Pingadeira",
+                shape: Box(x: "-Largura / 2", y: "-WallThickness / 2 - 0.02", z: "-0.02", width: "Largura", depth: "WallThickness + 0.02", height: "0.02"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-0.035", z: "0.05", width: "0.05", depth: "0.03", height: "Altura - 2 * 0.05"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "-0.05 / 2", y: "-0.035", z: "0.05", width: "0.05", depth: "0.03", height: "Altura - 2 * 0.05"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Vidro",
+                shape: Box(x: "-Largura / 2 + 2 * 0.05", y: "-0.026000000000000002", z: "0.05", width: "Largura / 2 - 5 * 0.05 / 2", depth: "0.012", height: "Altura - 2 * 0.05"),
+                material: "Vidro",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "-0.05 / 2", y: "0.005", z: "0.05", width: "0.05", depth: "0.03", height: "Altura - 2 * 0.05"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Caixilho",
+                shape: Box(x: "Largura / 2 - 2 * 0.05", y: "0.005", z: "0.05", width: "0.05", depth: "0.03", height: "Altura - 2 * 0.05"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Vidro",
+                shape: Box(x: "0.05 / 2", y: "0.013999999999999999", z: "0.05", width: "Largura / 2 - 5 * 0.05 / 2", depth: "0.012", height: "Altura - 2 * 0.05"),
+                material: "Vidro",
+                in_plan: false,
+              ),
+            ],
+            opening: Some((
+              width: "Largura",
+              height: "Altura",
+              sill: "Peitoril",
+              operation: Sliding,
+            )),
+          ),
+        ),
+        info: (
+          type_mark: "",
+          description: "",
+          manufacturer: "",
+          model: "",
+          url: "",
+          keynote: "",
+          classification: "",
+          fire_rating: "",
+          comments: "",
+          cost: None,
+        ),
+        uid: "7040e9f8ace74c2b8116e728a1ad8bb9",
+      ),
+      (14): (
+        id: (14),
         name: "Laje 12 cm",
         data: Floor(
           layers: [
@@ -1037,10 +1475,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "f068b4d491284366bc0cd85fdf588a5f",
+        uid: "d45e8dc74a3d40759c1a03c76146f73b",
       ),
-      (11): (
-        id: (11),
+      (15): (
+        id: (15),
         name: "Forro de gesso",
         data: Ceiling(
           thickness: 0.02,
@@ -1058,10 +1496,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "18fab3cad3cb494b9673393e4dcd7950",
+        uid: "891e8d5047b04269bce4883d7b6c51e8",
       ),
-      (12): (
-        id: (12),
+      (16): (
+        id: (16),
         name: "Pilar 20 x 20 cm",
         data: Column(
           section: Rectangular(
@@ -1069,6 +1507,7 @@
             depth: 0.2,
           ),
           material: "Concreto",
+          profile: Some((96)),
         ),
         info: (
           type_mark: "",
@@ -1082,16 +1521,17 @@
           comments: "",
           cost: None,
         ),
-        uid: "ecd9c02d386e47a5b660406a28d0916a",
+        uid: "1e21c32a5834416f98ef6bfd0bdc1139",
       ),
-      (13): (
-        id: (13),
+      (17): (
+        id: (17),
         name: "Pilar circular 30 cm",
         data: Column(
           section: Round(
             diameter: 0.3,
           ),
           material: "Concreto",
+          profile: Some((97)),
         ),
         info: (
           type_mark: "",
@@ -1105,16 +1545,17 @@
           comments: "",
           cost: None,
         ),
-        uid: "9da8a9528a514fc79e98dae21d324cd6",
+        uid: "a0969644d0794fa7921e2613c02e7e70",
       ),
-      (14): (
-        id: (14),
+      (18): (
+        id: (18),
         name: "Viga 15 x 40 cm",
         data: Beam(
           width: 0.15,
           height: 0.4,
           material: "Concreto",
           shape: Solid,
+          profile: Some((98)),
         ),
         info: (
           type_mark: "",
@@ -1128,10 +1569,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "21763f55aef84aafb8e726151155c64f",
+        uid: "cf889933192f4d5c8e19a2ad800e5a0b",
       ),
-      (15): (
-        id: (15),
+      (19): (
+        id: (19),
         name: "Pilar metálico H 200 x 200",
         data: Column(
           section: Profile(
@@ -1143,6 +1584,7 @@
             ),
           ),
           material: "Aço",
+          profile: Some((99)),
         ),
         info: (
           type_mark: "",
@@ -1156,10 +1598,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "ab4536dcf25d4ceda722f09e98fbde3b",
+        uid: "af92e635372f476f9fb17e08da71b02e",
       ),
-      (16): (
-        id: (16),
+      (20): (
+        id: (20),
         name: "Pilar metálico tubo 150 x 150 x 6",
         data: Column(
           section: Profile(
@@ -1170,6 +1612,7 @@
             ),
           ),
           material: "Aço",
+          profile: Some((100)),
         ),
         info: (
           type_mark: "",
@@ -1183,10 +1626,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "7977085dd7054553a5762413bf381334",
+        uid: "e4cf5aa46a9a442b9e8b684ea2c61b06",
       ),
-      (17): (
-        id: (17),
+      (21): (
+        id: (21),
         name: "Viga metálica I 300 x 150",
         data: Beam(
           width: 0.15,
@@ -1196,6 +1639,7 @@
             web: 0.0071,
             flange: 0.0107,
           ),
+          profile: Some((101)),
         ),
         info: (
           type_mark: "",
@@ -1209,10 +1653,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "f033946319694871a63321609a241b28",
+        uid: "ef0d0e78daf04d06a78f708cfaea7364",
       ),
-      (18): (
-        id: (18),
+      (22): (
+        id: (22),
         name: "Barra Ø 5,0 mm",
         data: Rebar(
           diameter: 0.005,
@@ -1230,10 +1674,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "b788ed3e235e4c799e93fd45fb4fa2a2",
+        uid: "22080c53f0eb4c0cb6726f0b3f422169",
       ),
-      (19): (
-        id: (19),
+      (23): (
+        id: (23),
         name: "Barra Ø 8,0 mm",
         data: Rebar(
           diameter: 0.008,
@@ -1251,10 +1695,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "4947a2f2e98644e78c403e24e7a85e2b",
+        uid: "6c96201b437b4c09a8ffc1ba03d96f78",
       ),
-      (20): (
-        id: (20),
+      (24): (
+        id: (24),
         name: "Barra Ø 10,0 mm",
         data: Rebar(
           diameter: 0.01,
@@ -1272,10 +1716,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "d01ae5d5c5084057b7a57f9395f027ae",
+        uid: "fefe36fdefac42989fb20279a2fc9cbb",
       ),
-      (21): (
-        id: (21),
+      (25): (
+        id: (25),
         name: "Barra Ø 12,5 mm",
         data: Rebar(
           diameter: 0.0125,
@@ -1293,10 +1737,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "ef0fe89fecbe422fa240db34c901f4d5",
+        uid: "c37791bd44a94ceba40b0c818344b441",
       ),
-      (22): (
-        id: (22),
+      (26): (
+        id: (26),
         name: "Barra Ø 16,0 mm",
         data: Rebar(
           diameter: 0.016,
@@ -1314,10 +1758,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "3581af9371354e3d966f616713c2ac6c",
+        uid: "6400ae19a5e747b6b3a77415fb80acb6",
       ),
-      (23): (
-        id: (23),
+      (27): (
+        id: (27),
         name: "Sapata 100 x 100 x 40 cm",
         data: Foundation(
           kind: Pad,
@@ -1338,10 +1782,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "cf7da0e3d9e64dc9846c8c011aa081f4",
+        uid: "a0ef601ec2334961be6958137076505d",
       ),
-      (24): (
-        id: (24),
+      (28): (
+        id: (28),
         name: "Viga baldrame 20 x 40 cm",
         data: Foundation(
           kind: Strip,
@@ -1362,10 +1806,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "c074ac870a8843228e6f5d7399f290ec",
+        uid: "fc6a4f52493a488faa9a9c93808e6825",
       ),
-      (25): (
-        id: (25),
+      (29): (
+        id: (29),
         name: "Radier 30 cm",
         data: Foundation(
           kind: Slab,
@@ -1386,16 +1830,34 @@
           comments: "",
           cost: None,
         ),
-        uid: "22d8ab50bb574b04b327b64efb6def56",
+        uid: "747086a976054bc88936f8df95607b40",
       ),
-      (26): (
-        id: (26),
+      (30): (
+        id: (30),
         name: "Escada 1,00 m",
         data: Stair(
           width: 1.0,
           max_riser: 0.18,
           tread: 0.28,
           material: "Concreto",
+          build: (
+            construction: Solid,
+            waist: 0.12,
+            stringers: Sides,
+            stringer_width: 0.06,
+            stringer_depth: 0.25,
+            tread_thickness: 0.04,
+            closed_risers: false,
+            landing_beams: Cross,
+            post_width: 0.08,
+          ),
+          rules: (
+            tread_rule: Fixed,
+            min_riser: 0.16,
+            min_tread: 0.28,
+            blondel_min: 0.63,
+            blondel_max: 0.65,
+          ),
         ),
         info: (
           type_mark: "",
@@ -1409,10 +1871,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "e499fdd62a5243b5a156dbd58a5ec5a7",
+        uid: "a7676c5b5e6348d48740f6182e1fea03",
       ),
-      (27): (
-        id: (27),
+      (31): (
+        id: (31),
         name: "Guarda-corpo 1,10 m",
         data: Railing(
           height: 1.1,
@@ -1431,10 +1893,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "a5fb8530649d4215ad250855e997ed37",
+        uid: "2abb1ac1bd9c4e22b5e9c8877d8ed7da",
       ),
-      (28): (
-        id: (28),
+      (32): (
+        id: (32),
         name: "Tubo PVC soldável 20 mm",
         data: Pipe(
           diameter: 0.02,
@@ -1452,10 +1914,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "7081cd2038244b8c921c1c834907fcf0",
+        uid: "045336a5f664438f945ae6ff9187aa47",
       ),
-      (29): (
-        id: (29),
+      (33): (
+        id: (33),
         name: "Tubo PVC soldável 25 mm",
         data: Pipe(
           diameter: 0.025,
@@ -1473,10 +1935,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "7b6dfdab8ee04283b53817cc9fb5d2be",
+        uid: "b39ca2a109a64532bbde7a724e9261c3",
       ),
-      (30): (
-        id: (30),
+      (34): (
+        id: (34),
         name: "Tubo PVC soldável 32 mm",
         data: Pipe(
           diameter: 0.032,
@@ -1494,10 +1956,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "03c53ff8ac6c4373a9359e3d6374bc37",
+        uid: "934cb04541424f46a9f8a01d9cb5d8ae",
       ),
-      (31): (
-        id: (31),
+      (35): (
+        id: (35),
         name: "Tubo PVC esgoto 40 mm",
         data: Pipe(
           diameter: 0.04,
@@ -1515,10 +1977,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "42eebd8f640a4b9cbb925a3f16a2abd9",
+        uid: "c25aa0e1ed1b40aeb373b9bd55b04f2f",
       ),
-      (32): (
-        id: (32),
+      (36): (
+        id: (36),
         name: "Tubo PVC esgoto 50 mm",
         data: Pipe(
           diameter: 0.05,
@@ -1536,10 +1998,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "abb8d1a1f33541e4abea7f9c682452b8",
+        uid: "09d9f24efe8143d0932726d3eb59859d",
       ),
-      (33): (
-        id: (33),
+      (37): (
+        id: (37),
         name: "Tubo PVC esgoto 75 mm",
         data: Pipe(
           diameter: 0.075,
@@ -1557,10 +2019,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "4e9d5c4bbd28473983027e0bd1bd9659",
+        uid: "48a4c663528f4065a8461fec648314f5",
       ),
-      (34): (
-        id: (34),
+      (38): (
+        id: (38),
         name: "Tubo PVC esgoto 100 mm",
         data: Pipe(
           diameter: 0.1,
@@ -1578,10 +2040,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "b3a3b3eb105c4aa1bad35b6cc5d1f838",
+        uid: "a302e1c994a046668dd50e8ee54926c0",
       ),
-      (35): (
-        id: (35),
+      (39): (
+        id: (39),
         name: "Eletroduto flexível 20 mm",
         data: Conduit(
           diameter: 0.02,
@@ -1599,10 +2061,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "0d90bc9af8df48cbb6d998d0e32eae73",
+        uid: "60370950007e4d7498096d761ce7087d",
       ),
-      (36): (
-        id: (36),
+      (40): (
+        id: (40),
         name: "Eletroduto flexível 25 mm",
         data: Conduit(
           diameter: 0.025,
@@ -1620,10 +2082,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "118c8207fcb046549507ed4e70c10c68",
+        uid: "6780e8b08181444fbb170330afc4677c",
       ),
-      (37): (
-        id: (37),
+      (41): (
+        id: (41),
         name: "Eletroduto flexível 32 mm",
         data: Conduit(
           diameter: 0.032,
@@ -1641,10 +2103,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "2746730e1ed34479a35e73d376c66a47",
+        uid: "9eaac717ca34494ab26134fcf6f6c69e",
       ),
-      (38): (
-        id: (38),
+      (42): (
+        id: (42),
         name: "Ambiente",
         data: Room(),
         info: (
@@ -1659,10 +2121,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "3a755d146c9a493cbcf931a3eb843087",
+        uid: "4603dc2a3a9441b7925f80b827d61c91",
       ),
-      (39): (
-        id: (39),
+      (43): (
+        id: (43),
         name: "Eixo 8 mm",
         data: Grid(
           bubble: 8.0,
@@ -1679,10 +2141,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "16dbed286a4549caae050f2e301aadae",
+        uid: "68d72a1d53f641c18ee1d65fa59ec094",
       ),
-      (40): (
-        id: (40),
+      (44): (
+        id: (44),
         name: "Cota linear 2,5 mm",
         data: Dimension(
           text_size: 2.5,
@@ -1699,10 +2161,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "bf5950d4fbf24a89b261a797cd2ca698",
+        uid: "891f09d12c0d49499f58c050b272df30",
       ),
-      (41): (
-        id: (41),
+      (45): (
+        id: (45),
         name: "Texto 2,5 mm",
         data: Text(
           size: 2.5,
@@ -1720,10 +2182,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "88207e2d4d244811b364be6187e730c3",
+        uid: "b0356e0d5b3b4784b3dac2c4d390fd7b",
       ),
-      (42): (
-        id: (42),
+      (46): (
+        id: (46),
         name: "Texto 3,5 mm",
         data: Text(
           size: 3.5,
@@ -1741,10 +2203,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "45258cf9b1db4841a3965a1553cf1a6e",
+        uid: "652c2969f1a5447e81a60467c743a685",
       ),
-      (43): (
-        id: (43),
+      (47): (
+        id: (47),
         name: "Telhado cerâmico",
         data: Roof(
           layers: [
@@ -1759,6 +2221,29 @@
               function: Structure,
             ),
           ],
+          framing: (
+            system: r#None,
+            material: "",
+            purlin: (
+              width: 0.06,
+              height: 0.16,
+            ),
+            purlin_spacing: 1.5,
+            rafter: (
+              width: 0.05,
+              height: 0.06,
+            ),
+            rafter_spacing: 0.5,
+            batten: (
+              width: 0.015,
+              height: 0.05,
+            ),
+            truss: (
+              width: 0.06,
+              height: 0.16,
+            ),
+            truss_spacing: 3.0,
+          ),
         ),
         info: (
           type_mark: "",
@@ -1772,10 +2257,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "5f4e07e575d943c4825e48de4e870c84",
+        uid: "90f6ce65d1564df4bd02bb02b4fbaab3",
       ),
-      (44): (
-        id: (44),
+      (48): (
+        id: (48),
         name: "Mesa 120 x 80",
         data: Component(
           component: "Mesa",
@@ -1847,10 +2332,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "9331f6d9f0694b61a3d642050f29abf7",
+        uid: "55f15f762cf64a54b4a1066a34460377",
       ),
-      (45): (
-        id: (45),
+      (49): (
+        id: (49),
         name: "Cadeira simples",
         data: Component(
           component: "Cadeira",
@@ -1934,10 +2419,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "cbbed8ae258543b4a2bbce4ee9f62942",
+        uid: "69167addfe374331aaf0bca4e3740e5f",
       ),
-      (46): (
-        id: (46),
+      (50): (
+        id: (50),
         name: "Cama casal 140 x 190",
         data: Component(
           component: "Cama",
@@ -1991,10 +2476,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "ece51e06797b44918a91552332847a3c",
+        uid: "acc219a6aeb345aeb18ee9f485b4a471",
       ),
-      (47): (
-        id: (47),
+      (51): (
+        id: (51),
         name: "Sofá 3 lugares",
         data: Component(
           component: "Sofá",
@@ -2066,10 +2551,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "e29dce04fb76418099ee5734d59f6033",
+        uid: "f29436c83bae4596ad0d9ffa15169bfb",
       ),
-      (48): (
-        id: (48),
+      (52): (
+        id: (52),
         name: "Bacia com caixa acoplada",
         data: Component(
           component: "Bacia sanitária",
@@ -2114,6 +2599,26 @@
               supply_weight: 0.3,
               hot_water: false,
             )),
+            connectors: [
+              (
+                name: "Esgoto",
+                system: Sanitary,
+                x: "0",
+                y: "Profundidade / 2 - 0.3",
+                z: "0",
+                direction: Down,
+                diameter: "0.1",
+              ),
+              (
+                name: "Água fria",
+                system: ColdWater,
+                x: "-0.15",
+                y: "Profundidade / 2",
+                z: "0.2",
+                direction: Back,
+                diameter: "0.02",
+              ),
+            ],
           ),
         ),
         info: (
@@ -2128,10 +2633,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "7b356ebbbca74092aff87ad5c987c852",
+        uid: "b305fd96a7de4df6aaa587a474538d5a",
       ),
-      (49): (
-        id: (49),
+      (53): (
+        id: (53),
         name: "Lavatório de coluna",
         data: Component(
           component: "Lavatório",
@@ -2176,6 +2681,35 @@
               supply_weight: 0.3,
               hot_water: true,
             )),
+            connectors: [
+              (
+                name: "Esgoto",
+                system: Sanitary,
+                x: "0",
+                y: "Profundidade / 2 - 0.05",
+                z: "0.5",
+                direction: Down,
+                diameter: "0.04",
+              ),
+              (
+                name: "Água fria",
+                system: ColdWater,
+                x: "-0.1",
+                y: "Profundidade / 2",
+                z: "0.6",
+                direction: Back,
+                diameter: "0.02",
+              ),
+              (
+                name: "Água quente",
+                system: HotWater,
+                x: "0.1",
+                y: "Profundidade / 2",
+                z: "0.6",
+                direction: Back,
+                diameter: "0.02",
+              ),
+            ],
           ),
         ),
         info: (
@@ -2190,10 +2724,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "ee80fb946de0473ba4c554f30ed276d1",
+        uid: "886ee0f29d094729866f0e6ee0182ba1",
       ),
-      (50): (
-        id: (50),
+      (54): (
+        id: (54),
         name: "Armário 160 cm",
         data: Component(
           component: "Armário",
@@ -2241,10 +2775,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "d2176c4662fd4646ac2e60c4da89d973",
+        uid: "75ce8980e86f45a793c37cbcffd2a5bd",
       ),
-      (51): (
-        id: (51),
+      (55): (
+        id: (55),
         name: "Chuveiro de parede",
         data: Component(
           component: "Chuveiro",
@@ -2297,10 +2831,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "9ff128ec83d946e0b2abe5f0793e6135",
+        uid: "24de5f0ca2024b1cae71d3dcbe5740f6",
       ),
-      (52): (
-        id: (52),
+      (56): (
+        id: (56),
         name: "Pia inox 120 cm",
         data: Component(
           component: "Pia de cozinha",
@@ -2353,10 +2887,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "7cd740357db94492a255715aeff0412a",
+        uid: "c6f45975416e4013ac90ca8cb7ec2aaf",
       ),
-      (53): (
-        id: (53),
+      (57): (
+        id: (57),
         name: "Ralo sifonado 150 mm",
         data: Component(
           component: "Ralo sifonado",
@@ -2409,10 +2943,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "5ce37928f13d46e68ebca83f5111c767",
+        uid: "d0674530d27e4223ad05a08787b33a60",
       ),
-      (54): (
-        id: (54),
+      (58): (
+        id: (58),
         name: "Tomada 2P+T 10 A",
         data: Component(
           component: "Tomada de uso geral",
@@ -2464,10 +2998,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "3f3348d73ca540ef980d35a46e527f8a",
+        uid: "d813b21ea0254626a823817f4ff704f4",
       ),
-      (55): (
-        id: (55),
+      (59): (
+        id: (59),
         name: "Tomada 2P+T 20 A",
         data: Component(
           component: "Tomada de uso específico",
@@ -2519,10 +3053,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "d9201ffaf8dd48e9876290c884e6c6d4",
+        uid: "56f5eee2b8ee4184a179e40c25772788",
       ),
-      (56): (
-        id: (56),
+      (60): (
+        id: (60),
         name: "Interruptor simples",
         data: Component(
           component: "Interruptor",
@@ -2574,10 +3108,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "361ddd22d92c42a1b9ede290e831d714",
+        uid: "d8fa54ceafdb414e8c0d73f9b3a88b95",
       ),
-      (57): (
-        id: (57),
+      (61): (
+        id: (61),
         name: "Arandela 60 VA",
         data: Component(
           component: "Arandela",
@@ -2629,10 +3163,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "8a884a442d56449bb6b0bed631bffa2f",
+        uid: "577072a505b347d79e675d46dfcdffce",
       ),
-      (58): (
-        id: (58),
+      (62): (
+        id: (62),
         name: "Quadro de distribuição de embutir",
         data: Component(
           component: "Quadro de distribuição",
@@ -2684,10 +3218,10 @@
           comments: "",
           cost: None,
         ),
-        uid: "73183c64447d4727bd39b8058f5e2335",
+        uid: "f875df0a9e574985b70ccc29cf7c8ebc",
       ),
-      (59): (
-        id: (59),
+      (63): (
+        id: (63),
         name: "Luminária de teto 100 VA",
         data: Component(
           component: "Ponto de luz no teto",
@@ -2739,12 +3273,324 @@
           comments: "",
           cost: None,
         ),
-        uid: "fe558b8fee5a42a9bab09bad17720f82",
+        uid: "106d2efb227744f8bbea010fff816381",
+      ),
+      (84): (
+        id: (84),
+        name: "Carimbo padrão",
+        data: Component(
+          component: "Carimbo padrão",
+          def: (
+            kind: TitleBlock,
+            params: [],
+            items: [],
+            sheet: [
+              (
+                name: "Border",
+                shape: Stroke(points: [(u: "10", v: "10"), (u: "SheetWidth - 10", v: "10"), (u: "SheetWidth - 10", v: "SheetHeight - 10"), (u: "10", v: "SheetHeight - 10")], closed: true, weight: "0.5"),
+              ),
+              (
+                name: "Block",
+                shape: Stroke(points: [(u: "SheetWidth - 180", v: "10"), (u: "SheetWidth - 10", v: "10"), (u: "SheetWidth - 10", v: "52"), (u: "SheetWidth - 180", v: "52")], closed: true, weight: "0.25"),
+              ),
+              (
+                name: "Row 1",
+                shape: Stroke(points: [(u: "SheetWidth - 180", v: "24"), (u: "SheetWidth - 50", v: "24")], closed: false, weight: "0.25"),
+              ),
+              (
+                name: "Row 2",
+                shape: Stroke(points: [(u: "SheetWidth - 180", v: "38"), (u: "SheetWidth - 10", v: "38")], closed: false, weight: "0.25"),
+              ),
+              (
+                name: "Number cell",
+                shape: Stroke(points: [(u: "SheetWidth - 50", v: "10"), (u: "SheetWidth - 50", v: "38")], closed: false, weight: "0.25"),
+              ),
+              (
+                name: "Project caption",
+                shape: Text(x: "SheetWidth - 178", y: "47", text: "PROJETO", size: "2", anchor: Left),
+              ),
+              (
+                name: "Project",
+                shape: Text(x: "SheetWidth - 178", y: "42", text: "{project_name}", size: "4", anchor: Left),
+              ),
+              (
+                name: "Sheet caption",
+                shape: Text(x: "SheetWidth - 178", y: "33", text: "FOLHA", size: "2", anchor: Left),
+              ),
+              (
+                name: "Sheet",
+                shape: Text(x: "SheetWidth - 178", y: "28.5", text: "{sheet_name}", size: "3.5", anchor: Left),
+              ),
+              (
+                name: "Client caption",
+                shape: Text(x: "SheetWidth - 178", y: "19", text: "CLIENTE", size: "2", anchor: Left),
+              ),
+              (
+                name: "Client",
+                shape: Text(x: "SheetWidth - 178", y: "15", text: "{client}", size: "3", anchor: Left),
+              ),
+              (
+                name: "Number caption",
+                shape: Text(x: "SheetWidth - 48", y: "33", text: "NÚMERO", size: "2", anchor: Left),
+              ),
+              (
+                name: "Number",
+                shape: Text(x: "SheetWidth - 48", y: "25", text: "{sheet_number}", size: "6", anchor: Left),
+              ),
+              (
+                name: "Project number",
+                shape: Text(x: "SheetWidth - 48", y: "18.8", text: "Proj. nº {project_number}", size: "2.2", anchor: Left),
+              ),
+              (
+                name: "Author",
+                shape: Text(x: "SheetWidth - 48", y: "13.8", text: "Autor: {author}", size: "2.2", anchor: Left),
+              ),
+            ],
+          ),
+        ),
+        info: (
+          type_mark: "",
+          description: "",
+          manufacturer: "",
+          model: "",
+          url: "",
+          keynote: "",
+          classification: "",
+          fire_rating: "",
+          comments: "",
+          cost: None,
+        ),
+        uid: "5a171ac75d634587b92186422eece0ca",
+      ),
+      (94): (
+        id: (94),
+        name: "Porta-janela 80x220",
+        data: Component(
+          component: "Porta-janela",
+          def: (
+            kind: Door,
+            params: [
+              (
+                name: "Largura",
+                value: 0.8,
+                kind: Length,
+                instance: false,
+              ),
+              (
+                name: "Altura",
+                value: 2.2,
+                kind: Length,
+                instance: false,
+              ),
+              (
+                name: "Rodapé",
+                value: 0.4,
+                kind: Length,
+                instance: false,
+              ),
+            ],
+            items: [
+              (
+                name: "Batente",
+                shape: Box(x: "-Largura / 2", y: "-WallThickness / 2", z: "0", width: "0.05", depth: "WallThickness", height: "Altura"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Batente",
+                shape: Box(x: "Largura / 2 - 0.05", y: "-WallThickness / 2", z: "0", width: "0.05", depth: "WallThickness", height: "Altura"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Batente",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-WallThickness / 2", z: "Altura - 0.05", width: "Largura - 2 * 0.05", depth: "WallThickness", height: "0.05"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Folha",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-0.025", z: "0", width: "0.08", depth: "0.05", height: "Altura - 0.05"),
+                material: "Madeira",
+                in_plan: false,
+              ),
+              (
+                name: "Folha",
+                shape: Box(x: "-Largura / 2 + 0.05 + Largura - 2 * 0.05 - 0.08", y: "-0.025", z: "0", width: "0.08", depth: "0.05", height: "Altura - 0.05"),
+                material: "Madeira",
+                in_plan: false,
+              ),
+              (
+                name: "Folha",
+                shape: Box(x: "-Largura / 2 + 0.05 + 0.08", y: "-0.025", z: "0", width: "Largura - 2 * 0.05 - 0.16", depth: "0.05", height: "Rodapé"),
+                material: "Madeira",
+                in_plan: false,
+              ),
+              (
+                name: "Folha",
+                shape: Box(x: "-Largura / 2 + 0.05 + 0.08", y: "-0.025", z: "Altura - 0.05 - 0.08", width: "Largura - 2 * 0.05 - 0.16", depth: "0.05", height: "0.08"),
+                material: "Madeira",
+                in_plan: false,
+              ),
+              (
+                name: "Vidro",
+                shape: Box(x: "-Largura / 2 + 0.05 + 0.08", y: "-0.006", z: "Rodapé", width: "Largura - 2 * 0.05 - 0.16", depth: "0.012", height: "Altura - 0.05 - 0.08 - Rodapé"),
+                material: "Vidro",
+                in_plan: false,
+              ),
+            ],
+            opening: Some((
+              width: "Largura",
+              height: "Altura",
+            )),
+          ),
+        ),
+        info: (
+          type_mark: "",
+          description: "",
+          manufacturer: "",
+          model: "",
+          url: "",
+          keynote: "",
+          classification: "",
+          fire_rating: "",
+          comments: "",
+          cost: None,
+        ),
+        uid: "23cb4f462492476a87f47daa5a0375bf",
+      ),
+      (95): (
+        id: (95),
+        name: "Porta-janela 2 folhas 140x220",
+        data: Component(
+          component: "Porta-janela 2 folhas",
+          def: (
+            kind: Door,
+            params: [
+              (
+                name: "Largura",
+                value: 1.4,
+                kind: Length,
+                instance: false,
+              ),
+              (
+                name: "Altura",
+                value: 2.2,
+                kind: Length,
+                instance: false,
+              ),
+              (
+                name: "Rodapé",
+                value: 0.4,
+                kind: Length,
+                instance: false,
+              ),
+            ],
+            items: [
+              (
+                name: "Batente",
+                shape: Box(x: "-Largura / 2", y: "-WallThickness / 2", z: "0", width: "0.05", depth: "WallThickness", height: "Altura"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Batente",
+                shape: Box(x: "Largura / 2 - 0.05", y: "-WallThickness / 2", z: "0", width: "0.05", depth: "WallThickness", height: "Altura"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Batente",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-WallThickness / 2", z: "Altura - 0.05", width: "Largura - 2 * 0.05", depth: "WallThickness", height: "0.05"),
+                material: "",
+                in_plan: false,
+              ),
+              (
+                name: "Folha",
+                shape: Box(x: "-Largura / 2 + 0.05", y: "-0.025", z: "0", width: "0.08", depth: "0.05", height: "Altura - 0.05"),
+                material: "Madeira",
+                in_plan: false,
+              ),
+              (
+                name: "Folha",
+                shape: Box(x: "-Largura / 2 + 0.05 + Largura / 2 - 0.05 - 0.08", y: "-0.025", z: "0", width: "0.08", depth: "0.05", height: "Altura - 0.05"),
+                material: "Madeira",
+                in_plan: false,
+              ),
+              (
+                name: "Folha",
+                shape: Box(x: "-Largura / 2 + 0.05 + 0.08", y: "-0.025", z: "0", width: "Largura / 2 - 0.05 - 0.16", depth: "0.05", height: "Rodapé"),
+                material: "Madeira",
+                in_plan: false,
+              ),
+              (
+                name: "Folha",
+                shape: Box(x: "-Largura / 2 + 0.05 + 0.08", y: "-0.025", z: "Altura - 0.05 - 0.08", width: "Largura / 2 - 0.05 - 0.16", depth: "0.05", height: "0.08"),
+                material: "Madeira",
+                in_plan: false,
+              ),
+              (
+                name: "Vidro",
+                shape: Box(x: "-Largura / 2 + 0.05 + 0.08", y: "-0.006", z: "Rodapé", width: "Largura / 2 - 0.05 - 0.16", depth: "0.012", height: "Altura - 0.05 - 0.08 - Rodapé"),
+                material: "Vidro",
+                in_plan: false,
+              ),
+              (
+                name: "Folha",
+                shape: Box(x: "0", y: "-0.025", z: "0", width: "0.08", depth: "0.05", height: "Altura - 0.05"),
+                material: "Madeira",
+                in_plan: false,
+              ),
+              (
+                name: "Folha",
+                shape: Box(x: "0 + Largura / 2 - 0.05 - 0.08", y: "-0.025", z: "0", width: "0.08", depth: "0.05", height: "Altura - 0.05"),
+                material: "Madeira",
+                in_plan: false,
+              ),
+              (
+                name: "Folha",
+                shape: Box(x: "0 + 0.08", y: "-0.025", z: "0", width: "Largura / 2 - 0.05 - 0.16", depth: "0.05", height: "Rodapé"),
+                material: "Madeira",
+                in_plan: false,
+              ),
+              (
+                name: "Folha",
+                shape: Box(x: "0 + 0.08", y: "-0.025", z: "Altura - 0.05 - 0.08", width: "Largura / 2 - 0.05 - 0.16", depth: "0.05", height: "0.08"),
+                material: "Madeira",
+                in_plan: false,
+              ),
+              (
+                name: "Vidro",
+                shape: Box(x: "0 + 0.08", y: "-0.006", z: "Rodapé", width: "Largura / 2 - 0.05 - 0.16", depth: "0.012", height: "Altura - 0.05 - 0.08 - Rodapé"),
+                material: "Vidro",
+                in_plan: false,
+              ),
+            ],
+            opening: Some((
+              width: "Largura",
+              height: "Altura",
+              door_operation: DoubleDoor,
+            )),
+          ),
+        ),
+        info: (
+          type_mark: "",
+          description: "",
+          manufacturer: "",
+          model: "",
+          url: "",
+          keynote: "",
+          classification: "",
+          fire_rating: "",
+          comments: "",
+          cost: None,
+        ),
+        uid: "2609930ba0494c7ab2053943da1799f6",
       ),
     },
     elements: {
-      (89): (
-        id: (89),
+      (102): (
+        id: (102),
         level: (1),
         type_id: (3),
         mark: "",
@@ -2765,11 +3611,11 @@
           join_end: true,
           bulge: 0.0,
         )),
-        uid: "5c3622bb2c204ac5b146d380542f7e01",
-        phase_created: (81),
+        uid: "a9fc447dbe8b44fe89591a689202d438",
+        phase_created: (86),
       ),
-      (90): (
-        id: (90),
+      (103): (
+        id: (103),
         level: (1),
         type_id: (3),
         mark: "",
@@ -2790,11 +3636,11 @@
           join_end: true,
           bulge: 0.0,
         )),
-        uid: "ccbfcebd5cbb42ddbc6b3bb3c0b02f5d",
-        phase_created: (81),
+        uid: "6cfc29cac0074a3aaba92b3a748b8093",
+        phase_created: (86),
       ),
-      (91): (
-        id: (91),
+      (104): (
+        id: (104),
         level: (1),
         type_id: (3),
         mark: "",
@@ -2815,11 +3661,11 @@
           join_end: true,
           bulge: 0.0,
         )),
-        uid: "2ff7f2ace99145d29d17d934ac6d86b9",
-        phase_created: (81),
+        uid: "37a76caed8c24035992d302218eebd5e",
+        phase_created: (86),
       ),
-      (92): (
-        id: (92),
+      (105): (
+        id: (105),
         level: (1),
         type_id: (3),
         mark: "",
@@ -2840,11 +3686,11 @@
           join_end: true,
           bulge: 0.0,
         )),
-        uid: "c41ce2399aa14505b72f5d72a439afe5",
-        phase_created: (81),
+        uid: "b429256248474767a5fddc89e0a0bcea",
+        phase_created: (86),
       ),
-      (93): (
-        id: (93),
+      (106): (
+        id: (106),
         level: (1),
         type_id: (3),
         mark: "",
@@ -2862,109 +3708,109 @@
           join_end: true,
           bulge: 0.0,
         )),
-        uid: "afde0aba1a1c4d8981988a1d78b7ff54",
-        phase_created: (81),
+        uid: "960a361f754c43038a5cb931fddf6e2a",
+        phase_created: (86),
       ),
-      (94): (
-        id: (94),
+      (107): (
+        id: (107),
         level: (1),
         type_id: (6),
         mark: "1",
         comments: "",
         kind: Door((
-          host: (92),
+          host: (105),
           offset: 6.5,
           sill_height: 0.0,
           flip_facing: false,
           flip_hand: false,
         )),
-        uid: "3bfd7e431541403092eff19dfdb05e37",
-        phase_created: (81),
+        uid: "ddd6fa1368a14a46aa4c8582e1e41c58",
+        phase_created: (86),
       ),
-      (95): (
-        id: (95),
+      (108): (
+        id: (108),
         level: (1),
         type_id: (6),
         mark: "2",
         comments: "",
         kind: Door((
-          host: (93),
+          host: (106),
           offset: 4.0,
           sill_height: 0.0,
           flip_facing: false,
           flip_hand: false,
         )),
-        uid: "2b74401683d8447fb5a7af0542712734",
-        phase_created: (81),
+        uid: "90cd27cd454f4796aa8e46afc0a80f37",
+        phase_created: (86),
       ),
-      (96): (
-        id: (96),
+      (109): (
+        id: (109),
         level: (1),
         type_id: (8),
         mark: "1",
         comments: "",
         kind: Window((
-          host: (92),
+          host: (105),
           offset: 2.0,
           sill_height: 1.0,
           flip_facing: false,
           flip_hand: false,
         )),
-        uid: "36730cdfa53e40f3af1848908f59bb57",
-        phase_created: (81),
+        uid: "3f2f530f6b1b47b9b1f7e82fcbde4593",
+        phase_created: (86),
       ),
-      (97): (
-        id: (97),
+      (110): (
+        id: (110),
         level: (1),
         type_id: (8),
         mark: "2",
         comments: "",
         kind: Window((
-          host: (90),
+          host: (103),
           offset: 2.5,
           sill_height: 1.0,
           flip_facing: false,
           flip_hand: false,
         )),
-        uid: "eab78c135d5f4eab8a827ec6aa2a0fd7",
-        phase_created: (81),
+        uid: "e821e850081848c1b90aecc42d05355a",
+        phase_created: (86),
       ),
-      (98): (
-        id: (98),
+      (111): (
+        id: (111),
         level: (1),
         type_id: (8),
         mark: "3",
         comments: "",
         kind: Window((
-          host: (90),
+          host: (103),
           offset: 6.5,
           sill_height: 1.0,
           flip_facing: false,
           flip_hand: false,
         )),
-        uid: "3ba9d4c272ff44cda8ed5996443c6cf7",
-        phase_created: (81),
+        uid: "f081bb71dfb74b2aa1d4ba0987c08371",
+        phase_created: (86),
       ),
-      (99): (
-        id: (99),
+      (112): (
+        id: (112),
         level: (1),
         type_id: (8),
         mark: "4",
         comments: "",
         kind: Window((
-          host: (91),
+          host: (104),
           offset: 3.0,
           sill_height: 1.0,
           flip_facing: false,
           flip_hand: false,
         )),
-        uid: "fbeb579da6474e189cbc73e56b878f50",
-        phase_created: (81),
+        uid: "03f36259169f41a3a7f008d728986d62",
+        phase_created: (86),
       ),
-      (100): (
-        id: (100),
+      (113): (
+        id: (113),
         level: (1),
-        type_id: (10),
+        type_id: (14),
         mark: "",
         comments: "",
         kind: Floor((
@@ -2976,13 +3822,13 @@
           ],
           height_offset: 0.0,
         )),
-        uid: "a3ccf3ba037f4151909f736b8c4ca76d",
-        phase_created: (81),
+        uid: "6e952593b3d54fd48549a080716f16bb",
+        phase_created: (86),
       ),
-      (101): (
-        id: (101),
+      (114): (
+        id: (114),
         level: (1),
-        type_id: (43),
+        type_id: (47),
         mark: "",
         comments: "",
         kind: Roof((
@@ -2998,13 +3844,13 @@
             slope: 0.35,
           ),
         )),
-        uid: "92297fc76b3044fdbf339460cd687b0d",
-        phase_created: (81),
+        uid: "f16f3ef6102c4466842f8790b6c9f017",
+        phase_created: (86),
       ),
-      (102): (
-        id: (102),
+      (115): (
+        id: (115),
         level: (1),
-        type_id: (26),
+        type_id: (30),
         mark: "",
         comments: "",
         kind: Stair((
@@ -3016,14 +3862,47 @@
             level: (2),
             offset: 0.0,
           ),
+          layout: (
+            shape: Straight,
+            turn: Left,
+            split: 0,
+            split2: 0,
+            risers: 0,
+            tread: 0.0,
+            landing: 0.0,
+            gap: 0.1,
+            winders: 0,
+            inner_radius: 0.15,
+            posts: ((
+              front_outer: false,
+              front: false,
+              front_inner: false,
+              inner: false,
+              back_inner: false,
+              back: false,
+              back_outer: false,
+              outer: false,
+            ), (
+              front_outer: false,
+              front: false,
+              front_inner: false,
+              inner: false,
+              back_inner: false,
+              back: false,
+              back_outer: false,
+              outer: false,
+            )),
+            numbers: false,
+            number_start: 1,
+          ),
         )),
-        uid: "aabe45dba62a4bb4af2bc52d3f20123b",
-        phase_created: (81),
+        uid: "ea6ceb44c8414839a7332ae0cced1264",
+        phase_created: (86),
       ),
-      (103): (
-        id: (103),
+      (116): (
+        id: (116),
         level: (1),
-        type_id: (12),
+        type_id: (16),
         mark: "",
         comments: "",
         kind: Column((
@@ -3037,13 +3916,13 @@
           ),
           structural: true,
         )),
-        uid: "ad841c41dda643b38429fa469c53e0ee",
-        phase_created: (81),
+        uid: "5c532d0b1bce47f191a0761b3df7354b",
+        phase_created: (86),
       ),
-      (104): (
-        id: (104),
+      (117): (
+        id: (117),
         level: (1),
-        type_id: (12),
+        type_id: (16),
         mark: "",
         comments: "",
         kind: Column((
@@ -3057,13 +3936,13 @@
           ),
           structural: true,
         )),
-        uid: "0aa00c84052d4c4eaca4ae33412a8a77",
-        phase_created: (81),
+        uid: "1cdb19e6ae97412ab9c67c37b3151285",
+        phase_created: (86),
       ),
-      (105): (
-        id: (105),
+      (118): (
+        id: (118),
         level: (1),
-        type_id: (14),
+        type_id: (18),
         mark: "",
         comments: "",
         kind: Beam((
@@ -3075,13 +3954,13 @@
           join_start: true,
           join_end: true,
         )),
-        uid: "11c9e7479def4defa13b552229af99e6",
-        phase_created: (81),
+        uid: "8a85c61a3484453d9079b4444f2593e5",
+        phase_created: (86),
       ),
-      (106): (
-        id: (106),
+      (119): (
+        id: (119),
         level: (1),
-        type_id: (27),
+        type_id: (31),
         mark: "",
         comments: "",
         kind: Railing((
@@ -3091,13 +3970,13 @@
           ],
           base_offset: 0.0,
         )),
-        uid: "850aad026ba14a7c975732ec1cde08e1",
-        phase_created: (81),
+        uid: "3db09b566f2c4c8d98ec7323ce786c59",
+        phase_created: (86),
       ),
-      (107): (
-        id: (107),
+      (120): (
+        id: (120),
         level: (1),
-        type_id: (47),
+        type_id: (51),
         mark: "",
         comments: "",
         kind: Component((
@@ -3106,13 +3985,13 @@
           base_offset: 0.0,
           overrides: {},
         )),
-        uid: "38d7aedc13ea4318b0a7cbf30a4ef3b7",
-        phase_created: (81),
+        uid: "d84d4681d6084c159845e68118c8b26f",
+        phase_created: (86),
       ),
-      (108): (
-        id: (108),
+      (121): (
+        id: (121),
         level: (1),
-        type_id: (44),
+        type_id: (48),
         mark: "",
         comments: "",
         kind: Component((
@@ -3121,13 +4000,13 @@
           base_offset: 0.0,
           overrides: {},
         )),
-        uid: "7eddda780ad04a7da77e93e2ef3a0038",
-        phase_created: (81),
+        uid: "f804cd3694fc44dc9e840c10144319c6",
+        phase_created: (86),
       ),
-      (109): (
-        id: (109),
+      (122): (
+        id: (122),
         level: (1),
-        type_id: (45),
+        type_id: (49),
         mark: "",
         comments: "",
         kind: Component((
@@ -3136,13 +4015,13 @@
           base_offset: 0.0,
           overrides: {},
         )),
-        uid: "49f40363594446bbbf1fd1301715cc69",
-        phase_created: (81),
+        uid: "eb85d6cd6c7748778e44ad438dd64969",
+        phase_created: (86),
       ),
-      (110): (
-        id: (110),
+      (123): (
+        id: (123),
         level: (1),
-        type_id: (45),
+        type_id: (49),
         mark: "",
         comments: "",
         kind: Component((
@@ -3151,13 +4030,13 @@
           base_offset: 0.0,
           overrides: {},
         )),
-        uid: "5e400515d13f4b94b310616605502318",
-        phase_created: (81),
+        uid: "a4171819f5234d339874315d51cc2941",
+        phase_created: (86),
       ),
-      (111): (
-        id: (111),
+      (124): (
+        id: (124),
         level: (1),
-        type_id: (46),
+        type_id: (50),
         mark: "",
         comments: "",
         kind: Component((
@@ -3166,13 +4045,13 @@
           base_offset: 0.0,
           overrides: {},
         )),
-        uid: "1578732e3f364c5092237950b02d3dc8",
-        phase_created: (81),
+        uid: "b59b08d931444ade82b4b6f28a199b02",
+        phase_created: (86),
       ),
-      (112): (
-        id: (112),
+      (125): (
+        id: (125),
         level: (1),
-        type_id: (50),
+        type_id: (54),
         mark: "",
         comments: "",
         kind: Component((
@@ -3181,13 +4060,13 @@
           base_offset: 0.0,
           overrides: {},
         )),
-        uid: "3b47fc7e8e9b43dbb9b60e8be5447c24",
-        phase_created: (81),
+        uid: "c98098f620ea407081f121214dec6ba4",
+        phase_created: (86),
       ),
-      (113): (
-        id: (113),
+      (126): (
+        id: (126),
         level: (1),
-        type_id: (38),
+        type_id: (42),
         mark: "",
         comments: "",
         kind: Room((
@@ -3196,13 +4075,13 @@
           name: "Sala",
           height: 3.0,
         )),
-        uid: "f05bf9ad945548cfb6e8538a64cc3ac1",
-        phase_created: (81),
+        uid: "d867dc6f064649cf9b22461962e4eb56",
+        phase_created: (86),
       ),
-      (114): (
-        id: (114),
+      (127): (
+        id: (127),
         level: (1),
-        type_id: (38),
+        type_id: (42),
         mark: "",
         comments: "",
         kind: Room((
@@ -3211,13 +4090,13 @@
           name: "Quarto",
           height: 3.0,
         )),
-        uid: "2fd168b6047f408bac128c05f7aa0e33",
-        phase_created: (81),
+        uid: "a73045d7401f4894a576c1f74b1a1403",
+        phase_created: (86),
       ),
-      (115): (
-        id: (115),
+      (128): (
+        id: (128),
         level: (1),
-        type_id: (39),
+        type_id: (43),
         mark: "",
         comments: "",
         kind: Grid((
@@ -3225,13 +4104,13 @@
           end: (0.0, 7.5),
           name: "1",
         )),
-        uid: "d57e4dbd67b14482a34fde7ce43a97f5",
-        phase_created: (81),
+        uid: "185a18e0754848be916f048ac4e88913",
+        phase_created: (86),
       ),
-      (116): (
-        id: (116),
+      (129): (
+        id: (129),
         level: (1),
-        type_id: (39),
+        type_id: (43),
         mark: "",
         comments: "",
         kind: Grid((
@@ -3239,13 +4118,13 @@
           end: (5.0, 7.5),
           name: "2",
         )),
-        uid: "a7fb034ebe1d4bfda07004b2bab90336",
-        phase_created: (81),
+        uid: "a2ec824563924ac98f4fdd7bfa3eae89",
+        phase_created: (86),
       ),
-      (117): (
-        id: (117),
+      (130): (
+        id: (130),
         level: (1),
-        type_id: (39),
+        type_id: (43),
         mark: "",
         comments: "",
         kind: Grid((
@@ -3253,13 +4132,13 @@
           end: (9.0, 7.5),
           name: "3",
         )),
-        uid: "cc08f4fa01f642d1872a52b71ea27751",
-        phase_created: (81),
+        uid: "1e23d753beeb4b87ae250400932d1116",
+        phase_created: (86),
       ),
-      (118): (
-        id: (118),
+      (131): (
+        id: (131),
         level: (1),
-        type_id: (39),
+        type_id: (43),
         mark: "",
         comments: "",
         kind: Grid((
@@ -3267,13 +4146,13 @@
           end: (10.5, 0.0),
           name: "A",
         )),
-        uid: "66c6ddd89ca24bc0bfc69ea6cf5ab057",
-        phase_created: (81),
+        uid: "2ce15044f4b4435aa94555d9ef0d73f2",
+        phase_created: (86),
       ),
-      (119): (
-        id: (119),
+      (132): (
+        id: (132),
         level: (1),
-        type_id: (39),
+        type_id: (43),
         mark: "",
         comments: "",
         kind: Grid((
@@ -3281,23 +4160,23 @@
           end: (10.5, 6.0),
           name: "B",
         )),
-        uid: "aac492fba16546458255f874bacb95f7",
-        phase_created: (81),
+        uid: "2945599aac024294b7c95dc577195eb1",
+        phase_created: (86),
       ),
-      (120): (
-        id: (120),
+      (133): (
+        id: (133),
         level: (1),
-        type_id: (40),
+        type_id: (44),
         mark: "",
         comments: "",
         kind: Dimension((
-          view: (65),
+          view: (69),
           a: (0.0, 0.0),
           b: (5.0, 0.0),
           offset: -1.2,
           kind: Aligned,
           refs: (Some((
-            target: Element((115)),
+            target: Element((128)),
             anchor: Line(
               from_end: false,
               along: 1.5,
@@ -3305,7 +4184,7 @@
             ),
             z: None,
           )), Some((
-            target: Element((116)),
+            target: Element((129)),
             anchor: Line(
               from_end: false,
               along: 1.5,
@@ -3314,23 +4193,23 @@
             z: None,
           ))),
         )),
-        uid: "1b03c2f50de9430583c275941998492e",
-        phase_created: (81),
+        uid: "ece57e13604242e5b1241e7fa5787e98",
+        phase_created: (86),
       ),
-      (121): (
-        id: (121),
+      (134): (
+        id: (134),
         level: (1),
-        type_id: (40),
+        type_id: (44),
         mark: "",
         comments: "",
         kind: Dimension((
-          view: (65),
+          view: (69),
           a: (5.0, 0.0),
           b: (9.0, 0.0),
           offset: -1.2,
           kind: Aligned,
           refs: (Some((
-            target: Element((116)),
+            target: Element((129)),
             anchor: Line(
               from_end: false,
               along: 1.5,
@@ -3338,7 +4217,7 @@
             ),
             z: None,
           )), Some((
-            target: Element((117)),
+            target: Element((130)),
             anchor: Line(
               from_end: false,
               along: 1.5,
@@ -3347,23 +4226,23 @@
             z: None,
           ))),
         )),
-        uid: "d04b4961fd6d4966b536e93dec8b51f6",
-        phase_created: (81),
+        uid: "290fd03167d94743ba402d6248d31c96",
+        phase_created: (86),
       ),
-      (122): (
-        id: (122),
+      (135): (
+        id: (135),
         level: (1),
-        type_id: (40),
+        type_id: (44),
         mark: "",
         comments: "",
         kind: Dimension((
-          view: (65),
+          view: (69),
           a: (0.0, 0.0),
           b: (9.0, 0.0),
           offset: -1.9,
           kind: Aligned,
           refs: (Some((
-            target: Element((115)),
+            target: Element((128)),
             anchor: Line(
               from_end: false,
               along: 1.5,
@@ -3371,7 +4250,7 @@
             ),
             z: None,
           )), Some((
-            target: Element((117)),
+            target: Element((130)),
             anchor: Line(
               from_end: false,
               along: 1.5,
@@ -3380,13 +4259,13 @@
             z: None,
           ))),
         )),
-        uid: "29027fa9d41c4e02ab4c288e83740cd2",
-        phase_created: (81),
+        uid: "1e329a5330be4eeba22d78d50d954c6b",
+        phase_created: (86),
       ),
     },
     views: {
-      (65): (
-        id: (65),
+      (69): (
+        id: (69),
         name: "Térreo",
         scale: 75,
         kind: FloorPlan(
@@ -3395,11 +4274,11 @@
           structural: false,
           structure_tags: false,
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (66): (
-        id: (66),
+      (70): (
+        id: (70),
         name: "Pavimento 1",
         scale: 50,
         kind: FloorPlan(
@@ -3408,33 +4287,33 @@
           structural: false,
           structure_tags: false,
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (67): (
-        id: (67),
+      (71): (
+        id: (71),
         name: "Térreo",
         scale: 50,
         kind: CeilingPlan(
           level: (1),
           cut_height: 1.2,
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (68): (
-        id: (68),
+      (72): (
+        id: (72),
         name: "Pavimento 1",
         scale: 50,
         kind: CeilingPlan(
           level: (2),
           cut_height: 1.2,
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (69): (
-        id: (69),
+      (73): (
+        id: (73),
         name: "{3D}",
         scale: 100,
         kind: ThreeD(
@@ -3447,51 +4326,51 @@
           analytical: false,
           rebar: false,
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (70): (
-        id: (70),
+      (74): (
+        id: (74),
         name: "Norte",
         scale: 100,
         kind: Elevation(
           direction: North,
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (71): (
-        id: (71),
+      (75): (
+        id: (75),
         name: "Sul",
         scale: 100,
         kind: Elevation(
           direction: South,
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (72): (
-        id: (72),
+      (76): (
+        id: (76),
         name: "Leste",
         scale: 100,
         kind: Elevation(
           direction: East,
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (73): (
-        id: (73),
+      (77): (
+        id: (77),
         name: "Oeste",
         scale: 100,
         kind: Elevation(
           direction: West,
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (74): (
-        id: (74),
+      (78): (
+        id: (78),
         name: "Legenda de tipos",
         scale: 50,
         kind: Legend(
@@ -3531,10 +4410,10 @@
             (35),
             (36),
             (37),
-            (43),
-            (44),
-            (45),
-            (46),
+            (38),
+            (39),
+            (40),
+            (41),
             (47),
             (48),
             (49),
@@ -3548,13 +4427,19 @@
             (57),
             (58),
             (59),
+            (60),
+            (61),
+            (62),
+            (63),
+            (94),
+            (95),
           ],
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (75): (
-        id: (75),
+      (79): (
+        id: (79),
         name: "Tabela de portas",
         scale: 1,
         kind: Schedule(
@@ -3567,11 +4452,11 @@
             hide_totals: false,
           ),
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (76): (
-        id: (76),
+      (80): (
+        id: (80),
         name: "Tabela de janelas",
         scale: 1,
         kind: Schedule(
@@ -3584,11 +4469,11 @@
             hide_totals: false,
           ),
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (77): (
-        id: (77),
+      (81): (
+        id: (81),
         name: "Tabela de paredes",
         scale: 1,
         kind: Schedule(
@@ -3601,11 +4486,11 @@
             hide_totals: false,
           ),
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (78): (
-        id: (78),
+      (82): (
+        id: (82),
         name: "Tabela de ambientes",
         scale: 1,
         kind: Schedule(
@@ -3618,11 +4503,11 @@
             hide_totals: false,
           ),
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (79): (
-        id: (79),
+      (83): (
+        id: (83),
         name: "Plantas",
         scale: 1,
         kind: Sheet(
@@ -3630,20 +4515,21 @@
           size: A3,
           viewports: [
             (
-              view: (65),
+              view: (69),
               center: (130.0, 160.0),
             ),
             (
-              view: (69),
+              view: (73),
               center: (320.0, 190.0),
             ),
           ],
+          title_block: Some((84)),
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (123): (
-        id: (123),
+      (136): (
+        id: (136),
         name: "Corte 1",
         scale: 50,
         kind: Section(
@@ -3651,11 +4537,11 @@
           end: (3.0, 7.5),
           depth: 10.0,
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
-      (124): (
-        id: (124),
+      (137): (
+        id: (137),
         name: "Elevação e corte",
         scale: 1,
         kind: Sheet(
@@ -3663,17 +4549,18 @@
           size: A3,
           viewports: [
             (
-              view: (71),
+              view: (75),
               center: (130.0, 170.0),
             ),
             (
-              view: (123),
+              view: (136),
               center: (310.0, 170.0),
             ),
           ],
+          title_block: Some((84)),
         ),
-        phase: (81),
-        phase_filter: Some((82)),
+        phase: (86),
+        phase_filter: Some((87)),
       ),
     },
     units: (
@@ -3710,31 +4597,31 @@
     joins: [],
     groups: {},
     systems: {
-      (60): (
+      (64): (
         name: "Água fria",
         code: "AF",
         kind: ColdWater,
         voltage: 127.0,
       ),
-      (61): (
+      (65): (
         name: "Água quente",
         code: "AQ",
         kind: HotWater,
         voltage: 127.0,
       ),
-      (62): (
+      (66): (
         name: "Esgoto sanitário",
         code: "ES",
         kind: Sanitary,
         voltage: 127.0,
       ),
-      (63): (
+      (67): (
         name: "Ventilação",
         code: "V",
         kind: Vent,
         voltage: 127.0,
       ),
-      (64): (
+      (68): (
         name: "Águas pluviais",
         code: "AP",
         kind: Rainwater,
@@ -3743,65 +4630,65 @@
     },
     phases: [
       (
-        id: (80),
+        id: (85),
         name: "Existente",
       ),
       (
-        id: (81),
+        id: (86),
         name: "Construção nova",
       ),
     ],
     phase_filters: {
-      (82): (
-        id: (82),
+      (87): (
+        id: (87),
         name: "Mostrar tudo",
         existing: Overridden,
         demolished: Overridden,
         new: ByCategory,
         temporary: Overridden,
       ),
-      (83): (
-        id: (83),
+      (88): (
+        id: (88),
         name: "Mostrar completo",
         existing: ByCategory,
         demolished: NotDisplayed,
         new: ByCategory,
         temporary: NotDisplayed,
       ),
-      (84): (
-        id: (84),
+      (89): (
+        id: (89),
         name: "Mostrar novo",
         existing: NotDisplayed,
         demolished: NotDisplayed,
         new: ByCategory,
         temporary: NotDisplayed,
       ),
-      (85): (
-        id: (85),
+      (90): (
+        id: (90),
         name: "Mostrar anterior + demolição",
         existing: Overridden,
         demolished: Overridden,
         new: NotDisplayed,
         temporary: NotDisplayed,
       ),
-      (86): (
-        id: (86),
+      (91): (
+        id: (91),
         name: "Mostrar anterior + novo",
         existing: Overridden,
         demolished: NotDisplayed,
         new: ByCategory,
         temporary: NotDisplayed,
       ),
-      (87): (
-        id: (87),
+      (92): (
+        id: (92),
         name: "Mostrar fase anterior",
         existing: Overridden,
         demolished: NotDisplayed,
         new: NotDisplayed,
         temporary: NotDisplayed,
       ),
-      (88): (
-        id: (88),
+      (93): (
+        id: (93),
         name: "Mostrar demolição + novo",
         existing: NotDisplayed,
         demolished: Overridden,
@@ -3809,6 +4696,89 @@
         temporary: Overridden,
       ),
     },
-    next_id: 125,
+    profiles: {
+      (96): (
+        id: (96),
+        uid: "0f20f88ac9d44213b5948351adb497c4",
+        name: "Rect 20x20",
+        material: Concrete,
+        shape: Rect(
+          b: 0.2,
+          h: 0.2,
+          chamfer: 0.0,
+        ),
+        catalog: None,
+        description: "",
+      ),
+      (97): (
+        id: (97),
+        uid: "82ddd286a79946048c00929c15f2f267",
+        name: "Ø30",
+        material: Concrete,
+        shape: Round(
+          d: 0.3,
+        ),
+        catalog: None,
+        description: "",
+      ),
+      (98): (
+        id: (98),
+        uid: "5b04ad32e9d647d6924cea4a658cedaf",
+        name: "Rect 15x40",
+        material: Concrete,
+        shape: Rect(
+          b: 0.15,
+          h: 0.4,
+          chamfer: 0.0,
+        ),
+        catalog: None,
+        description: "",
+      ),
+      (99): (
+        id: (99),
+        uid: "23c4f0b403fd4a78927343e402170146",
+        name: "I 200x200x9x15",
+        material: Steel,
+        shape: I(
+          d: 0.2,
+          bf: 0.2,
+          tw: 0.009,
+          tf: 0.015,
+          r: 0.0,
+        ),
+        catalog: None,
+        description: "",
+      ),
+      (100): (
+        id: (100),
+        uid: "77dcd734943840e390ada25540374fb3",
+        name: "Tube 150x150x6",
+        material: Steel,
+        shape: RectTube(
+          h: 0.15,
+          b: 0.15,
+          t: 0.006,
+          ro: 0.0,
+        ),
+        catalog: None,
+        description: "",
+      ),
+      (101): (
+        id: (101),
+        uid: "ed99d9fc0554402f99d361dea4a45d42",
+        name: "I 300x150x7.1x10.7",
+        material: Steel,
+        shape: I(
+          d: 0.3,
+          bf: 0.15,
+          tw: 0.0071,
+          tf: 0.0107,
+          r: 0.0,
+        ),
+        catalog: None,
+        description: "",
+      ),
+    },
+    next_id: 138,
   ),
 )

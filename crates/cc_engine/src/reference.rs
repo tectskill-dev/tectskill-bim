@@ -9,8 +9,12 @@ fn type_label(schema: &Value) -> String {
     if let Some(alternatives) = schema.get("anyOf").and_then(Value::as_array) {
         let labels: Vec<String> =
             alternatives.iter().filter(|a| a.get("type") != Some(&Value::from("null"))).map(type_label).collect();
-        let is_ref =
-            labels.len() == 2 && labels.contains(&"integer".to_string()) && labels.contains(&"string".to_string());
+        // Ids are 64-bit; a smaller integer or text is a value (a scale).
+        let id_number = alternatives.iter().any(|a| a.get("format") == Some(&Value::from("uint64")));
+        let is_ref = id_number
+            && labels.len() == 2
+            && labels.contains(&"integer".to_string())
+            && labels.contains(&"string".to_string());
         return if is_ref { "id or name".into() } else { labels.join(" or ") };
     }
     let types: Vec<&str> = match schema.get("type") {
@@ -60,8 +64,8 @@ pub fn markdown() -> String {
     let commands = catalog();
     let mut groups: Vec<&str> = Vec::new();
     for c in &commands {
-        if !groups.contains(&c.group) {
-            groups.push(c.group);
+        if !groups.contains(&c.group.as_str()) {
+            groups.push(&c.group);
         }
     }
     out.push_str("\n## Contents\n\n");

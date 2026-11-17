@@ -8,8 +8,28 @@ use crate::icons::{Badge, Icon};
 use crate::ribbon::{category_icon, dimension_icon};
 use crate::state::{AppState, PendingAction};
 use crate::t;
-use crate::tools::{DimensionMode, Tool};
+use crate::tools::{ComponentGroup, DimensionMode, Tool};
 use cc_core::{Category, ViewCategory};
+
+/// The user's two-letter keys by command id (empty: no keys), as
+/// Preferences → Shortcuts sets them; `preferences::sync_look` keeps it in
+/// step with the preferences.
+static KEY_OVERRIDES: std::sync::RwLock<std::collections::BTreeMap<String, String>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
+
+/// Use `keys` (command id → two letters, or empty) as the custom shortcuts.
+pub fn set_key_overrides(keys: &std::collections::BTreeMap<String, String>) {
+    if let Ok(mut current) = KEY_OVERRIDES.write()
+        && *current != *keys
+    {
+        current.clone_from(keys);
+    }
+}
+
+/// Two ASCII capital letters, the form of the keys typed in a view.
+pub fn is_letter_keys(keys: &str) -> bool {
+    keys.len() == 2 && keys.chars().all(|c| c.is_ascii_uppercase())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UiCommand {
@@ -20,23 +40,87 @@ pub enum UiCommand {
     SaveAs,
     CloseProject,
     ImportIfc,
+    /// Import a DWG or DXF drawing into the active view.
+    ImportCad,
+    /// Import a picture or an SVG drawing into the active view.
+    ImportImage,
+    /// Insert a SketchUp model into the open project.
+    ImportSkp,
+    /// Insert a Wavefront OBJ model into the open project.
+    ImportObj,
+    /// Insert a glTF model (.glb, .gltf) into the open project.
+    ImportGltf,
     ExportIfc,
     ExportPdf,
     ExportSvg,
     ExportImage,
+    ExportDxf,
     About,
     CheckUpdates,
+    Preferences,
     Undo,
     Redo,
     Default3D,
     /// The placement tool of a model category.
     Place(Category),
+    /// Start the column or beam tool on a type of the given structural material.
+    StructurePlace(Category, cc_core::StructuralMaterial),
     NewComponent,
     LoadComponent,
     ComponentLibrary,
+    /// Open the component modeling environment on the selected component.
+    EditComponent,
+    /// Environment tools and actions.
+    CompExtrusion,
+    CompRevolution,
+    CompSweep,
+    CompBlend,
+    CompRefPlane,
+    CompDimension,
+    CompEqual,
+    CompConnector,
+    CompSaveFile,
+    CompFinish,
+    CompCancel,
+    /// Sketch mode: drawing tools, picking the walls, finish and cancel.
+    SketchLine,
+    SketchRect,
+    SketchPolygon,
+    SketchPolygonOut,
+    SketchCircle,
+    SketchEllipse,
+    SketchArc3,
+    SketchArcCenter,
+    SketchArcTangent,
+    /// A measured point of a terrain (its elevation from the options bar).
+    SketchPoint,
+    SketchPickWalls,
+    SketchFinish,
+    SketchCancel,
+    /// Open the sketch of the selected floor, ceiling, roof or mass.
+    EditBoundary,
+    /// Open the profile of the selected sweep's type in a sketch.
+    EditProfile,
+    /// Open the active sheet's title block in the editor.
+    EditTitleBlock,
+    /// Create a title block from the standard layout and open it.
+    NewTitleBlock,
+    /// Sketch lines and arcs of a title block.
+    TbLines,
+    /// Place a text on a title block.
+    TbText,
+    /// Place a picture on a title block.
+    TbImage,
     Select,
     SelectInstances,
     ColumnsAtGrids,
+    /// Opens the Grid Frame dialog.
+    GridFrame,
+    SteelBuilding,
+    /// Opens the Wall Framing dialog for light steel.
+    LightSteelFrame,
+    /// Opens the Wall Framing dialog for wood.
+    WoodFrame,
     AlignGridEnds,
     BeamsOnGrids,
     BeamsBetweenColumns,
@@ -48,8 +132,11 @@ pub enum UiCommand {
     AnalyticalView,
     AnalyticalExport,
     Truss,
-    BracesX,
+    /// Brace the bay between two selected columns, else start the Bracing tool.
+    Bracing,
     TypicalRebar,
+    /// Place connections of a kind on the selected members, else the active level's.
+    Connection(cc_core::connection::ConnectionKind),
     RebarView,
     SteelSchedule,
     StructuralPlan,
@@ -64,9 +151,25 @@ pub enum UiCommand {
     MepConnect,
     MepSizing,
     PanelDiagram,
+    /// Place a communications or lightning protection device (its built-in type made on first use).
+    PlaceDeviceOf(cc_core::DeviceKind),
+    EarthRing,
+    LpsCheck,
+    Cabling,
+    CommunicationsPlan,
+    LightningPlan,
     Dimension(DimensionMode),
     Text,
+    LevelMarkPlan,
+    LevelMarkSection,
     AddLeader,
+    DetailLine,
+    FilledRegion,
+    MaskingRegion,
+    LineStyles,
+    BrowserOrganization,
+    DetailComponent,
+    CreateDetailComponent,
     Move,
     CopyElements,
     Rotate,
@@ -74,6 +177,11 @@ pub enum UiCommand {
     MirrorDraw,
     Array,
     Align,
+    PushPull,
+    /// Walls, floors and a roof from the selected masses.
+    MassWalls,
+    MassSlabs,
+    MassRoof,
     Offset,
     TrimCorner,
     TrimExtend,
@@ -82,8 +190,15 @@ pub enum UiCommand {
     Measure,
     JoinGeometry,
     UnjoinGeometry,
+    AttachTop,
+    DetachTop,
+    /// Paint faces with a material in a 3D view.
+    Paint,
+    RemovePaint,
     Group,
     Ungroup,
+    /// Explode the selected imported drawing into native 2D elements.
+    Explode,
     Pin,
     Unpin,
     Delete,
@@ -95,14 +210,22 @@ pub enum UiCommand {
     CeilingPlan,
     New3D,
     Section,
+    /// Draw a callout: a detail view of a region of the active view.
+    Callout,
     Elevations,
     Legend,
+    DraftingView,
     Schedule,
     Sheet,
     ZoomFit,
+    /// Close every view tab but the active one.
+    CloseInactiveViews,
     VisibilityGraphics,
     ViewFilters,
     ViewTemplates,
+    SunSettings,
+    /// Path trace the active 3D view in the render window.
+    Render,
     OverrideGraphics,
     HideInView,
     TempHide,
@@ -112,28 +235,48 @@ pub enum UiCommand {
     TempReset,
     TempPermanent,
     Phases,
+    DesignOptions,
+    ActiveOption,
     Demolish,
+    CurtainGrid,
     ProjectInfo,
+    SiteLocation,
     Units,
     Levels,
     Materials,
+    FillPatterns,
+    Profiles,
     MacroRecord,
     MacroRun,
+    /// Open or close the visual programming editor.
+    VisualProgramming,
+    Plugins,
+    PluginCommands,
     ToggleRibbon,
     CommandPalette,
 }
 
+/// Communications and lightning protection devices placed by a tool of their own.
+pub const DEVICE_TOOLS: [cc_core::DeviceKind; 4] = [
+    cc_core::DeviceKind::AirTerminal,
+    cc_core::DeviceKind::EarthElectrode,
+    cc_core::DeviceKind::Rack,
+    cc_core::DeviceKind::DataOutlet,
+];
+
 /// Model categories placed by a tool of their own (dimensions and text have their own commands).
-const PLACED: [Category; 17] = [
+const PLACED: [Category; 26] = [
     Category::Wall,
     Category::Door,
     Category::Window,
+    Category::Niche,
     Category::Floor,
     Category::Ceiling,
     Category::Roof,
     Category::Stair,
     Category::Ramp,
     Category::Railing,
+    Category::Sweep,
     Category::Room,
     Category::Component,
     Category::Grid,
@@ -142,6 +285,13 @@ const PLACED: [Category; 17] = [
     Category::Foundation,
     Category::Pipe,
     Category::Conduit,
+    Category::CableTray,
+    Category::Valve,
+    Category::LightningConductor,
+    Category::Mass,
+    Category::Shaft,
+    Category::Topography,
+    Category::Pad,
 ];
 
 impl UiCommand {
@@ -156,28 +306,92 @@ impl UiCommand {
             SaveAs,
             CloseProject,
             ImportIfc,
+            ImportCad,
+            ImportImage,
+            ImportSkp,
+            ImportObj,
+            ImportGltf,
             ExportIfc,
             ExportPdf,
             ExportSvg,
             ExportImage,
+            ExportDxf,
             About,
             CheckUpdates,
+            Preferences,
             Undo,
             Redo,
             Default3D,
         ];
         all.extend(PLACED.map(Place));
-        all.extend([NewComponent, LoadComponent, ComponentLibrary, Select, SelectInstances]);
-        all.extend([AlignGridEnds, ColumnsAtGrids, BeamsOnGrids, BeamsBetweenColumns, StructuralSchedules]);
+        all.extend([NewComponent, LoadComponent, ComponentLibrary, EditComponent, Select, SelectInstances]);
+        all.extend([
+            CompExtrusion,
+            CompRevolution,
+            CompSweep,
+            CompBlend,
+            CompRefPlane,
+            CompDimension,
+            CompEqual,
+            CompConnector,
+            CompSaveFile,
+            CompFinish,
+            CompCancel,
+        ]);
+        all.extend([
+            SketchLine,
+            SketchRect,
+            SketchPolygon,
+            SketchPolygonOut,
+            SketchCircle,
+            SketchEllipse,
+            SketchArc3,
+            SketchArcCenter,
+            SketchArcTangent,
+            SketchPoint,
+            SketchPickWalls,
+            SketchFinish,
+            SketchCancel,
+            EditBoundary,
+            EditProfile,
+            EditTitleBlock,
+            NewTitleBlock,
+            TbLines,
+            TbText,
+            TbImage,
+        ]);
+        all.extend([
+            AlignGridEnds,
+            ColumnsAtGrids,
+            GridFrame,
+            SteelBuilding,
+            LightSteelFrame,
+            WoodFrame,
+            BeamsOnGrids,
+            BeamsBetweenColumns,
+            StructuralSchedules,
+        ]);
         all.extend([FootingsUnderColumns, StripFootingsUnderWalls, FoundationSlab, SlabJoinSupports]);
-        all.extend([AnalyticalView, AnalyticalExport, Truss, BracesX, TypicalRebar, RebarView, SteelSchedule]);
+        all.extend([AnalyticalView, AnalyticalExport, Truss, Bracing, TypicalRebar, RebarView, SteelSchedule]);
+        all.extend(cc_core::connection::ConnectionKind::ALL.map(Connection));
         all.extend([StructuralPlan, NumberStructure, StructureTags]);
         all.extend([PlaceFixture, PlaceDevice, MepConnect, Systems, MepSizing, PlumbingPlan, ElectricalPlan]);
         all.extend([MepSchedules, PanelDiagram]);
+        all.extend(DEVICE_TOOLS.map(PlaceDeviceOf));
+        all.extend([EarthRing, LpsCheck, Cabling, CommunicationsPlan, LightningPlan]);
         all.extend(DimensionMode::ALL.map(Dimension));
         all.extend([
             Text,
+            LevelMarkPlan,
+            LevelMarkSection,
             AddLeader,
+            DetailLine,
+            FilledRegion,
+            MaskingRegion,
+            LineStyles,
+            BrowserOrganization,
+            DetailComponent,
+            CreateDetailComponent,
             Move,
             CopyElements,
             Rotate,
@@ -185,6 +399,10 @@ impl UiCommand {
             MirrorDraw,
             Array,
             Align,
+            PushPull,
+            MassWalls,
+            MassSlabs,
+            MassRoof,
             Offset,
             TrimCorner,
             TrimExtend,
@@ -193,8 +411,13 @@ impl UiCommand {
             Measure,
             JoinGeometry,
             UnjoinGeometry,
+            AttachTop,
+            DetachTop,
+            Paint,
+            RemovePaint,
             Group,
             Ungroup,
+            Explode,
             Pin,
             Unpin,
             Delete,
@@ -206,14 +429,19 @@ impl UiCommand {
             CeilingPlan,
             New3D,
             Section,
+            Callout,
             Elevations,
             Legend,
+            DraftingView,
             Schedule,
             Sheet,
             ZoomFit,
+            CloseInactiveViews,
             VisibilityGraphics,
             ViewFilters,
             ViewTemplates,
+            SunSettings,
+            Render,
             OverrideGraphics,
             HideInView,
             TempHide,
@@ -223,13 +451,22 @@ impl UiCommand {
             TempReset,
             TempPermanent,
             Phases,
+            DesignOptions,
+            ActiveOption,
             Demolish,
+            CurtainGrid,
             ProjectInfo,
+            SiteLocation,
             Units,
             Levels,
             Materials,
+            FillPatterns,
+            Profiles,
             MacroRecord,
             MacroRun,
+            VisualProgramming,
+            Plugins,
+            PluginCommands,
             ToggleRibbon,
             CommandPalette,
         ]);
@@ -238,7 +475,12 @@ impl UiCommand {
 
     /// The command a two-letter key sequence runs.
     pub fn from_keys(keys: &str) -> Option<UiCommand> {
-        Self::all().into_iter().find(|c| c.shortcut() == Some(keys))
+        Self::all().into_iter().find(|c| c.shortcut().as_deref() == Some(keys))
+    }
+
+    /// The command named `id` (see [`UiCommand::id`]).
+    pub fn from_id(id: &str) -> Option<UiCommand> {
+        Self::all().into_iter().find(|c| c.id() == id)
     }
 
     pub fn icon(self) -> Icon {
@@ -246,24 +488,61 @@ impl UiCommand {
         match self {
             Home => Icon::Home,
             New => Icon::New,
-            Open | ImportIfc => Icon::Open,
+            Open | ImportIfc | ImportSkp | ImportObj | ImportGltf => Icon::Open,
             Save => Icon::Save,
             SaveAs => Icon::SaveAs,
             CloseProject => Icon::CloseProject,
             ExportIfc => Icon::Export,
             ExportPdf | ExportSvg | Sheet => Icon::Sheet,
             ExportImage => Icon::Image,
+            ExportDxf => Icon::CadImport,
+            ImportCad => Icon::CadImport,
+            ImportImage => Icon::Image,
             About => Icon::About,
             CheckUpdates => Icon::Update,
+            Preferences => Icon::Settings,
             Undo => Icon::Undo,
             Redo => Icon::Redo,
             Default3D | New3D => Icon::View3D,
-            Place(category) => category_icon(category),
-            NewComponent | LoadComponent => Icon::Component,
+            Place(category) | StructurePlace(category, _) => category_icon(category),
+            NewComponent | LoadComponent | EditComponent => Icon::Component,
+            CompExtrusion => Icon::Extrusion,
+            CompRevolution => Icon::Revolution,
+            CompSweep => Icon::Sweep,
+            CompBlend => Icon::Blend,
+            CompRefPlane => Icon::RefPlane,
+            CompDimension => Icon::Dimension,
+            CompEqual => Icon::Equal,
+            CompConnector => Icon::Connector,
+            CompSaveFile => Icon::Save,
+            CompFinish => Icon::Finish,
+            CompCancel => Icon::Close,
+            SketchLine => Icon::DrawLine,
+            SketchRect => Icon::DrawRect,
+            SketchPolygon => Icon::DrawPolygon,
+            SketchPolygonOut => Icon::DrawPolygonOut,
+            SketchCircle => Icon::DrawCircle,
+            SketchEllipse => Icon::DrawEllipse,
+            SketchArc3 => Icon::DrawArc3,
+            SketchArcCenter => Icon::DrawArcCenter,
+            SketchArcTangent => Icon::DrawArcTangent,
+            SketchPoint => Icon::DrawPoint,
+            SketchPickWalls => Icon::Wall,
+            SketchFinish => Icon::Finish,
+            SketchCancel => Icon::Close,
+            EditBoundary => Icon::EditBoundary,
+            EditProfile => Icon::EditProfile,
+            EditTitleBlock | NewTitleBlock => Icon::TitleBlock,
+            TbLines => Icon::DrawLine,
+            TbText => Icon::Text,
+            TbImage => Icon::Image,
             ComponentLibrary => Icon::Library,
             Select => Icon::Select,
             SelectInstances => Icon::SelectInstances,
             ColumnsAtGrids => Icon::ColumnsAtGrids,
+            GridFrame => Icon::GridFrame,
+            SteelBuilding => Icon::SteelBuilding,
+            LightSteelFrame | WoodFrame => Icon::WallFraming,
             AlignGridEnds => Icon::AlignGridEnds,
             BeamsOnGrids => Icon::BeamsOnGrids,
             BeamsBetweenColumns => Icon::BeamsBetweenColumns,
@@ -274,8 +553,9 @@ impl UiCommand {
             SlabJoinSupports => Icon::SlabSupports,
             AnalyticalView | AnalyticalExport => Icon::Analytical,
             Truss => Icon::Truss,
-            BracesX => Icon::Brace,
+            Bracing => Icon::Brace,
             TypicalRebar => Icon::Rebar,
+            Connection(_) => Icon::Connection,
             RebarView => Icon::RebarView,
             SteelSchedule => Icon::Schedule,
             StructuralPlan => Icon::StructuralPlan,
@@ -283,6 +563,17 @@ impl UiCommand {
             StructureTags => Icon::StructureTags,
             PlaceFixture => Icon::PlumbingFixture,
             PlaceDevice => Icon::Outlet,
+            PlaceDeviceOf(d) => match d {
+                cc_core::DeviceKind::AirTerminal => Icon::AirTerminal,
+                cc_core::DeviceKind::EarthElectrode => Icon::EarthElectrode,
+                cc_core::DeviceKind::Rack => Icon::Rack,
+                _ => Icon::DataOutlet,
+            },
+            EarthRing => Icon::EarthRing,
+            LpsCheck => Icon::LpsCheck,
+            Cabling => Icon::Cabling,
+            LightningPlan => Icon::LightningPlan,
+            CommunicationsPlan => Icon::CommunicationsPlan,
             Systems => Icon::Systems,
             PlumbingPlan => Icon::PlumbingPlan,
             ElectricalPlan => Icon::ElectricalPlan,
@@ -292,6 +583,14 @@ impl UiCommand {
             PanelDiagram => Icon::Systems,
             Dimension(mode) => dimension_icon(mode),
             Text => Icon::Text,
+            DetailLine => Icon::DetailLine,
+            DetailComponent | CreateDetailComponent => Icon::DetailComponent,
+            FilledRegion => Icon::FilledRegion,
+            MaskingRegion => Icon::MaskingRegion,
+            LineStyles => Icon::LineStyles,
+            BrowserOrganization => Icon::BrowserOrganization,
+            LevelMarkPlan => Icon::LevelMarkPlan,
+            LevelMarkSection => Icon::LevelMarkSection,
             AddLeader => Icon::Leader,
             Move => Icon::Move,
             CopyElements | ClipboardCopy => Icon::Copy,
@@ -300,6 +599,10 @@ impl UiCommand {
             MirrorDraw => Icon::MirrorDraw,
             Array => Icon::Array,
             Align => Icon::Align,
+            PushPull => Icon::PushPull,
+            MassWalls => Icon::Wall,
+            MassSlabs => Icon::Floor,
+            MassRoof => Icon::Roof,
             Offset => Icon::Offset,
             TrimCorner => Icon::TrimCorner,
             TrimExtend => Icon::TrimExtend,
@@ -309,7 +612,10 @@ impl UiCommand {
             JoinGeometry => Icon::JoinGeometry,
             Group => Icon::Group,
             Ungroup => Icon::Ungroup,
+            Explode => Icon::Explode,
             UnjoinGeometry => Icon::UnjoinGeometry,
+            AttachTop | DetachTop => Icon::AttachTop,
+            Paint | RemovePaint => Icon::Paint,
             Pin => Icon::Pin,
             Unpin => Icon::Unpin,
             Delete => Icon::Delete,
@@ -319,25 +625,38 @@ impl UiCommand {
             FloorPlan => Icon::FloorPlan,
             CeilingPlan => Icon::CeilingPlan,
             Section => Icon::Section,
+            Callout => Icon::Callout,
             Elevations => Icon::Elevation,
             Legend => Icon::Legend,
+            DraftingView => Icon::DraftingView,
             Schedule => Icon::Schedule,
             ZoomFit => Icon::ZoomFit,
+            CloseInactiveViews => Icon::CloseViews,
             VisibilityGraphics => Icon::Visibility,
             ViewFilters => Icon::Filter,
             ViewTemplates => Icon::ViewTemplate,
+            SunSettings => Icon::Sun,
+            Render => Icon::Render,
             OverrideGraphics => Icon::OverrideGraphics,
             HideInView | TempHide | TempHideCategory | TempPermanent => Icon::Hide,
             TempIsolate | TempIsolateCategory => Icon::Isolate,
             TempReset => Icon::ResetTemporary,
             Phases => Icon::Phases,
+            DesignOptions => Icon::DesignOptions,
+            ActiveOption => Icon::ActiveOption,
             Demolish => Icon::Demolish,
+            CurtainGrid => Icon::CurtainGrid,
             ProjectInfo => Icon::ProjectInfo,
+            SiteLocation => Icon::SiteLocation,
             Units => Icon::Dimension,
             Levels => Icon::Levels,
             Materials => Icon::Materials,
+            FillPatterns => Icon::FillPatterns,
+            Profiles => Icon::Profiles,
             MacroRecord => Icon::MacroRecord,
             MacroRun => Icon::MacroRun,
+            VisualProgramming => Icon::Graph,
+            Plugins | PluginCommands => Icon::Plugin,
             ToggleRibbon => Icon::ChevronUp,
             CommandPalette => Icon::Search,
         }
@@ -347,13 +666,28 @@ impl UiCommand {
     pub fn badge(self) -> Option<Badge> {
         use UiCommand::*;
         match self {
-            NewComponent | FloorPlan | CeilingPlan | New3D | Legend | Schedule | StructuralSchedules | Sheet
-            | SteelSchedule | StructuralPlan | PlumbingPlan | ElectricalPlan | MepSchedules | PanelDiagram => {
-                Some(Badge::New)
+            NewComponent
+            | FloorPlan
+            | CeilingPlan
+            | New3D
+            | Legend
+            | DraftingView
+            | Schedule
+            | StructuralSchedules
+            | Sheet
+            | SteelSchedule
+            | StructuralPlan
+            | PlumbingPlan
+            | ElectricalPlan
+            | MepSchedules
+            | PanelDiagram
+            | NewTitleBlock
+            | CreateDetailComponent => Some(Badge::New),
+            ImportIfc | ImportCad | ImportImage | ImportSkp | ImportObj | ImportGltf | LoadComponent => {
+                Some(Badge::Import)
             }
-            ImportIfc | LoadComponent => Some(Badge::Import),
-            ExportPdf | ExportSvg | ExportImage | AnalyticalExport => Some(Badge::Export),
-            Delete => Some(Badge::Remove),
+            ExportPdf | ExportSvg | ExportImage | ExportDxf | AnalyticalExport => Some(Badge::Export),
+            Delete | DetachTop | RemovePaint => Some(Badge::Remove),
             _ => None,
         }
     }
@@ -369,22 +703,65 @@ impl UiCommand {
             SaveAs => t!("action-save-as"),
             CloseProject => t!("action-close-project"),
             ImportIfc => t!("action-import-ifc"),
+            ImportCad => t!("action-import-cad"),
+            ImportImage => t!("action-import-image"),
+            ImportSkp => t!("action-import-skp"),
+            ImportObj => t!("action-import-obj"),
+            ImportGltf => t!("action-import-gltf"),
             ExportIfc => t!("action-export-ifc"),
             ExportPdf => t!("action-export-pdf"),
             ExportSvg => t!("action-export-svg"),
             ExportImage => t!("action-export-image"),
+            ExportDxf => t!("action-export-dxf"),
             About => t!("dlg-about"),
             CheckUpdates => t!("action-check-updates"),
+            Preferences => t!("action-preferences"),
             Undo => t!("action-undo"),
             Redo => t!("action-redo"),
             Default3D => t!("action-default-3d"),
-            Place(category) => place_label(category),
+            Place(category) | StructurePlace(category, _) => place_label(category),
             NewComponent => t!("action-new-component"),
+            EditComponent => t!("action-edit-component"),
+            CompExtrusion => t!("comp-env-extrusion"),
+            CompRevolution => t!("comp-env-revolution"),
+            CompSweep => t!("comp-env-sweep"),
+            CompBlend => t!("comp-env-blend"),
+            CompRefPlane => t!("comp-env-ref-plane"),
+            CompDimension => t!("comp-env-dimension"),
+            CompEqual => t!("comp-env-equal"),
+            CompConnector => t!("comp-env-connector"),
+            CompSaveFile => t!("action-save-component"),
+            CompFinish => t!("comp-env-finish"),
+            CompCancel => t!("comp-env-cancel"),
+            SketchLine => t!("sketch-tool-line"),
+            SketchRect => t!("sketch-tool-rect"),
+            SketchPolygon => t!("sketch-tool-polygon"),
+            SketchPolygonOut => t!("sketch-tool-polygon-out"),
+            SketchCircle => t!("sketch-tool-circle"),
+            SketchEllipse => t!("sketch-tool-ellipse"),
+            SketchArc3 => t!("sketch-tool-arc3"),
+            SketchArcCenter => t!("sketch-tool-arc-center"),
+            SketchArcTangent => t!("sketch-tool-arc-tangent"),
+            SketchPoint => t!("sketch-tool-point"),
+            SketchPickWalls => t!("sketch-from-walls"),
+            SketchFinish => t!("sketch-finish-mode"),
+            SketchCancel => t!("sketch-cancel-mode"),
+            EditBoundary => t!("edit-boundary"),
+            EditProfile => t!("edit-profile"),
+            EditTitleBlock => t!("action-edit-title-block"),
+            NewTitleBlock => t!("action-new-title-block"),
+            TbLines => t!("tb-tool-lines"),
+            TbText => t!("tb-tool-text"),
+            TbImage => t!("tb-tool-image"),
             LoadComponent => t!("action-load-component"),
             ComponentLibrary => t!("action-component-library"),
             Select => t!("tool-select"),
             SelectInstances => t!("action-select-instances"),
             ColumnsAtGrids => t!("action-columns-at-grids"),
+            GridFrame => t!("action-grid-frame"),
+            SteelBuilding => t!("action-steel-building"),
+            LightSteelFrame => t!("action-light-steel-frame"),
+            WoodFrame => t!("action-wood-frame"),
             AlignGridEnds => t!("action-align-grid-ends"),
             BeamsOnGrids => t!("action-beams-on-grids"),
             BeamsBetweenColumns => t!("action-beams-between-columns"),
@@ -396,8 +773,9 @@ impl UiCommand {
             AnalyticalView => t!("action-analytical-view"),
             AnalyticalExport => t!("action-analytical-export"),
             Truss => t!("tool-truss"),
-            BracesX => t!("action-braces-x"),
+            Bracing => t!("action-bracing"),
             TypicalRebar => t!("action-rebar-typical"),
+            Connection(kind) => crate::i18n::tr(kind.key()),
             RebarView => t!("action-rebar-view"),
             SteelSchedule => t!("action-steel-schedule"),
             StructuralPlan => t!("action-structural-plan"),
@@ -405,6 +783,12 @@ impl UiCommand {
             StructureTags => t!("action-structure-tags"),
             PlaceFixture => t!("tool-fixture"),
             PlaceDevice => t!("tool-device"),
+            PlaceDeviceOf(d) => crate::i18n::tr(d.key()),
+            EarthRing => t!("action-earth-ring"),
+            LpsCheck => t!("dlg-lps-check"),
+            Cabling => t!("dlg-cabling"),
+            LightningPlan => t!("action-lightning-plan"),
+            CommunicationsPlan => t!("action-communications-plan"),
             Systems => t!("dlg-systems"),
             PlumbingPlan => t!("action-plumbing-plan"),
             ElectricalPlan => t!("action-electrical-plan"),
@@ -414,6 +798,15 @@ impl UiCommand {
             PanelDiagram => t!("action-panel-diagram"),
             Dimension(mode) => crate::i18n::tr(mode.key()),
             Text => t!("tool-text"),
+            DetailLine => t!("tool-detail-line"),
+            DetailComponent => t!("tool-detail-component"),
+            CreateDetailComponent => t!("action-create-detail-component"),
+            FilledRegion => t!("tool-filled-region"),
+            MaskingRegion => t!("tool-masking-region"),
+            LineStyles => t!("action-line-styles"),
+            BrowserOrganization => t!("action-browser-organization"),
+            LevelMarkPlan => t!("tool-level-mark-plan"),
+            LevelMarkSection => t!("tool-level-mark-section"),
             AddLeader => t!("tool-add-leader"),
             Move => t!("tool-move"),
             CopyElements => t!("tool-copy"),
@@ -422,6 +815,10 @@ impl UiCommand {
             MirrorDraw => t!("tool-mirror-draw"),
             Array => t!("tool-array"),
             Align => t!("tool-align"),
+            PushPull => t!("tool-push-pull"),
+            MassWalls => t!("action-mass-walls"),
+            MassSlabs => t!("action-mass-slabs"),
+            MassRoof => t!("action-mass-roof"),
             Offset => t!("tool-offset"),
             TrimCorner => t!("tool-trim-corner"),
             TrimExtend => t!("tool-trim-extend"),
@@ -431,7 +828,12 @@ impl UiCommand {
             JoinGeometry => t!("tool-join-geometry"),
             Group => t!("action-group"),
             Ungroup => t!("action-ungroup"),
+            Explode => t!("action-explode"),
             UnjoinGeometry => t!("tool-unjoin-geometry"),
+            AttachTop => t!("tool-attach-top"),
+            DetachTop => t!("tool-detach-top"),
+            Paint => t!("tool-paint"),
+            RemovePaint => t!("tool-remove-paint"),
             Pin => t!("action-pin"),
             Unpin => t!("action-unpin"),
             Delete => t!("action-delete"),
@@ -443,14 +845,19 @@ impl UiCommand {
             CeilingPlan => t!("view-new-ceiling-plan"),
             New3D => t!("view-new-3d"),
             Section => t!("tool-section"),
+            Callout => t!("tool-callout"),
             Elevations => t!("view-elevations"),
             Legend => t!("view-new-legend"),
+            DraftingView => t!("view-new-drafting"),
             Schedule => t!("view-new-schedule"),
             Sheet => t!("view-new-sheet"),
             ZoomFit => t!("action-zoom-fit"),
+            CloseInactiveViews => t!("action-close-inactive-views"),
             VisibilityGraphics => t!("action-visibility-graphics"),
             ViewFilters => t!("action-view-filters"),
             ViewTemplates => t!("action-view-templates"),
+            SunSettings => t!("action-sun-settings"),
+            Render => t!("action-render"),
             OverrideGraphics => t!("action-override-graphics"),
             HideInView => t!("action-hide-in-view"),
             TempHide => t!("action-temp-hide"),
@@ -460,14 +867,23 @@ impl UiCommand {
             TempReset => t!("action-temp-reset"),
             TempPermanent => t!("action-temp-permanent"),
             Phases => t!("action-phases"),
+            DesignOptions => t!("action-design-options"),
+            ActiveOption => crate::design_options_ui::active_label(state),
             Demolish => t!("tool-demolish"),
+            CurtainGrid => t!("tool-curtain-grid"),
             ProjectInfo => t!("dlg-project-info"),
+            SiteLocation => t!("dlg-site-location"),
             Units => t!("dlg-units"),
             Levels => t!("dlg-levels"),
             Materials => t!("dlg-materials"),
+            FillPatterns => t!("dlg-fill-patterns"),
+            Profiles => t!("cmd-profiles"),
             MacroRecord if state.session.is_recording() => t!("action-macro-stop"),
             MacroRecord => t!("action-macro-record"),
             MacroRun => t!("action-macro-run"),
+            VisualProgramming => t!("action-visual-programming"),
+            Plugins => t!("action-plugins"),
+            PluginCommands => t!("action-plugin-commands"),
             ToggleRibbon if state.ribbon_collapsed => t!("action-ribbon-expand"),
             ToggleRibbon => t!("action-ribbon-collapse"),
             CommandPalette => t!("action-command-palette"),
@@ -499,22 +915,65 @@ impl UiCommand {
             SaveAs => t!("cmd-desc-save-as"),
             CloseProject => t!("cmd-desc-close-project"),
             ImportIfc => t!("cmd-desc-import-ifc"),
+            ImportCad => t!("cmd-desc-import-cad"),
+            ImportImage => t!("cmd-desc-import-image"),
+            ImportSkp => t!("cmd-desc-import-skp"),
+            ImportObj => t!("cmd-desc-import-obj"),
+            ImportGltf => t!("cmd-desc-import-gltf"),
             ExportIfc => t!("cmd-desc-export-ifc"),
             ExportPdf => t!("cmd-desc-export-pdf"),
             ExportSvg => t!("cmd-desc-export-svg"),
             ExportImage => t!("cmd-desc-export-image"),
+            ExportDxf => t!("cmd-desc-export-dxf"),
             About => t!("cmd-desc-about"),
             CheckUpdates => t!("cmd-desc-check-updates"),
+            Preferences => t!("cmd-desc-preferences"),
             Undo => t!("cmd-desc-undo"),
             Redo => t!("cmd-desc-redo"),
             Default3D => t!("cmd-desc-default-3d"),
-            Place(category) => place_description(category),
+            Place(category) | StructurePlace(category, _) => place_description(category),
             NewComponent => t!("cmd-desc-new-component"),
+            EditComponent => t!("cmd-desc-edit-component"),
+            CompExtrusion => t!("cmd-desc-comp-extrusion"),
+            CompRevolution => t!("cmd-desc-comp-revolution"),
+            CompSweep => t!("cmd-desc-comp-sweep"),
+            CompBlend => t!("cmd-desc-comp-blend"),
+            CompRefPlane => t!("cmd-desc-comp-ref-plane"),
+            CompDimension => t!("cmd-desc-comp-dimension"),
+            CompEqual => t!("cmd-desc-comp-equal"),
+            CompConnector => t!("cmd-desc-comp-connector"),
+            CompSaveFile => t!("cmd-desc-comp-save"),
+            CompFinish => t!("cmd-desc-comp-finish"),
+            CompCancel => t!("cmd-desc-comp-cancel"),
+            SketchLine => t!("cmd-desc-sketch-tool-line"),
+            SketchRect => t!("cmd-desc-sketch-tool-rect"),
+            SketchPolygon => t!("cmd-desc-sketch-tool-polygon"),
+            SketchPolygonOut => t!("cmd-desc-sketch-tool-polygon-out"),
+            SketchCircle => t!("cmd-desc-sketch-tool-circle"),
+            SketchEllipse => t!("cmd-desc-sketch-tool-ellipse"),
+            SketchArc3 => t!("cmd-desc-sketch-tool-arc3"),
+            SketchArcCenter => t!("cmd-desc-sketch-tool-arc-center"),
+            SketchArcTangent => t!("cmd-desc-sketch-tool-arc-tangent"),
+            SketchPoint => t!("cmd-desc-sketch-tool-point"),
+            SketchPickWalls => t!("cmd-desc-sketch-from-walls"),
+            SketchFinish => t!("cmd-desc-sketch-finish-mode"),
+            SketchCancel => t!("cmd-desc-sketch-cancel-mode"),
+            EditBoundary => t!("cmd-desc-edit-boundary"),
+            EditProfile => t!("cmd-desc-edit-profile"),
+            EditTitleBlock => t!("cmd-desc-edit-title-block"),
+            NewTitleBlock => t!("cmd-desc-new-title-block"),
+            TbLines => t!("cmd-desc-tb-lines"),
+            TbText => t!("cmd-desc-tb-text"),
+            TbImage => t!("cmd-desc-tb-image"),
             LoadComponent => t!("cmd-desc-load-component"),
             ComponentLibrary => t!("cmd-desc-component-library"),
             Select => t!("cmd-desc-select"),
             SelectInstances => t!("cmd-desc-select-instances"),
             ColumnsAtGrids => t!("cmd-desc-columns-at-grids"),
+            GridFrame => t!("cmd-desc-grid-frame"),
+            SteelBuilding => t!("cmd-desc-steel-building"),
+            LightSteelFrame => t!("cmd-desc-light-steel-frame"),
+            WoodFrame => t!("cmd-desc-wood-frame"),
             AlignGridEnds => t!("cmd-desc-align-grid-ends"),
             BeamsOnGrids => t!("cmd-desc-beams-on-grids"),
             BeamsBetweenColumns => t!("cmd-desc-beams-between-columns"),
@@ -526,8 +985,15 @@ impl UiCommand {
             AnalyticalView => t!("cmd-desc-analytical-view"),
             AnalyticalExport => t!("cmd-desc-analytical-export"),
             Truss => t!("cmd-desc-truss"),
-            BracesX => t!("cmd-desc-braces-x"),
+            Bracing => t!("cmd-desc-bracing"),
             TypicalRebar => t!("cmd-desc-rebar-typical"),
+            Connection(kind) => match kind {
+                cc_core::connection::ConnectionKind::BasePlate => t!("cmd-desc-base-plate"),
+                cc_core::connection::ConnectionKind::EndPlate => t!("cmd-desc-end-plate"),
+                cc_core::connection::ConnectionKind::FinPlate => t!("cmd-desc-fin-plate"),
+                cc_core::connection::ConnectionKind::TimberBolts => t!("cmd-desc-timber-bolts"),
+                cc_core::connection::ConnectionKind::Hanger => t!("cmd-desc-hanger"),
+            },
             RebarView => t!("cmd-desc-rebar-view"),
             SteelSchedule => t!("cmd-desc-steel-schedule"),
             StructuralPlan => t!("cmd-desc-structural-plan"),
@@ -535,6 +1001,17 @@ impl UiCommand {
             StructureTags => t!("cmd-desc-structure-tags"),
             PlaceFixture => t!("cmd-desc-fixture"),
             PlaceDevice => t!("cmd-desc-device"),
+            PlaceDeviceOf(d) => match d {
+                cc_core::DeviceKind::AirTerminal => t!("cmd-desc-air-terminal"),
+                cc_core::DeviceKind::EarthElectrode => t!("cmd-desc-earth-electrode"),
+                cc_core::DeviceKind::Rack => t!("cmd-desc-rack"),
+                _ => t!("cmd-desc-data-outlet"),
+            },
+            EarthRing => t!("cmd-desc-earth-ring"),
+            LpsCheck => t!("cmd-desc-lps-check"),
+            Cabling => t!("cmd-desc-cabling"),
+            LightningPlan => t!("cmd-desc-lightning-plan"),
+            CommunicationsPlan => t!("cmd-desc-communications-plan"),
             Systems => t!("cmd-desc-systems"),
             PlumbingPlan => t!("cmd-desc-plumbing-plan"),
             ElectricalPlan => t!("cmd-desc-electrical-plan"),
@@ -544,10 +1021,20 @@ impl UiCommand {
             PanelDiagram => t!("cmd-desc-panel-diagram"),
             Dimension(DimensionMode::Aligned) => t!("cmd-desc-dim-aligned"),
             Dimension(DimensionMode::Linear) => t!("cmd-desc-dim-linear"),
+            Dimension(DimensionMode::Ordinate) => t!("cmd-desc-dim-ordinate"),
             Dimension(DimensionMode::Angular) => t!("cmd-desc-dim-angular"),
             Dimension(DimensionMode::Radial) => t!("cmd-desc-dim-radial"),
             Dimension(DimensionMode::Diameter) => t!("cmd-desc-dim-diameter"),
             Text => t!("cmd-desc-text"),
+            DetailLine => t!("cmd-desc-detail-line"),
+            DetailComponent => t!("cmd-desc-detail-component"),
+            CreateDetailComponent => t!("cmd-desc-create-detail-component"),
+            FilledRegion => t!("cmd-desc-filled-region"),
+            MaskingRegion => t!("cmd-desc-masking-region"),
+            LineStyles => t!("cmd-desc-line-styles"),
+            BrowserOrganization => t!("cmd-desc-browser-organization"),
+            LevelMarkPlan => t!("cmd-desc-level-mark-plan"),
+            LevelMarkSection => t!("cmd-desc-level-mark-section"),
             AddLeader => t!("hint-add-leader-button"),
             Move => t!("cmd-desc-move"),
             CopyElements => t!("cmd-desc-copy-elements"),
@@ -556,6 +1043,10 @@ impl UiCommand {
             MirrorDraw => t!("cmd-desc-mirror-draw"),
             Array => t!("cmd-desc-array"),
             Align => t!("cmd-desc-align"),
+            PushPull => t!("cmd-desc-push-pull"),
+            MassWalls => t!("cmd-desc-mass-walls"),
+            MassSlabs => t!("cmd-desc-mass-slabs"),
+            MassRoof => t!("cmd-desc-mass-roof"),
             Offset => t!("cmd-desc-offset"),
             TrimCorner => t!("cmd-desc-trim-corner"),
             TrimExtend => t!("cmd-desc-trim-extend"),
@@ -565,7 +1056,12 @@ impl UiCommand {
             JoinGeometry => t!("cmd-desc-join-geometry"),
             Group => t!("cmd-desc-group"),
             Ungroup => t!("cmd-desc-ungroup"),
+            Explode => t!("cmd-desc-explode"),
             UnjoinGeometry => t!("cmd-desc-unjoin-geometry"),
+            AttachTop => t!("cmd-desc-attach-top"),
+            DetachTop => t!("cmd-desc-detach-top"),
+            Paint => t!("cmd-desc-paint"),
+            RemovePaint => t!("cmd-desc-remove-paint"),
             Pin => t!("cmd-desc-pin"),
             Unpin => t!("cmd-desc-unpin"),
             Delete => t!("cmd-desc-delete"),
@@ -577,14 +1073,19 @@ impl UiCommand {
             CeilingPlan => t!("cmd-desc-ceiling-plan"),
             New3D => t!("cmd-desc-new-3d"),
             Section => t!("cmd-desc-section"),
+            Callout => t!("cmd-desc-callout"),
             Elevations => t!("cmd-desc-elevations"),
             Legend => t!("cmd-desc-legend"),
+            DraftingView => t!("cmd-desc-drafting"),
             Schedule => t!("cmd-desc-schedule"),
             Sheet => t!("cmd-desc-sheet"),
             ZoomFit => t!("cmd-desc-zoom-fit"),
+            CloseInactiveViews => t!("cmd-desc-close-inactive-views"),
             VisibilityGraphics => t!("cmd-desc-visibility-graphics"),
             ViewFilters => t!("cmd-desc-view-filters"),
             ViewTemplates => t!("cmd-desc-view-templates"),
+            SunSettings => t!("cmd-desc-sun-settings"),
+            Render => t!("cmd-desc-render"),
             OverrideGraphics => t!("cmd-desc-override-graphics"),
             HideInView => t!("cmd-desc-hide-in-view"),
             TempHide => t!("cmd-desc-temp-hide"),
@@ -594,20 +1095,56 @@ impl UiCommand {
             TempReset => t!("cmd-desc-temp-reset"),
             TempPermanent => t!("cmd-desc-temp-permanent"),
             Phases => t!("cmd-desc-phases"),
+            DesignOptions => t!("cmd-desc-design-options"),
+            ActiveOption => t!("hint-active-option"),
             Demolish => t!("cmd-desc-demolish"),
+            CurtainGrid => t!("cmd-desc-curtain-grid"),
             ProjectInfo => t!("cmd-desc-project-info"),
+            SiteLocation => t!("cmd-desc-site-location"),
             Units => t!("cmd-desc-units"),
             Levels => t!("cmd-desc-levels"),
             Materials => t!("cmd-desc-materials"),
+            FillPatterns => t!("cmd-desc-fill-patterns"),
+            Profiles => t!("cmd-profiles-desc"),
             MacroRecord => t!("hint-macro-record"),
             MacroRun => t!("hint-macro-run"),
+            VisualProgramming => t!("cmd-desc-visual-programming"),
+            Plugins => t!("cmd-desc-plugins"),
+            PluginCommands => t!("cmd-desc-plugin-commands"),
             ToggleRibbon => t!("cmd-desc-toggle-ribbon"),
             CommandPalette => t!("cmd-desc-command-palette"),
         }
     }
 
-    /// Keyboard shortcut: a Ctrl chord or a two-letter sequence typed in a view.
-    pub fn shortcut(self) -> Option<&'static str> {
+    /// Keyboard shortcut: a Ctrl chord or a two-letter sequence typed in a
+    /// view; two-letter keys follow the user's choices (Preferences →
+    /// Shortcuts).
+    pub fn shortcut(self) -> Option<String> {
+        let default = self.default_shortcut();
+        if !self.customizable() {
+            return default.map(str::to_string);
+        }
+        let custom = KEY_OVERRIDES.read().ok().and_then(|keys| keys.get(&self.id()).cloned());
+        match custom {
+            Some(keys) if keys.is_empty() => None,
+            Some(keys) => Some(keys),
+            None => default.map(str::to_string),
+        }
+    }
+
+    /// A stable name of the command, under which its custom keys are kept.
+    pub fn id(self) -> String {
+        format!("{self:?}")
+    }
+
+    /// Whether the user may change the keys: two-letter ones and commands
+    /// without keys (Ctrl chords, Delete and Esc are fixed).
+    pub fn customizable(self) -> bool {
+        self.default_shortcut().is_none_or(is_letter_keys)
+    }
+
+    /// The keys the command has before any change by the user.
+    pub fn default_shortcut(self) -> Option<&'static str> {
         use UiCommand::*;
         Some(match self {
             New => "Ctrl+N",
@@ -625,7 +1162,12 @@ impl UiCommand {
             Place(Category::Roof) => "TE",
             Place(Category::Stair) => "ST",
             Place(Category::Ramp) => "RP",
+            Place(Category::Mass) => "MS",
+            Place(Category::Shaft) => "SF",
+            Place(Category::Topography) => "TS",
+            Place(Category::Pad) => "PD",
             Place(Category::Railing) => "RA",
+            Place(Category::Sweep) => "SW",
             Place(Category::Room) => "RM",
             Place(Category::Component) => "CM",
             Place(Category::Grid) => "GR",
@@ -634,6 +1176,11 @@ impl UiCommand {
             Place(Category::Foundation) => "FT",
             Place(Category::Pipe) => "PI",
             Place(Category::Conduit) => "CN",
+            Place(Category::CableTray) => "TY",
+            Place(Category::Valve) => "VL",
+            Place(Category::LightningConductor) => "LC",
+            PlaceDeviceOf(cc_core::DeviceKind::AirTerminal) => "AT",
+            PlaceDeviceOf(cc_core::DeviceKind::DataOutlet) => "DO",
             Select => "MD",
             SelectInstances => "SA",
             Group => "GP",
@@ -641,6 +1188,9 @@ impl UiCommand {
             Ungroup => "UG",
             Dimension(DimensionMode::Aligned) => "DI",
             Text => "TT",
+            DetailLine => "DL",
+            DetailComponent => "DC",
+            FilledRegion => "FR",
             Move => "MV",
             CopyElements => "CO",
             Rotate => "RO",
@@ -648,6 +1198,7 @@ impl UiCommand {
             MirrorDraw => "DM",
             Array => "AR",
             Align => "AL",
+            PushPull => "PP",
             Offset => "OF",
             TrimCorner => "TR",
             TrimExtend => "TX",
@@ -669,7 +1220,9 @@ impl UiCommand {
             TempIsolateCategory => "IC",
             TempReset => "HR",
             Demolish => "DE",
+            Paint => "PA",
             ToggleRibbon => "Ctrl+F1",
+            Preferences => "Ctrl+,",
             CommandPalette => "Ctrl+Shift+P",
             _ => return None,
         })
@@ -682,13 +1235,22 @@ impl UiCommand {
             New => "project_new",
             Open => "project_open",
             Save | SaveAs => "project_save",
+            VisualProgramming => "graph_run",
             ImportIfc => "ifc_import",
+            ImportCad => "cad_import",
+            ImportImage => "image_import",
+            ImportSkp => "skp_import",
+            ImportObj => "obj_import",
+            ImportGltf => "gltf_import",
             ExportIfc => "ifc_export",
             ExportPdf | ExportSvg => "sheet_export",
-            ExportImage => "view_export",
+            ExportImage | ExportDxf => "view_export",
             Undo => "undo",
             SelectInstances => "elements_list",
             ColumnsAtGrids => "columns_at_grids",
+            GridFrame => "grid_frame_create",
+            SteelBuilding => "steel_building_create",
+            LightSteelFrame | WoodFrame => "wall_framing_create",
             AlignGridEnds => "grids_align_ends",
             BeamsOnGrids => "beams_on_grids",
             BeamsBetweenColumns => "beams_between_columns",
@@ -696,12 +1258,18 @@ impl UiCommand {
             Place(Category::Wall) => "wall_create",
             Place(Category::Door) => "door_create",
             Place(Category::Window) => "window_create",
+            Place(Category::Niche) => "niche_create",
             Place(Category::Floor) => "floor_create",
             Place(Category::Ceiling) => "ceiling_create",
             Place(Category::Roof) => "roof_create",
             Place(Category::Stair) => "stair_create",
             Place(Category::Ramp) => "ramp_create",
+            Place(Category::Mass) => "mass_create",
+            Place(Category::Shaft) => "shaft_create",
+            Place(Category::Topography) => "topography_create",
+            Place(Category::Pad) => "pad_create",
             Place(Category::Railing) => "railing_create",
+            Place(Category::Sweep) => "sweep_create",
             Place(Category::Room) => "room_create",
             Place(Category::Grid) => "grid_create",
             Place(Category::Column) => "column_create",
@@ -709,6 +1277,17 @@ impl UiCommand {
             Place(Category::Foundation) => "footing_create",
             Place(Category::Pipe) => "pipe_create",
             Place(Category::Conduit) => "conduit_create",
+            Place(Category::CableTray) => "cable_tray_create",
+            Place(Category::Valve) => "valve_place",
+            Place(Category::LightningConductor) => "lps_conductor_create",
+            PlaceDeviceOf(cc_core::DeviceKind::AirTerminal) => "air_terminal_place",
+            PlaceDeviceOf(cc_core::DeviceKind::EarthElectrode) => "earth_electrode_place",
+            PlaceDeviceOf(cc_core::DeviceKind::Rack) => "rack_place",
+            PlaceDeviceOf(_) => "data_outlet_place",
+            EarthRing => "earth_ring_create",
+            LpsCheck => "lps_check",
+            Cabling => "cabling_list",
+            LightningPlan | CommunicationsPlan => "view_create",
             PlaceFixture | PlaceDevice => "component_place",
             Systems => "system_set",
             MepConnect => "mep_connect",
@@ -722,23 +1301,48 @@ impl UiCommand {
             AnalyticalView => "view_create",
             AnalyticalExport => "analytical_export",
             Truss => "truss_create",
-            BracesX => "braces_between_columns",
+            Bracing => "bracing_create",
             TypicalRebar => "rebar_typical",
+            Connection(_) => "connections_create",
             RebarView | SteelSchedule | StructuralPlan => "view_create",
             NumberStructure => "structure_number",
             StructureTags => "view_set",
             Place(_) => "component_place",
             NewComponent => "component_create",
+            EditComponent => "component_get",
+            CompExtrusion | CompRevolution | CompSweep | CompBlend => "component_piece_add",
+            CompRefPlane => "component_ref_plane_add",
+            CompDimension => "component_dimension_add",
+            CompEqual => "component_equal_add",
+            CompConnector => "component_connector_add",
+            SketchFinish | EditBoundary => "sketch_set",
+            EditProfile => "sweep_profile_set",
+            EditTitleBlock => "component_get",
+            NewTitleBlock => "title_block_create",
+            TbLines | TbText | TbImage => "component_sheet_piece_add",
+            CompSaveFile => "component_save",
             LoadComponent => "component_load",
             ComponentLibrary => "component_library_list",
             Dimension(_) => "dimension_create",
             Text => "text_create",
+            DetailLine => "detail_line_create",
+            DetailComponent => "detail_component_place",
+            CreateDetailComponent => "detail_component_create",
+            FilledRegion => "filled_region_create",
+            MaskingRegion => "masking_region_create",
+            LineStyles => "line_styles_list",
+            BrowserOrganization => "browser_schemes_list",
+            LevelMarkPlan | LevelMarkSection => "level_mark_create",
             AddLeader => "text_add_leader",
             Move => "elements_move",
             CopyElements | Array => "elements_copy",
             Rotate => "elements_rotate",
             MirrorPick | MirrorDraw => "elements_mirror",
             Align => "element_align",
+            PushPull => "mass_face_move",
+            MassWalls => "mass_walls_create",
+            MassSlabs => "mass_slabs_create",
+            MassRoof => "mass_roof_create",
             Offset => "element_offset",
             TrimCorner => "trim_corner",
             TrimExtend => "trim_extend",
@@ -748,26 +1352,39 @@ impl UiCommand {
             Measure => "measure",
             Group => "group_create",
             Ungroup => "group_ungroup",
+            Explode => "cad_explode",
             UnjoinGeometry => "geometry_unjoin",
+            AttachTop | DetachTop => "wall_attach",
+            Paint => "paint",
+            RemovePaint => "paint_remove",
             Pin | Unpin => "elements_pin",
             Delete | Cut => "elements_delete",
             Paste => "elements_paste",
             ClipboardCopy => "elements_export",
             MatchType => "elements_set_type",
-            FloorPlan | CeilingPlan | New3D | Section | Legend | Schedule | Sheet => "view_create",
+            FloorPlan | CeilingPlan | New3D | Section | Legend | DraftingView | Schedule | Sheet => "view_create",
+            Callout => "callout_create",
             ProjectInfo => "project_info_set",
+            SiteLocation => "site_set",
             VisibilityGraphics => "view_graphics_set",
             ViewFilters => "filter_set",
             ViewTemplates => "template_set",
+            SunSettings => "view_set",
+            Render => "view_render",
             OverrideGraphics => "element_override_set",
             HideInView => "element_hide_in_view",
             TempHide | TempIsolate | TempHideCategory | TempIsolateCategory | TempReset => "view_temporary",
             TempPermanent => "view_temporary_apply",
             Phases => "phase_set",
+            DesignOptions => "option_set",
+            ActiveOption => "option_active_set",
             Demolish => "elements_demolish",
+            CurtainGrid => "curtain_grid_set",
             Units => "units_set",
             Levels => "level_set",
             Materials => "material_set",
+            FillPatterns => "fill_patterns_list",
+            Profiles => "profiles_list",
             _ => return None,
         })
     }
@@ -775,25 +1392,108 @@ impl UiCommand {
     /// Why the command cannot run now, or `None` when it can.
     pub fn unavailable(self, state: &AppState) -> Option<String> {
         use UiCommand::*;
+        if let StructurePlace(category, _) = self {
+            return Place(category).unavailable(state);
+        }
         let project_open = state.project_open && !state.show_home;
         match self {
-            Home | New | Open | ImportIfc | About | CheckUpdates | ToggleRibbon | CommandPalette => return None,
+            Home | New | Open | ImportIfc | About | CheckUpdates | Preferences | ToggleRibbon | CommandPalette => {
+                return None;
+            }
             _ if !project_open => return Some(t!("why-no-project")),
             _ => {}
         }
         let has_sel = !state.selection.is_empty();
         let project = state.project();
+        let walls = || {
+            state.selection.iter().filter_map(|id| project.element(*id)).filter_map(|e| match &e.kind {
+                cc_core::ElementKind::Wall(w) => Some(w),
+                _ => None,
+            })
+        };
         match self {
+            AttachTop if walls().next().is_none() => Some(t!("why-select-walls")),
+            DetachTop if !walls().any(|w| w.attach_top.is_some()) => Some(t!("why-select-attached-walls")),
+            Undo if state.sketch.as_ref().is_some_and(|s| !s.can_undo()) => Some(t!("why-nothing-undo")),
+            Redo if state.sketch.as_ref().is_some_and(|s| !s.can_redo()) => Some(t!("why-nothing-redo")),
+            Undo | Redo if state.sketch.is_some() => None,
             Undo if !state.session.doc.can_undo() => Some(t!("why-nothing-undo")),
             Redo if !state.session.doc.can_redo() => Some(t!("why-nothing-redo")),
+            SketchLine | SketchRect | SketchPolygon | SketchPolygonOut | SketchCircle | SketchEllipse | SketchArc3
+            | SketchArcCenter | SketchArcTangent | SketchPoint | SketchPickWalls | SketchFinish | SketchCancel
+                if state.sketch.is_none() =>
+            {
+                Some(t!("why-no-sketch"))
+            }
+            SketchPoint if !crate::sketch_mode::takes_points(state) => Some(t!("why-sketch-points")),
+            SketchPickWalls
+                if state.active_level().is_none()
+                    || crate::component_sketch::piece(state).is_some()
+                    || crate::title_block_env::is_sheet_sketch(state) =>
+            {
+                Some(t!("msg-open-plan"))
+            }
+            // In a sketch the modify tools act on its curves.
+            Move | CopyElements | Rotate | MirrorPick | MirrorDraw | Offset | TrimCorner | TrimExtend | Split
+                if state.sketch.is_some() =>
+            {
+                let needs_selection = sketch_draw(self).is_some_and(|d| d.on_selection());
+                state
+                    .sketch
+                    .as_ref()
+                    .is_some_and(|s| needs_selection && s.selected.is_empty() && !self.selected(state))
+                    .then(|| t!("msg-select-first"))
+            }
+            Delete if state.sketch.is_some() => {
+                state.sketch.as_ref().is_some_and(|s| s.nothing_selected()).then(|| t!("msg-select-first"))
+            }
+            EditBoundary if crate::sketch_mode::boundary_target(state).is_none() => Some(t!("why-select-outline")),
+            EditProfile if crate::profile_sketch::target(state).is_none() => Some(t!("why-select-sweep")),
+            Profiles if crate::profiles_dialog::section_sketch_open(state) => Some(t!("why-profile-sketch-open")),
+            TbLines | TbText | TbImage if !crate::title_block_env::is_open(state) => Some(t!("why-title-block-editor")),
+            EditTitleBlock if crate::title_block_env::sheet_title_block(state).is_none() => {
+                Some(t!("why-sheet-title-block"))
+            }
             ExportPdf | ExportSvg if actions::active_sheet(state).is_none() => Some(t!("hint-export-sheet")),
             ExportImage if actions::image_view(state).is_none() => Some(t!("hint-export-image")),
-            // A project without a ramp type gets one when the tool starts.
-            Place(category) if category != Category::Ramp && Tool::for_category(project, category).is_none() => {
+            ExportDxf if actions::image_view(state).is_none() => Some(t!("hint-export-dxf")),
+            ImportCad | ImportImage | DetailLine | FilledRegion | MaskingRegion | DetailComponent
+                if crate::cad_ui::cad_view(state).is_none() =>
+            {
+                Some(t!("why-cad-view"))
+            }
+            DetailComponent if Tool::for_category(project, Category::DetailComponent).is_none() => {
+                Some(t!("why-no-detail-component"))
+            }
+            CreateDetailComponent if crate::detail_component_ui::selection(state).is_none() => {
+                Some(t!("why-select-detail"))
+            }
+            // Pads grade a terrain of the plan's level.
+            Place(Category::Pad) if !actions::terrain_on_level(state) => Some(t!("why-no-terrain")),
+            // Valves go on pipes.
+            Place(Category::Valve) if project.elements_of(Category::Pipe).next().is_none() => Some(t!("why-no-pipes")),
+            // A project without a ramp, mass, sweep, shaft, terrain, pad, cable tray or valve type gets
+            // one when the tool starts.
+            Place(category)
+                if !matches!(
+                    category,
+                    Category::Ramp
+                        | Category::Mass
+                        | Category::Sweep
+                        | Category::Shaft
+                        | Category::Topography
+                        | Category::Pad
+                        | Category::CableTray
+                        | Category::Valve
+                ) && Tool::for_category(project, category).is_none() =>
+            {
                 Some(t!("msg-no-type"))
             }
             Dimension(_) if Tool::for_category(project, Category::Dimension).is_none() => Some(t!("msg-no-type")),
             Text if Tool::for_category(project, Category::Text).is_none() => Some(t!("msg-no-type")),
+            LevelMarkPlan if !active_view_is(state, cc_core::View::is_plan) => Some(t!("msg-open-plan")),
+            Callout if !active_view_is(state, |v| v.kind.croppable()) => Some(t!("why-callout-view")),
+            LevelMarkSection if !active_view_is(state, |v| v.projection().is_some()) => Some(t!("why-open-section")),
             AddLeader if crate::ribbon::selected_text(state).is_none() && !self.selected(state) => {
                 Some(t!("why-select-text"))
             }
@@ -803,7 +1503,7 @@ impl UiCommand {
             Pin | Unpin | Delete | Cut | ClipboardCopy | SelectInstances if !has_sel => Some(t!("msg-select-first")),
             SelectInstances if state.active_view.is_none() => Some(t!("why-no-view")),
             Group if state.selection.len() < 2 => Some(t!("msg-group-two")),
-            ColumnsAtGrids if crate::actions::grids_for(state).len() < 2 => Some(t!("msg-grids-two")),
+            ColumnsAtGrids | GridFrame if crate::actions::grids_for(state).len() < 2 => Some(t!("msg-grids-two")),
             AlignGridEnds if crate::actions::reference_grid(state).is_none() => Some(t!("why-select-one-grid")),
             BeamsOnGrids if crate::actions::grids_for(state).is_empty() => Some(t!("why-no-grids")),
             BeamsBetweenColumns if crate::actions::selected_columns(state).len() < 2 => Some(t!("msg-columns-two")),
@@ -818,10 +1518,18 @@ impl UiCommand {
             FoundationSlab if crate::tools::foundation_type(project, cc_core::FoundationKind::Slab).is_none() => {
                 Some(t!("msg-no-type"))
             }
-            Truss if project.default_type(Category::Beam).is_none() => Some(t!("msg-no-type")),
-            BracesX if crate::actions::selected_columns(state).len() != 2 => Some(t!("msg-columns-two-exactly")),
+            Truss if state.prefs.structure_material == cc_core::StructuralMaterial::Concrete => {
+                Some(t!("msg-truss-material"))
+            }
+            Bracing if state.prefs.structure_material == cc_core::StructuralMaterial::Concrete => {
+                Some(t!("msg-bracing-material"))
+            }
             TypicalRebar if project.default_type(Category::Rebar).is_none() => Some(t!("msg-no-rebar-type")),
-            StructuralPlan | PlumbingPlan | ElectricalPlan if project.levels.is_empty() => Some(t!("why-no-levels")),
+            StructuralPlan | PlumbingPlan | ElectricalPlan | CommunicationsPlan | LightningPlan | EarthRing
+                if project.levels.is_empty() =>
+            {
+                Some(t!("why-no-levels"))
+            }
             PlaceFixture if crate::tools::mep_component_type(project, false).is_none() => Some(t!("msg-no-type")),
             PanelDiagram if crate::systems_dialog::panels(state).is_empty() => Some(t!("why-no-panel")),
             PlaceDevice if crate::tools::mep_component_type(project, true).is_none() => Some(t!("msg-no-type")),
@@ -834,11 +1542,17 @@ impl UiCommand {
                 Some(t!("why-select-fixtures"))
             }
             StructureTags if crate::actions::active_floor_plan(state).is_none() => Some(t!("msg-plan-only")),
+            PushPull if !crate::modify3d::active_3d(state) => Some(t!("why-push-pull-3d")),
+            MassWalls | MassSlabs | MassRoof if crate::actions::selected_masses(state).is_empty() => {
+                Some(t!("why-select-mass"))
+            }
             Ungroup if !state.selection.iter().any(|id| project.group_of(*id).is_some()) => Some(t!("why-no-group")),
+            Explode if crate::cad_ui::selected_import(state).is_none() => Some(t!("why-select-cad")),
             Paste if state.clipboard.is_empty() => Some(t!("why-clipboard-empty")),
             FloorPlan | CeilingPlan if project.levels.is_empty() => Some(t!("why-no-levels")),
             Elevations if project.views_of(ViewCategory::Elevation).next().is_none() => Some(t!("why-no-elevations")),
             ZoomFit | Measure if state.active_view.is_none() => Some(t!("why-no-view")),
+            CloseInactiveViews if state.open_tabs <= 1 => Some(t!("why-one-view-open")),
             VisibilityGraphics | OverrideGraphics | HideInView | TempHide | TempIsolate | TempHideCategory
             | TempIsolateCategory | TempReset | TempPermanent
                 if graphics_view(state).is_none() =>
@@ -854,11 +1568,23 @@ impl UiCommand {
                 Some(t!("msg-nothing-temporary"))
             }
             Demolish if phase_view(state).is_none() => Some(t!("why-no-phase-view")),
+            SunSettings if !active_view_is(state, |v| v.kind.takes_sun()) => Some(t!("why-sun-view")),
+            Render if !active_view_is(state, |v| v.kind.takes_render()) => Some(t!("why-render-view")),
+            ActiveOption if state.project().option_sets.is_empty() => Some(t!("why-no-option-sets")),
+            Paint | RemovePaint if !crate::modify3d::active_3d(state) => Some(t!("why-paint-3d")),
+            Paint if state.project().materials.is_empty() => Some(t!("why-no-materials")),
             // These pick ends and sides on plan linework; the other modify tools work in 3D too.
             TrimCorner | TrimExtend | Split | Offset | ToggleJoin if crate::modify3d::active_3d(state) => {
                 Some(t!("msg-plan-only"))
             }
             MacroRun if state.session.is_recording() => Some(t!("why-recording")),
+            EditComponent if crate::component_env::target_type(state).is_none() => Some(t!("why-select-component")),
+            CompExtrusion | CompRevolution | CompSweep | CompBlend | CompRefPlane | CompDimension | CompEqual
+            | CompConnector | CompSaveFile | CompFinish | CompCancel
+                if state.component_env.is_none() =>
+            {
+                Some(t!("why-no-component-env"))
+            }
             _ => None,
         }
     }
@@ -868,17 +1594,67 @@ impl UiCommand {
         use UiCommand::*;
         let tool = &state.tool;
         match self {
-            Place(Category::Component) => {
-                matches!(tool, Tool::Component { type_id } if mep_kind(state, *type_id).is_none())
-            }
+            Place(Category::Component) => is_component_group(state, ComponentGroup::Generic),
             Place(category) => tool.category() == Some(category) && !matches!(tool, Tool::Section | Tool::Truss { .. }),
-            PlaceFixture => matches!(tool, Tool::Component { type_id } if mep_kind(state, *type_id) == Some(false)),
-            PlaceDevice => matches!(tool, Tool::Component { type_id } if mep_kind(state, *type_id) == Some(true)),
+            PlaceFixture => is_component_group(state, ComponentGroup::Fixture),
+            PlaceDevice => is_component_group(state, ComponentGroup::Device),
+            PlaceDeviceOf(device) => is_component_group(state, ComponentGroup::Own(device)),
             Truss => matches!(tool, Tool::Truss { .. }),
+            Bracing => matches!(tool, Tool::Bracing { .. }),
             StructureTags => crate::actions::active_floor_plan(state).is_some_and(|(_, tags)| tags),
+            Select if state.sketch.is_some() => {
+                state.sketch.as_ref().is_some_and(|s| s.draw == crate::sketch_mode::Draw::Select)
+            }
+            Select if state.component_env.is_some() => {
+                state.component_env.as_ref().is_some_and(|e| e.tool == crate::component_env::EnvTool::Select)
+            }
             Select => *tool == Tool::Select,
+            TbLines => crate::title_block_env::is_sheet_sketch(state),
+            TbText => state.component_env.as_ref().is_some_and(|e| e.tool == crate::component_env::EnvTool::SheetText),
+            TbImage => state
+                .component_env
+                .as_ref()
+                .is_some_and(|e| matches!(e.tool, crate::component_env::EnvTool::SheetImage { .. })),
+            SketchLine | SketchRect | SketchPolygon | SketchPolygonOut | SketchCircle | SketchEllipse | SketchArc3
+            | SketchArcCenter | SketchArcTangent | SketchPoint => {
+                state.sketch.as_ref().is_some_and(|s| sketch_draw(self) == Some(s.draw))
+            }
+            Move | CopyElements | Rotate | MirrorPick | MirrorDraw | Offset | TrimCorner | TrimExtend | Split
+                if state.sketch.is_some() =>
+            {
+                state.sketch.as_ref().is_some_and(|s| sketch_draw(self) == Some(s.draw))
+            }
+            CompExtrusion | CompRevolution | CompSweep | CompBlend => {
+                let want = match self {
+                    CompExtrusion => crate::component_sketch::PieceKind::Extrusion,
+                    CompRevolution => crate::component_sketch::PieceKind::Revolution,
+                    CompSweep => crate::component_sketch::PieceKind::Sweep,
+                    _ => crate::component_sketch::PieceKind::Blend,
+                };
+                crate::component_sketch::piece(state).is_some_and(|p| p.kind == want)
+            }
+            CompRefPlane => state
+                .component_env
+                .as_ref()
+                .is_some_and(|e| matches!(e.tool, crate::component_env::EnvTool::RefPlane { .. })),
+            CompConnector => {
+                state.component_env.as_ref().is_some_and(|e| matches!(e.tool, crate::component_env::EnvTool::Connector))
+            }
+            CompEqual => state
+                .component_env
+                .as_ref()
+                .is_some_and(|e| matches!(e.tool, crate::component_env::EnvTool::Equal { .. })),
+            CompDimension => state
+                .component_env
+                .as_ref()
+                .is_some_and(|e| matches!(e.tool, crate::component_env::EnvTool::Dimension { .. })),
             Dimension(mode) => matches!(tool, Tool::Dimension { mode: m, .. } if *m == mode),
             Text => matches!(tool, Tool::Text { .. }),
+            DetailLine => *tool == Tool::DetailLine,
+            DetailComponent => matches!(tool, Tool::DetailComponent { .. }),
+            FilledRegion => matches!(tool, Tool::Sketch { category: Category::FilledRegion, .. }),
+            MaskingRegion => matches!(tool, Tool::Sketch { category: Category::MaskingRegion, .. }),
+            LevelMarkPlan | LevelMarkSection => matches!(tool, Tool::LevelMark { .. }),
             AddLeader => matches!(tool, Tool::AddLeader { .. }),
             Move => *tool == Tool::Move,
             CopyElements => *tool == Tool::Copy,
@@ -887,6 +1663,7 @@ impl UiCommand {
             MirrorDraw => *tool == Tool::Mirror { draw: true },
             Array => *tool == Tool::Array,
             Align => *tool == Tool::Align,
+            PushPull => *tool == Tool::PushPull,
             Offset => *tool == Tool::Offset,
             TrimCorner => *tool == Tool::TrimCorner,
             TrimExtend => *tool == Tool::TrimExtend,
@@ -895,12 +1672,19 @@ impl UiCommand {
             Measure => *tool == Tool::Measure,
             JoinGeometry => *tool == Tool::JoinGeometry { unjoin: false },
             UnjoinGeometry => *tool == Tool::JoinGeometry { unjoin: true },
+            AttachTop => *tool == Tool::AttachTop,
+            Paint => *tool == Tool::Paint { remove: false },
+            RemovePaint => *tool == Tool::Paint { remove: true },
             Paste => *tool == Tool::Paste,
             MatchType => *tool == Tool::MatchType,
             Demolish => *tool == Tool::Demolish,
+            CurtainGrid => *tool == Tool::CurtainGrid,
             Section => *tool == Tool::Section,
+            Callout => *tool == Tool::Callout,
             FoundationSlab => matches!(tool, Tool::Sketch { category: Category::Foundation, .. }),
             MacroRecord => state.session.is_recording(),
+            ActiveOption => state.project().active_option().is_some(),
+            VisualProgramming => state.graph.open,
             ToggleRibbon => state.ribbon_collapsed,
             _ => false,
         }
@@ -923,17 +1707,19 @@ pub fn phase_view(state: &AppState) -> Option<cc_core::ViewId> {
     })
 }
 
-/// The active view when it has visibility/graphics (plans, elevations, sections, 3D).
+/// The active view when it has visibility/graphics (plans, elevations, sections, 3D, drafting views).
 pub fn graphics_view(state: &AppState) -> Option<cc_core::ViewId> {
-    state.active_view.filter(|v| state.project().view(*v).is_some_and(|v| cc_core::ViewTemplate::applies_to(&v.kind)))
+    state.active_view.filter(|v| state.project().view(*v).is_some_and(|v| v.kind.has_graphics()))
 }
 
-/// Whether a component type is an electrical device (`Some(true)`), a plumbing fixture or neither.
-fn mep_kind(state: &AppState, type_id: cc_core::ElementTypeId) -> Option<bool> {
-    match state.project().element_type(type_id).map(|t| &t.data) {
-        Some(cc_core::TypeData::Component { def, .. }) => def.mep.map(|m| matches!(m, cc_core::MepData::Device { .. })),
-        _ => None,
-    }
+/// Whether the component tool is placing types of `group`.
+fn is_component_group(state: &AppState, group: ComponentGroup) -> bool {
+    matches!(state.tool, Tool::Component { type_id } if crate::tools::component_group(state.project(), type_id) == group)
+}
+
+/// Whether the active view is one `test` accepts.
+fn active_view_is(state: &AppState, test: impl Fn(&cc_core::View) -> bool) -> bool {
+    state.active_view.and_then(|v| state.project().view(v)).is_some_and(test)
 }
 
 fn place_label(category: Category) -> String {
@@ -941,12 +1727,14 @@ fn place_label(category: Category) -> String {
         Category::Wall => t!("tool-wall"),
         Category::Door => t!("tool-door"),
         Category::Window => t!("tool-window"),
+        Category::Niche => t!("tool-niche"),
         Category::Floor => t!("tool-floor"),
         Category::Ceiling => t!("tool-ceiling"),
         Category::Roof => t!("tool-roof"),
         Category::Stair => t!("tool-stair"),
         Category::Ramp => t!("tool-ramp"),
         Category::Railing => t!("tool-railing"),
+        Category::Sweep => t!("tool-sweep"),
         Category::Room => t!("tool-room"),
         Category::Grid => t!("tool-grid"),
         Category::Column => t!("tool-column"),
@@ -955,9 +1743,31 @@ fn place_label(category: Category) -> String {
         Category::Rebar => t!("category-rebar"),
         Category::Pipe => t!("tool-pipe"),
         Category::Conduit => t!("tool-conduit"),
+        Category::CableTray => t!("tool-cable-tray"),
+        Category::Valve => t!("tool-valve"),
+        Category::LightningConductor => t!("tool-lightning-conductor"),
         Category::Dimension => t!("tool-dimension"),
         Category::Text => t!("tool-text"),
+        Category::DetailLine => t!("tool-detail-line"),
+        Category::DetailComponent => t!("tool-detail-component"),
+        Category::FilledRegion => t!("tool-filled-region"),
+        Category::MaskingRegion => t!("tool-masking-region"),
+        Category::LevelMark => t!("tool-level-mark"),
+        Category::BarTag => t!("category-bar-tag"),
+        Category::TitleBlock => t!("category-title-block"),
         Category::Component => t!("tool-component"),
+        Category::CadImport => t!("action-import-cad"),
+        Category::Mass => t!("tool-mass"),
+        Category::Shaft => t!("tool-shaft"),
+        Category::SteelBuilding => t!("category-steel-building"),
+        Category::Truss => t!("category-truss"),
+        Category::Bracing => t!("category-bracing"),
+        Category::Connection => t!("category-connection"),
+        Category::WallFraming => t!("category-wall-framing"),
+        Category::Topography => t!("tool-topography"),
+        Category::Pad => t!("tool-pad"),
+        // Made by commands (pile caps, `pile_create`), not drawn.
+        Category::Pile => t!("category-pile"),
     }
 }
 
@@ -966,12 +1776,14 @@ fn place_description(category: Category) -> String {
         Category::Wall => t!("cmd-desc-wall"),
         Category::Door => t!("cmd-desc-door"),
         Category::Window => t!("cmd-desc-window"),
+        Category::Niche => t!("cmd-desc-niche"),
         Category::Floor => t!("cmd-desc-floor"),
         Category::Ceiling => t!("cmd-desc-ceiling"),
         Category::Roof => t!("cmd-desc-roof"),
         Category::Stair => t!("cmd-desc-stair"),
         Category::Ramp => t!("cmd-desc-ramp"),
         Category::Railing => t!("cmd-desc-railing"),
+        Category::Sweep => t!("cmd-desc-sweep"),
         Category::Room => t!("cmd-desc-room"),
         Category::Grid => t!("cmd-desc-grid"),
         Category::Column => t!("cmd-desc-column"),
@@ -980,9 +1792,30 @@ fn place_description(category: Category) -> String {
         Category::Rebar => t!("cmd-desc-rebar-typical"),
         Category::Pipe => t!("cmd-desc-pipe"),
         Category::Conduit => t!("cmd-desc-conduit"),
+        Category::CableTray => t!("cmd-desc-cable-tray"),
+        Category::Valve => t!("cmd-desc-valve"),
+        Category::LightningConductor => t!("cmd-desc-lightning-conductor"),
         Category::Dimension => t!("cmd-desc-dim-aligned"),
         Category::Text => t!("cmd-desc-text"),
+        Category::DetailLine => t!("cmd-desc-detail-line"),
+        Category::DetailComponent => t!("cmd-desc-detail-component"),
+        Category::FilledRegion => t!("cmd-desc-filled-region"),
+        Category::MaskingRegion => t!("cmd-desc-masking-region"),
+        Category::LevelMark => t!("cmd-desc-level-mark-plan"),
+        Category::BarTag => t!("category-bar-tag"),
+        Category::TitleBlock => t!("category-title-block"),
         Category::Component => t!("cmd-desc-component"),
+        Category::CadImport => t!("cmd-desc-import-cad"),
+        Category::Mass => t!("cmd-desc-mass"),
+        Category::Shaft => t!("cmd-desc-shaft"),
+        Category::SteelBuilding => t!("cmd-desc-steel-building"),
+        Category::Truss => t!("cmd-desc-truss"),
+        Category::Bracing => t!("cmd-desc-bracing"),
+        Category::Connection => t!("category-connection"),
+        Category::WallFraming => t!("cmd-desc-light-steel-frame"),
+        Category::Topography => t!("cmd-desc-topography"),
+        Category::Pad => t!("cmd-desc-pad"),
+        Category::Pile => t!("category-pile"),
     }
 }
 
@@ -996,13 +1829,40 @@ pub fn invoke(state: &mut AppState, ctx: &egui::Context, command: UiCommand) {
 
 /// Run `command` (callers check availability first). Menu commands act on
 /// their most likely choice: the active level, the first elevation.
+/// The drawing tool a sketch command picks.
+fn sketch_draw(command: UiCommand) -> Option<crate::sketch_mode::Draw> {
+    use crate::sketch_mode::Draw;
+    Some(match command {
+        UiCommand::SketchLine => Draw::Line,
+        UiCommand::SketchRect => Draw::Rect,
+        UiCommand::SketchPolygon => Draw::Polygon,
+        UiCommand::SketchPolygonOut => Draw::PolygonOut,
+        UiCommand::SketchCircle => Draw::Circle,
+        UiCommand::SketchEllipse => Draw::Ellipse,
+        UiCommand::SketchArc3 => Draw::Arc3,
+        UiCommand::SketchArcCenter => Draw::ArcCenter,
+        UiCommand::SketchArcTangent => Draw::ArcTangent,
+        UiCommand::SketchPoint => Draw::Point,
+        UiCommand::Move => Draw::Move,
+        UiCommand::CopyElements => Draw::Copy,
+        UiCommand::Rotate => Draw::Rotate,
+        UiCommand::MirrorPick => Draw::MirrorPick,
+        UiCommand::MirrorDraw => Draw::MirrorAxis,
+        UiCommand::Offset => Draw::Offset,
+        UiCommand::TrimCorner => Draw::TrimCorner,
+        UiCommand::TrimExtend => Draw::TrimExtend,
+        UiCommand::Split => Draw::Split,
+        _ => return None,
+    })
+}
+
 pub fn run(state: &mut AppState, ctx: &egui::Context, command: UiCommand) {
     use UiCommand::*;
     // A ribbon panel shown over the views closes once a command runs.
     state.ribbon_peek = false;
     match command {
         Home => state.show_home = true,
-        New => actions::guarded(state, PendingAction::New),
+        New => crate::new_project_dialog::open(state),
         Open => actions::guarded(state, PendingAction::Open),
         Save => {
             actions::save(state, false);
@@ -1012,29 +1872,105 @@ pub fn run(state: &mut AppState, ctx: &egui::Context, command: UiCommand) {
         }
         CloseProject => actions::guarded(state, PendingAction::Close),
         ImportIfc => actions::guarded(state, PendingAction::ImportIfc),
+        ImportCad => crate::cad_ui::import_cad(state),
+        ImportImage => crate::cad_ui::import_image(state),
+        ImportSkp => actions::import_skp(state),
+        ImportObj => crate::obj_ui::import_obj(state),
+        ImportGltf => crate::obj_ui::import_gltf(state),
         ExportIfc => actions::export_ifc(state),
         ExportPdf => actions::export_sheet(state, actions::SheetFormat::Pdf),
         ExportSvg => actions::export_sheet(state, actions::SheetFormat::Svg),
         ExportImage => actions::export_image(state),
+        ExportDxf => actions::export_dxf(state),
         About => state.dialogs.about = true,
         CheckUpdates => state.updates.start(ctx, true),
-        Undo => {
-            actions::run_command(state, cc_engine::commands::project::Undo {});
-        }
-        Redo => {
-            actions::run_command(state, cc_engine::commands::project::Redo {});
-        }
+        Preferences => crate::preferences::open(state, crate::preferences::Section::General),
+        Undo => match state.sketch.as_mut() {
+            Some(s) => s.undo(),
+            None => {
+                // While a chain is drawn, undo steps it back and the tool goes on;
+                // another tool halfway through a pick undoes nothing.
+                if !crate::tools::chain_back(state) && state.interaction.is_idle() {
+                    actions::run_command(state, cc_engine::commands::project::Undo {});
+                }
+            }
+        },
+        Redo => match state.sketch.as_mut() {
+            Some(s) => s.redo(),
+            None => {
+                if !crate::tools::chain_forward(state) {
+                    actions::run_command(state, cc_engine::commands::project::Redo {});
+                }
+            }
+        },
         Default3D => actions::open_default_3d(state),
         Place(category) => actions::activate_category_tool(state, category),
-        NewComponent => {
-            state.dialogs.component_editor = Some(crate::component_editor::Editor::new_component());
-        }
+        StructurePlace(category, material) => actions::structure_place(state, category, material),
+        NewComponent => crate::new_component_dialog::open(state),
         LoadComponent => actions::load_component(state),
+        EditComponent => {
+            if let Some(t) = crate::component_env::target_type(state) {
+                crate::component_env::open(state, t);
+            }
+        }
+        CompExtrusion => crate::component_sketch::start(state, crate::component_sketch::PieceKind::Extrusion),
+        CompRevolution => crate::component_sketch::start(state, crate::component_sketch::PieceKind::Revolution),
+        CompSweep => crate::component_sketch::start(state, crate::component_sketch::PieceKind::Sweep),
+        CompBlend => crate::component_sketch::start(state, crate::component_sketch::PieceKind::Blend),
+        CompRefPlane => {
+            crate::component_env::set_tool(state, crate::component_env::EnvTool::RefPlane { first: None });
+        }
+        CompDimension => {
+            crate::component_env::set_tool(state, crate::component_env::EnvTool::Dimension { first: None });
+        }
+        CompConnector => crate::component_env::set_tool(state, crate::component_env::EnvTool::Connector),
+        CompEqual => crate::component_env::set_tool(
+            state,
+            crate::component_env::EnvTool::Equal { picked: Vec::new(), view: None },
+        ),
+        CompSaveFile => crate::component_env::save_file(state),
+        CompFinish => crate::component_env::finish(state),
+        CompCancel => crate::component_env::cancel(state),
         ComponentLibrary => crate::library::open(state),
+        Select if state.sketch.is_some() => crate::sketch_mode::set_draw(state, crate::sketch_mode::Draw::Select),
+        Select if state.component_env.is_some() => {
+            crate::component_env::set_tool(state, crate::component_env::EnvTool::Select);
+        }
         Select => state.set_tool(Tool::Select),
+        SketchLine | SketchRect | SketchPolygon | SketchPolygonOut | SketchCircle | SketchEllipse | SketchArc3
+        | SketchArcCenter | SketchArcTangent | SketchPoint => {
+            if let Some(draw) = sketch_draw(command) {
+                crate::sketch_mode::set_draw(state, draw);
+            }
+        }
+        Move | CopyElements | Rotate | MirrorPick | MirrorDraw | Offset | TrimCorner | TrimExtend | Split
+            if state.sketch.is_some() =>
+        {
+            if let Some(draw) = sketch_draw(command) {
+                crate::sketch_mode::set_draw(state, draw);
+            }
+        }
+        SketchPickWalls => crate::sketch_mode::pick_walls(state),
+        SketchFinish => crate::sketch_mode::finish(state),
+        SketchCancel => crate::sketch_mode::cancel(state),
+        EditBoundary => crate::sketch_mode::edit_boundary(state),
+        EditProfile => crate::profile_sketch::edit_selected(state),
+        EditTitleBlock => {
+            if let Some(id) = actions::active_sheet(state) {
+                crate::title_block_env::edit_sheet(state, id);
+            }
+        }
+        NewTitleBlock => crate::title_block_env::new_title_block(state),
+        TbLines => crate::title_block_env::start_lines(state),
+        TbText => crate::component_env::set_tool(state, crate::component_env::EnvTool::SheetText),
+        TbImage => crate::title_block_env::pick_image(state),
         SelectInstances => crate::actions::select_instances(state),
         Group => crate::actions::group_selection(state),
         ColumnsAtGrids => crate::actions::columns_at_grids(state),
+        GridFrame => crate::grid_frame_ui::open(state),
+        SteelBuilding => crate::steel_building_ui::open(state),
+        LightSteelFrame => crate::wall_framing_ui::open(state, cc_core::wall_framing::FramingSystem::LightSteel),
+        WoodFrame => crate::wall_framing_ui::open(state, cc_core::wall_framing::FramingSystem::Wood),
         AlignGridEnds => crate::actions::align_grid_ends(state),
         BeamsOnGrids => crate::actions::beams_on_grids(state),
         BeamsBetweenColumns => crate::actions::beams_between_columns(state),
@@ -1050,13 +1986,15 @@ pub fn run(state: &mut AppState, ctx: &egui::Context, command: UiCommand) {
         AnalyticalView => crate::actions::open_analytical_view(state),
         AnalyticalExport => crate::actions::export_analytical(state),
         Truss => {
-            if let Some(type_id) = state.project().default_type(Category::Beam) {
-                state.set_tool(Tool::Truss { type_id });
+            let material = state.prefs.structure_material;
+            if material != cc_core::StructuralMaterial::Concrete {
+                state.set_tool(Tool::Truss { material });
                 state.message = t!("hint-truss");
             }
         }
-        BracesX => crate::actions::braces_x(state),
+        Bracing => crate::bracing_ui::start(state),
         TypicalRebar => crate::actions::typical_rebar(state),
+        Connection(kind) => crate::connection_ui::place(state, kind),
         RebarView => crate::actions::open_rebar_view(state),
         SteelSchedule => {
             actions::new_schedule(state, Category::Rebar);
@@ -1077,6 +2015,12 @@ pub fn run(state: &mut AppState, ctx: &egui::Context, command: UiCommand) {
         PanelDiagram => crate::actions::open_panel_diagram(state),
         PlumbingPlan => crate::actions::open_mep_plan(state, cc_core::MepDiscipline::Plumbing),
         ElectricalPlan => crate::actions::open_mep_plan(state, cc_core::MepDiscipline::Electrical),
+        CommunicationsPlan => crate::actions::open_mep_plan(state, cc_core::MepDiscipline::Communications),
+        LightningPlan => crate::actions::open_mep_plan(state, cc_core::MepDiscipline::Lightning),
+        PlaceDeviceOf(device) => crate::lps_cabling_ui::device_tool(state, device),
+        EarthRing => crate::lps_cabling_ui::earth_ring(state),
+        LpsCheck => state.dialogs.lps_check = true,
+        Cabling => state.dialogs.cabling = true,
         MepSchedules => {
             actions::new_schedule(state, Category::Pipe);
             actions::new_schedule(state, Category::Conduit);
@@ -1086,6 +2030,7 @@ pub fn run(state: &mut AppState, ctx: &egui::Context, command: UiCommand) {
             actions::new_schedule(state, Category::Beam);
         }
         Ungroup => crate::actions::ungroup_selection(state),
+        Explode => crate::cad_ui::explode_selected(state),
         Dimension(mode) => {
             if let Some(Tool::Dimension { type_id, .. }) = Tool::for_category(state.project(), Category::Dimension) {
                 state.set_tool(Tool::Dimension { type_id, mode });
@@ -1096,6 +2041,32 @@ pub fn run(state: &mut AppState, ctx: &egui::Context, command: UiCommand) {
             if let Some(tool) = Tool::for_category(state.project(), Category::Text) {
                 state.set_tool(tool);
                 state.message = t!("hint-text");
+            }
+        }
+        DetailLine => {
+            state.set_tool(Tool::DetailLine);
+            state.message = t!("hint-detail-line");
+        }
+        DetailComponent => {
+            if let Some(tool) = Tool::for_category(state.project(), Category::DetailComponent) {
+                state.set_tool(tool);
+                state.message = t!("hint-detail-component");
+            }
+        }
+        CreateDetailComponent => crate::detail_component_ui::create_from_selection(state),
+        FilledRegion => crate::region_ui::start(state, Category::FilledRegion),
+        MaskingRegion => crate::region_ui::start(state, Category::MaskingRegion),
+        LineStyles => crate::line_styles_dialog::open(state),
+        BrowserOrganization => crate::browser_org_dialog::open(state),
+        LevelMarkPlan | LevelMarkSection => {
+            // A project gets its level mark type with its first mark.
+            if Tool::for_category(state.project(), Category::LevelMark).is_none() {
+                let command = cc_engine::commands::level_mark::LevelMarkTypeCreate::default();
+                crate::actions::run_command(state, command);
+            }
+            if let Some(tool) = Tool::for_category(state.project(), Category::LevelMark) {
+                state.set_tool(tool);
+                state.message = t!("hint-level-mark");
             }
         }
         AddLeader => {
@@ -1111,6 +2082,13 @@ pub fn run(state: &mut AppState, ctx: &egui::Context, command: UiCommand) {
         MirrorDraw => crate::modify::start(state, Tool::Mirror { draw: true }),
         Array => crate::modify::start(state, Tool::Array),
         Align => crate::modify::start_pick(state, Tool::Align),
+        MassWalls => crate::actions::from_masses(state, "walls"),
+        MassSlabs => crate::actions::from_masses(state, "slabs"),
+        MassRoof => crate::actions::from_masses(state, "roof"),
+        PushPull => {
+            state.set_tool(Tool::PushPull);
+            state.message = t!("hint-push-pull");
+        }
         Offset => crate::modify::start_pick(state, Tool::Offset),
         TrimCorner => crate::modify::start_pick(state, Tool::TrimCorner),
         TrimExtend => crate::modify::start_pick(state, Tool::TrimExtend),
@@ -1124,9 +2102,16 @@ pub fn run(state: &mut AppState, ctx: &egui::Context, command: UiCommand) {
             state.set_tool(Tool::JoinGeometry { unjoin: command == UnjoinGeometry });
             state.message = t!("hint-join-pick");
         }
+        AttachTop => crate::modify::start_attach(state),
+        DetachTop => crate::modify::detach_tops(state),
+        Paint => crate::paint_ui::start(state, false),
+        RemovePaint => crate::paint_ui::start(state, true),
         Pin => crate::modify::set_pinned(state, true),
         Unpin => crate::modify::set_pinned(state, false),
-        Delete => state.delete_selection(),
+        Delete => match state.sketch.as_mut() {
+            Some(s) => s.delete_selected(),
+            None => state.delete_selection(),
+        },
         Paste => crate::clipboard::paste(state),
         Cut => crate::clipboard::cut(ctx, state),
         ClipboardCopy => {
@@ -1146,6 +2131,10 @@ pub fn run(state: &mut AppState, ctx: &egui::Context, command: UiCommand) {
             state.set_tool(Tool::Section);
             state.message = t!("msg-section-hint");
         }
+        Callout => {
+            state.set_tool(Tool::Callout);
+            state.message = t!("msg-callout-hint");
+        }
         Elevations => {
             let first = state.project().views_of(ViewCategory::Elevation).next().map(|v| v.id);
             if let Some(id) = first {
@@ -1155,6 +2144,9 @@ pub fn run(state: &mut AppState, ctx: &egui::Context, command: UiCommand) {
         Legend => {
             actions::new_legend(state);
         }
+        DraftingView => {
+            actions::new_drafting_view(state);
+        }
         Schedule => {
             actions::new_schedule(state, Category::Wall);
         }
@@ -1162,6 +2154,7 @@ pub fn run(state: &mut AppState, ctx: &egui::Context, command: UiCommand) {
             actions::new_sheet(state);
         }
         ZoomFit => crate::app::zoom_fit(state),
+        CloseInactiveViews => state.close_others_than = state.active_view,
         VisibilityGraphics => {
             if let Some(view) = graphics_view(state) {
                 crate::graphics_dialog::open(state, crate::graphics_dialog::Target::View(view));
@@ -1169,6 +2162,8 @@ pub fn run(state: &mut AppState, ctx: &egui::Context, command: UiCommand) {
         }
         ViewFilters => crate::graphics_dialog::open_filters(state),
         ViewTemplates => crate::graphics_dialog::open_templates(state),
+        SunSettings => crate::sun_ui::open(state),
+        Render => crate::render_ui::open(state),
         OverrideGraphics => crate::graphics_dialog::open_overrides(state),
         HideInView => actions::hide_in_view(state),
         TempHide => actions::temporary(state, "hide"),
@@ -1178,13 +2173,27 @@ pub fn run(state: &mut AppState, ctx: &egui::Context, command: UiCommand) {
         TempReset => actions::temporary(state, "reset"),
         TempPermanent => actions::temporary_permanent(state),
         Phases => crate::phases_dialog::open(state),
+        DesignOptions => crate::design_options_ui::open(state),
+        // A menu in the ribbon; from the palette, the Design Options dialog.
+        ActiveOption => crate::design_options_ui::open(state),
         Demolish => crate::phases_dialog::start_demolish(state),
+        CurtainGrid => {
+            state.set_tool(Tool::CurtainGrid);
+            state.message = t!("hint-curtain-grid");
+        }
         ProjectInfo => state.dialogs.project_info = true,
+        SiteLocation => crate::site_ui::open(state),
         Units => state.dialogs.units = true,
         Levels => state.dialogs.levels = true,
         Materials => state.dialogs.materials = true,
+        FillPatterns => crate::fill_patterns_dialog::open(state),
+        Profiles => crate::profiles_dialog::open(state),
         MacroRecord => actions::toggle_macro_recording(state),
         MacroRun => actions::run_macro(state),
+        VisualProgramming => crate::graph_ui::toggle(state),
+        Plugins => crate::plugins_ui::open(state),
+        // A menu in the ribbon; from the palette, the Plugins window.
+        PluginCommands => crate::plugins_ui::open(state),
         ToggleRibbon => state.ribbon_collapsed = !state.ribbon_collapsed,
         CommandPalette => crate::palette::toggle(state),
     }
@@ -1206,10 +2215,16 @@ mod tests {
     }
 
     #[test]
+    fn opening_an_editor_names_the_query_it_reads() {
+        // Opening changes nothing: like Edit Component, it reads the definition.
+        assert_eq!(UiCommand::EditTitleBlock.engine(), UiCommand::EditComponent.engine());
+    }
+
+    #[test]
     fn shortcuts_are_unique() {
         let mut seen = HashSet::new();
         for command in UiCommand::all() {
-            if let Some(keys) = command.shortcut() {
+            if let Some(keys) = command.default_shortcut() {
                 assert!(seen.insert(keys), "{keys} is used twice");
                 if keys.len() == 2 {
                     assert_eq!(UiCommand::from_keys(keys), Some(command));
@@ -1266,6 +2281,63 @@ mod tests {
         assert!(crate::modify3d::works_in_3d(&state.tool));
     }
 
+    /// Paint needs a 3D view; it picks a face there and paints it with the
+    /// material of the options bar, and Remove Paint takes it off.
+    #[test]
+    fn paint_picks_faces_in_3d() {
+        let mut state = AppState::new(cc_core::Document::new(crate::home::sample_project("casa_simples").unwrap()));
+        state.project_open = true;
+        state.show_home = false;
+        let plan = state.project().views_of(ViewCategory::FloorPlan).next().map(|v| v.id);
+        state.active_view = plan;
+        assert_eq!(UiCommand::Paint.unavailable(&state), Some(t!("why-paint-3d")));
+        let view = state.project().views_of(ViewCategory::ThreeD).next().map(|v| v.id).unwrap();
+        state.active_view = Some(view);
+        assert_eq!(UiCommand::Paint.unavailable(&state), None);
+        let ctx = egui::Context::default();
+        invoke(&mut state, &ctx, UiCommand::Paint);
+        assert_eq!(state.tool, Tool::Paint { remove: false });
+        assert!(state.project().material(&state.paint_material).is_some());
+        // A ray straight down onto the middle of the first wall's top.
+        let (wall, w) = state.project().walls().next().map(|(e, w)| (e.id, w.clone())).unwrap();
+        let mid = (w.start + w.end) * 0.5;
+        state.session.sync();
+        let ray = cc_geom::Ray { origin: mid.extend(100.0), dir: -glam::DVec3::Z };
+        crate::paint_ui::pick(&mut state, view, false, Some(wall), ray);
+        assert_eq!(state.message, t!("msg-painted"));
+        let painted = state.project().element(wall).unwrap().paints.clone();
+        assert_eq!(painted.len(), 1);
+        assert!(painted[0].normal.z > 0.5);
+        state.session.sync();
+        crate::paint_ui::pick(&mut state, view, true, Some(wall), ray);
+        assert!(state.project().element(wall).unwrap().paints.is_empty(), "{}", state.message);
+        // Nothing under the pointer: the hint again.
+        crate::paint_ui::pick(&mut state, view, false, None, ray);
+        assert_eq!(state.message, t!("hint-paint"));
+    }
+
+    /// Issue #148: *Drafting View* creates and opens a drafting view, which
+    /// takes text, dimensions and imported drawings and has visibility/graphics.
+    #[test]
+    fn drafting_view_entry() {
+        let mut state = AppState::new(cc_core::Document::new(crate::home::sample_project("casa_simples").unwrap()));
+        state.project_open = true;
+        state.show_home = false;
+        assert_eq!(UiCommand::DraftingView.unavailable(&state), None);
+        let ctx = egui::Context::default();
+        invoke(&mut state, &ctx, UiCommand::DraftingView);
+        let views: Vec<_> = state.project().views_of(ViewCategory::Drafting).cloned().collect();
+        let [view] = views.as_slice() else { panic!("one drafting view: {views:?}") };
+        let view = view.clone();
+        state.active_view = Some(view.id);
+        assert_eq!(UiCommand::Text.unavailable(&state), None);
+        assert_eq!(UiCommand::Dimension(DimensionMode::Aligned).unavailable(&state), None);
+        assert_eq!(UiCommand::ImportCad.unavailable(&state), None);
+        assert_eq!(graphics_view(&state), Some(view.id));
+        let drawing = state.session.drawing(view.id).unwrap();
+        assert!(drawing.prims.is_empty(), "no model in it");
+    }
+
     #[test]
     fn select_all_instances_in_the_view() {
         let mut state = AppState::new(cc_core::Document::new(crate::home::sample_project("casa_simples").unwrap()));
@@ -1311,6 +2383,52 @@ mod tests {
         assert!(
             state.dialogs.graphics.as_ref().is_some_and(|d| d.target == crate::graphics_dialog::Target::View(plan))
         );
+    }
+
+    #[test]
+    fn explode_turns_the_selected_import_into_detail_lines() {
+        let mut state = AppState::new(cc_core::Document::new(crate::home::sample_project("casa_simples").unwrap()));
+        state.project_open = true;
+        state.show_home = false;
+        let view = state.project().views.values().find(|v| v.is_plan()).map(|v| v.id).unwrap();
+        let dir = std::env::temp_dir().join(format!("ccad-app-explode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lines.dxf");
+        let groups = [
+            ("0", "SECTION"),
+            ("2", "ENTITIES"),
+            ("0", "LINE"),
+            ("8", "Walls"),
+            ("10", "0"),
+            ("20", "0"),
+            ("11", "1"),
+            ("21", "0"),
+            ("0", "ENDSEC"),
+            ("0", "EOF"),
+        ];
+        std::fs::write(&path, groups.iter().map(|(c, v)| format!("{c}\n{v}\n")).collect::<String>()).unwrap();
+        let command = cc_engine::commands::cad::CadImportFile {
+            path,
+            view: cc_engine::Ref::Id(view.0),
+            position: None,
+            align: None,
+            units: Some("m".into()),
+            rotation: None,
+            scale: None,
+            color_mode: None,
+            halftone: None,
+            blocks: None,
+        };
+        let id = state.session.run(command).unwrap()["id"].as_u64().map(cc_core::ElementId).unwrap();
+        let ctx = egui::Context::default();
+        assert_eq!(UiCommand::Explode.unavailable(&state), Some(t!("why-select-cad")));
+        state.selection = [id].into_iter().collect();
+        assert_eq!(UiCommand::Explode.unavailable(&state), None);
+        invoke(&mut state, &ctx, UiCommand::Explode);
+        assert!(state.project().element(id).is_none());
+        assert_eq!(state.selection.len(), 1);
+        let line = state.selection.iter().next().and_then(|i| state.project().element(*i)).unwrap();
+        assert!(matches!(line.kind, cc_core::ElementKind::DetailLine(_)));
     }
 
     #[test]

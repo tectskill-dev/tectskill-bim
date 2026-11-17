@@ -1,6 +1,6 @@
 [package]
 name = "cc_views"
-description = "ConstructCAD view generation: plans, sections, elevations, legends, schedules"
+description = "ConstructCraft view generation: plans, sections, elevations, legends, schedules"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,6 +14,8 @@ glam.workspace = true
 # Raster export: the SVG with its text as Inter outlines (embedded), encoded as PNG.
 png.workspace = true
 resvg.workspace = true
+image.workspace = true
+miniz_oxide.workspace = true
 skrifa.workspace = true
 harfrust.workspace = true
 subsetter.workspace = true

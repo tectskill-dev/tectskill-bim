@@ -1,7 +1,7 @@
-//! 2D view canvas: plans, ceilings, elevations, sections and legends.
+//! 2D view canvas: plans, ceilings, elevations, sections, legends and drafting views.
 
 use crate::icons::{self, Icon};
-use crate::paint::{PaintOptions, Xf, paint_drawing};
+use crate::paint::Xf;
 use crate::state::AppState;
 use crate::theme::{self, PALETTE};
 use cc_core::ViewId;
@@ -69,6 +69,9 @@ pub struct ZoomNav {
     pub sheet_size: bool,
 }
 
+/// Screen points per drawing unit of a view before anything is fitted.
+const EMPTY_PPM: f64 = 40.0;
+
 /// Pan/zoom state of a 2D view.
 #[derive(Debug, Clone)]
 pub struct View2DState {
@@ -95,7 +98,7 @@ impl Default for View2DState {
     fn default() -> Self {
         Self {
             center: DVec2::ZERO,
-            ppm: 40.0,
+            ppm: EMPTY_PPM,
             fitted: false,
             auto_fit: None,
             back: Vec::new(),
@@ -168,6 +171,20 @@ impl View2DState {
         self.fitted = false;
     }
 
+    /// Where a view with nothing to fit starts. A view of the model shows
+    /// the first meters of a building; a drafting view, drawn at its own
+    /// scale, shows as much paper as a 1:100 plan does at that zoom, so what
+    /// is annotated in it can be read (issue #318: at the zoom of a building
+    /// the text of a 1:10 detail is a pixel tall).
+    pub fn start_empty(&mut self, scale: u32, drafting: bool) {
+        let paper = if drafting { f64::from(scale.max(1)) / 100.0 } else { 1.0 };
+        self.center = DVec2::new(5.0, 4.0) * paper;
+        if drafting {
+            self.ppm = (EMPTY_PPM / paper).clamp(1e-3, 1e6);
+        }
+        self.fitted = true;
+    }
+
     pub fn fit(&mut self, (lo, hi): (DVec2, DVec2), rect: Rect) {
         let size = (hi - lo).max(DVec2::splat(1e-3));
         let margin = 0.85;
@@ -185,11 +202,21 @@ impl View2DState {
             || self.auto_fit.is_some_and(|(c, ppm, size)| c == self.center && ppm == self.ppm && size != rect.size())
     }
 
-    /// Scroll-wheel zoom around the cursor and middle-button pan.
+    /// Wheel or pinch zoom around the cursor, two-finger (trackpad) and
+    /// middle-button pan (see [`crate::gestures`]).
     pub fn navigate(&mut self, ui: &Ui, resp: &Response, rect: Rect) {
         if resp.hovered() {
-            let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
-            let factor = (scroll as f64 * 0.0025).exp() * pinch as f64;
+            let gesture = crate::gestures::read(ui);
+            if gesture.pan != egui::Vec2::ZERO {
+                let now = ui.input(|i| i.time);
+                if now - self.last_wheel > 0.6 {
+                    self.remember();
+                }
+                self.last_wheel = now;
+                let d = gesture.pan;
+                self.center += DVec2::new(-d.x as f64, d.y as f64) / self.ppm;
+            }
+            let factor = gesture.zoom(0.0025);
             if (factor - 1.0).abs() > 1e-6
                 && let Some(cursor) = resp.hover_pos()
             {
@@ -285,10 +312,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, view_id: ViewId) {
     if st.needs_fit(rect) {
         match drawing.fit_bounds() {
             Some(b) if b.1.distance(b.0) > 0.5 => st.fit(b, rect),
-            _ => {
-                st.center = DVec2::new(5.0, 4.0);
-                st.fitted = true;
-            }
+            _ => st.start_empty(view.scale, view.is_drafting()),
         }
     }
     st.navigate(ui, &resp, rect);
@@ -296,8 +320,9 @@ pub fn show(ui: &mut Ui, state: &mut AppState, view_id: ViewId) {
     let xf = st.xf(rect);
     let px_per_mm = st.ppm * view.scale as f64 / 1000.0;
 
-    let opts = PaintOptions { highlight: &state.selection, px_per_mm, mono: None, only: None };
-    paint_drawing(&painter, &drawing, &xf, &opts);
+    // The drawing's meshes are kept between frames on whole pixels: what is
+    // drawn over it uses the transform it was painted with.
+    let xf = state.paint_cache.paint(&painter, view_id, &drawing, &drawing, xf, &state.selection, px_per_mm);
 
     if let Some(p) = resp.hover_pos() {
         state.cursor = Some(xf.to_world(p));
@@ -361,15 +386,21 @@ pub fn view_toolbar(
     nav: ZoomNav,
 ) -> Option<ZoomCommand> {
     let painter = ui.painter_at(rect);
-    let size = egui::vec2(if scale.is_some() { 110.0 } else { 52.0 }, 28.0);
+    let font = egui::FontId::new(12.0, theme::semibold());
+    let text = scale.map(cc_views::format::scale);
+    // Wide enough for a long imperial label (`3/16" = 1'-0"`).
+    let text_width = text
+        .as_ref()
+        .map(|t| painter.layout_no_wrap(t.clone(), font.clone(), PALETTE.text_muted).size().x)
+        .unwrap_or(0.0);
+    let size = egui::vec2(if text.is_some() { (text_width + 64.0).max(110.0) } else { 52.0 }, 28.0);
     let bar = Rect::from_min_size(rect.right_bottom() - size - egui::vec2(12.0, 12.0), size);
     painter.rect_filled(bar.translate(egui::vec2(0.0, 1.0)), 7.0, egui::Color32::from_black_alpha(18));
     painter.rect_filled(bar, 7.0, PALETTE.panel);
     painter.rect_stroke(bar, 7.0, egui::Stroke::new(1.0, PALETTE.border), egui::StrokeKind::Inside);
-    if let Some(scale) = scale {
+    if let Some(text) = text {
         let label = egui::pos2(bar.left() + 12.0, bar.center().y);
-        let font = egui::FontId::new(12.0, theme::semibold());
-        painter.text(label, egui::Align2::LEFT_CENTER, format!("1:{scale}"), font, PALETTE.text_muted);
+        painter.text(label, egui::Align2::LEFT_CENTER, text, font, PALETTE.text_muted);
     }
     let button = Rect::from_center_size(egui::pos2(bar.right() - 30.0, bar.center().y), egui::vec2(24.0, 22.0));
     let arrow = Rect::from_center_size(egui::pos2(bar.right() - 11.0, bar.center().y), egui::vec2(14.0, 22.0));
@@ -451,6 +482,31 @@ mod tests {
         // Once zoomed by hand, resizing keeps the zoom.
         st.apply(ZoomCommand::OutTwo, 10.0);
         assert!(!st.needs_fit(rect));
+    }
+
+    /// Issue #318: an empty drafting view opens at a zoom where the text of
+    /// its dimensions is drawn, as it is in an empty plan.
+    #[test]
+    fn an_empty_drafting_view_starts_where_its_text_is_readable() {
+        let clip = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let shown = |scale: u32, drafting: bool| {
+            let mut st = View2DState::default();
+            st.start_empty(scale, drafting);
+            assert!(st.fitted);
+            // A 2.5 mm dimension text at the middle of the view.
+            let px = (2.5 * st.ppm * f64::from(scale) / 1000.0) as f32;
+            (!crate::paint::text_culled("2.00", px, clip.center(), clip), st)
+        };
+        assert!(shown(100, false).0, "a plan at 1:100");
+        for scale in [1, 5, 10, 20, 50] {
+            let (readable, st) = shown(scale, true);
+            assert!(readable, "a drafting view at 1:{scale}");
+            // The same paper as the plan: 4 px per paper millimeter.
+            assert!((st.ppm * f64::from(scale) / 1000.0 - 4.0).abs() < 1e-9);
+        }
+        // Views of the model start as before.
+        let (_, plan) = shown(50, false);
+        assert_eq!((plan.center, plan.ppm), (DVec2::new(5.0, 4.0), 40.0));
     }
 
     #[test]

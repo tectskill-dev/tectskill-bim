@@ -79,7 +79,7 @@ fn end_refs(project: &Project, drawing: &Drawing2D, dim: &Dimension) -> [Option<
         element.or_else(level)
     };
     match dim.kind {
-        DimensionKind::Aligned | DimensionKind::Linear { .. } => {
+        DimensionKind::Aligned | DimensionKind::Linear { .. } | DimensionKind::Ordinate { .. } => {
             let dir = dim.direction();
             [at(dim.a, 1e-4, dir), at(dim.b, 1e-4, dir)]
         }
@@ -198,8 +198,12 @@ pub fn set_value(s: &mut Session, id: ElementId, value: f64) -> Result<()> {
     // The referenced element of an end moves first; otherwise what the
     // view's linework shows at the ends.
     let element_end = |r: &Option<DimRef>| r.and_then(|r| r.element());
+    // An ordinate dimension keeps its origin: its point moves.
+    let ordinate = matches!(dim.kind, DimensionKind::Ordinate { .. });
     let (at_b, ids) = match (element_end(&dim.refs[0]), element_end(&dim.refs[1])) {
         (_, Some(e)) => (true, vec![e]),
+        (_, None) if ordinate && dim.refs[1].is_none() => (true, attached(&drawing, p, id, dim.b, dim.a)),
+        (_, None) if ordinate => return set_level(s, &dim, value),
         (Some(e), None) => (false, vec![e]),
         (None, None) if dim.refs.iter().any(Option::is_some) => return set_level(s, &dim, value),
         (None, None) => {
@@ -217,7 +221,7 @@ pub fn set_value(s: &mut Session, id: ElementId, value: f64) -> Result<()> {
     }
     let moving = if at_b { dim.b } else { dim.a };
     match dim.kind {
-        DimensionKind::Aligned | DimensionKind::Linear { .. } => {
+        DimensionKind::Aligned | DimensionKind::Linear { .. } | DimensionKind::Ordinate { .. } => {
             let dir = dim.direction().ok_or_else(invalid)?;
             let measured = (dim.b - dim.a).dot(dir);
             let target = value * if measured < 0.0 { -1.0 } else { 1.0 };

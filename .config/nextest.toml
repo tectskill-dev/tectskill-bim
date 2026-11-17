@@ -1,0 +1,12 @@
+# cargo-nextest configuration (https://nexte.st). Install: `cargo install cargo-nextest --locked`.
+
+[profile.default]
+# Report every failure rather than stopping at the first.
+fail-fast = false
+# Flag tests that run for more than a minute.
+slow-timeout = { period = "60s" }
+
+[profile.ci]
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 10 }
+failure-output = "immediate-final"

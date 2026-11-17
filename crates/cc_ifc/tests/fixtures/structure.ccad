@@ -2236,6 +2236,37 @@
         )),
         uid: "8cec2539c41c40cbb48f36abbc1c74e6",
       ),
+      (126): (
+        id: (126),
+        level: (1),
+        type_id: (19),
+        mark: "",
+        comments: "",
+        kind: Foundation((
+          shape: Strip(
+            start: (30.0, 0.0),
+            end: (34.0, 0.0),
+          ),
+          top_offset: 0.0,
+        )),
+        uid: "5b0e7f3c21a44d8e9c6f0a1b2d3e4f51",
+      ),
+      (127): (
+        id: (127),
+        level: (1),
+        type_id: (19),
+        mark: "",
+        comments: "",
+        kind: Foundation((
+          shape: Strip(
+            start: (34.0, 0.0),
+            end: (30.0, 4.0),
+            bulge: 0.41421356237309503,
+          ),
+          top_offset: 0.0,
+        )),
+        uid: "6c1f8a4d32b54e9fad7a1b2c3e4f5a62",
+      ),
       (75): (
         id: (75),
         level: (1),
@@ -3227,6 +3258,6 @@
         ],
       ),
     },
-    next_id: 126,
+    next_id: 128,
   ),
 )

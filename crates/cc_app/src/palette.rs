@@ -28,23 +28,25 @@ pub struct Palette {
 }
 
 struct EngineCommand {
-    name: &'static str,
+    name: String,
     description: String,
     schema: serde_json::Value,
 }
 
 struct Form {
-    name: &'static str,
+    name: String,
     description: String,
     args: String,
     result: Option<Result<String, String>>,
 }
 
 impl Palette {
-    pub fn new() -> Palette {
+    /// The palette over the session's commands (built-in and plugins').
+    pub fn new(session: &cc_engine::Session) -> Palette {
         // File commands (open, save, import, export) replace the document or
         // need file dialogs; their interface commands cover them.
-        let catalog = cc_engine::catalog()
+        let catalog = session
+            .commands()
             .into_iter()
             .filter(|c| c.kind != cc_engine::CommandKind::File)
             .map(|c| EngineCommand { name: c.name, description: c.description, schema: c.input_schema })
@@ -71,7 +73,7 @@ struct Entry {
     action: Action,
     label: String,
     detail: String,
-    shortcut: Option<&'static str>,
+    shortcut: Option<String>,
     icon: Icon,
     badge: Option<Badge>,
     /// Why it cannot run now.
@@ -99,10 +101,10 @@ fn fold(text: &str) -> String {
 /// Words found at the start of the label, or the exact shortcut, rank first.
 fn score(entry: &Entry, words: &[String]) -> Option<u32> {
     let label = fold(&entry.label);
-    let rest = fold(&format!("{} {}", entry.detail, entry.shortcut.unwrap_or_default()));
+    let rest = fold(&format!("{} {}", entry.detail, entry.shortcut.as_deref().unwrap_or_default()));
     let mut total = 0;
     for word in words {
-        if entry.shortcut.is_some_and(|s| fold(s) == *word) {
+        if entry.shortcut.as_deref().is_some_and(|s| fold(s) == *word) {
             total += 8;
         } else if label.starts_with(word.as_str()) {
             total += 4;
@@ -166,6 +168,7 @@ fn entries(state: &AppState, palette: &Palette) -> Vec<Entry> {
                 ViewCategory::Section => Icon::Section,
                 ViewCategory::ThreeD => Icon::View3D,
                 ViewCategory::Legend => Icon::Legend,
+                ViewCategory::Drafting => Icon::DraftingView,
                 ViewCategory::Schedule => Icon::Schedule,
                 ViewCategory::Diagram => Icon::Systems,
                 ViewCategory::Sheet => Icon::Sheet,
@@ -195,11 +198,17 @@ fn entries(state: &AppState, palette: &Palette) -> Vec<Entry> {
     list
 }
 
+/// Bonus of an entry whose whole label is the query (an engine command typed
+/// in full beats the longer names that share its words).
+const EXACT: u32 = 100;
+
 /// The matches of the query, best first (all entries in their order when it is empty).
 fn matches(entries: Vec<Entry>, query: &str) -> Vec<Entry> {
-    let words: Vec<String> = fold(query).split_whitespace().map(String::from).collect();
+    let folded = fold(query);
+    let words: Vec<String> = folded.split_whitespace().map(String::from).collect();
+    let exact = |e: &Entry| if !words.is_empty() && fold(&e.label).trim() == folded.trim() { EXACT } else { 0 };
     let mut scored: Vec<(u32, usize, Entry)> =
-        entries.into_iter().enumerate().filter_map(|(i, e)| score(&e, &words).map(|s| (s, i, e))).collect();
+        entries.into_iter().enumerate().filter_map(|(i, e)| score(&e, &words).map(|s| (s + exact(&e), i, e))).collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     scored.into_iter().map(|(_, _, e)| e).collect()
 }
@@ -229,11 +238,25 @@ fn skeleton(schema: &serde_json::Value) -> String {
     serde_json::to_string_pretty(&Value::Object(args)).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Open the palette on the form of the engine command `name` (a plugin's
+/// command from the ribbon); nothing happens for an unknown name.
+pub fn open_command(state: &mut AppState, name: &str) {
+    let mut palette = Palette::new(&state.session);
+    let Some(command) = palette.catalog.iter().find(|c| c.name == name) else { return };
+    palette.form = Some(Form {
+        name: command.name.clone(),
+        description: command.description.clone(),
+        args: skeleton(&command.schema),
+        result: None,
+    });
+    state.palette = Some(palette);
+}
+
 /// Open or close the palette.
 pub fn toggle(state: &mut AppState) {
     state.palette = match state.palette {
         Some(_) => None,
-        None => Some(Palette::new()),
+        None => Some(Palette::new(&state.session)),
     };
 }
 
@@ -362,7 +385,7 @@ fn search(ui: &mut egui::Ui, state: &mut AppState, palette: &mut Palette, keep: 
         Action::Engine(i) => {
             if let Some(command) = palette.catalog.get(i) {
                 palette.form = Some(Form {
-                    name: command.name,
+                    name: command.name.clone(),
                     description: command.description.clone(),
                     args: skeleton(&command.schema),
                     result: None,
@@ -393,7 +416,7 @@ fn entry_row(ui: &mut egui::Ui, entry: &Entry, selected: bool, height: f32) -> e
     painter.galley(egui::pos2(left, rect.center().y - label.size().y / 2.0), label, text_color);
     // The detail (or why it is unavailable) fills the rest of the row, cut to fit.
     let mut right = rect.right() - 8.0;
-    if let Some(keys) = entry.shortcut {
+    if let Some(keys) = entry.shortcut.as_deref() {
         let galley = painter.layout_no_wrap(keys.to_string(), egui::FontId::proportional(11.5), p.text_muted);
         let size = galley.size() + vec2(10.0, 4.0);
         let cap = egui::Rect::from_min_size(egui::pos2(right - size.x, rect.center().y - size.y / 2.0), size);
@@ -423,7 +446,7 @@ fn engine_form(ui: &mut egui::Ui, state: &mut AppState, mut form: Form) -> Optio
     ui.horizontal(|ui| {
         let (icon, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
         icons::paint(ui.painter(), icon, Icon::MacroRun, p.text);
-        ui.label(RichText::new(form.name).monospace().strong().color(p.text));
+        ui.label(RichText::new(form.name.as_str()).monospace().strong().color(p.text));
     });
     ui.label(theme::muted(&form.description));
     ui.add_space(4.0);
@@ -451,10 +474,16 @@ fn engine_form(ui: &mut egui::Ui, state: &mut AppState, mut form: Form) -> Optio
     });
     if run {
         form.result = Some(match serde_json::from_str::<serde_json::Value>(&form.args) {
-            Ok(args) => match state.session.execute(form.name, args) {
-                Ok(out) => Ok(serde_json::to_string_pretty(&out).unwrap_or_default()),
-                Err(e) => Err(e.message),
-            },
+            Ok(args) => {
+                let result = state.session.execute(&form.name, args);
+                // What a plugin command printed, above its result.
+                let printed = state.session.take_extension_messages().join("\n");
+                let with = |s: String| if printed.is_empty() { s } else { format!("{printed}\n\n{s}") };
+                match result {
+                    Ok(out) => Ok(with(serde_json::to_string_pretty(&out).unwrap_or_default())),
+                    Err(e) => Err(with(e.message)),
+                }
+            }
             Err(e) => Err(t!("palette-bad-json", "error" => e)),
         });
     }
@@ -477,12 +506,12 @@ fn engine_form(ui: &mut egui::Ui, state: &mut AppState, mut form: Form) -> Optio
 mod tests {
     use super::*;
 
-    fn entry(label: &str, detail: &str, shortcut: Option<&'static str>) -> Entry {
+    fn entry(label: &str, detail: &str, shortcut: Option<&str>) -> Entry {
         Entry {
             action: Action::Command(UiCommand::Select),
             label: label.to_string(),
             detail: detail.to_string(),
-            shortcut,
+            shortcut: shortcut.map(str::to_string),
             icon: Icon::Select,
             badge: None,
             why: None,
@@ -498,7 +527,7 @@ mod tests {
             entry("Planta de piso: Térreo", "Cria uma planta", None),
         ];
         let labels = |query: &str| -> Vec<String> {
-            let list = list.iter().map(|e| entry(&e.label, &e.detail, e.shortcut)).collect::<Vec<_>>();
+            let list = list.iter().map(|e| entry(&e.label, &e.detail, e.shortcut.as_deref())).collect::<Vec<_>>();
             matches(list, query).into_iter().map(|e| e.label).collect()
         };
         assert_eq!(labels("NIVEIS"), ["Níveis"]);
@@ -523,7 +552,7 @@ mod tests {
         let args: serde_json::Value = serde_json::from_str(&skeleton(&schema)).unwrap();
         assert_eq!(args, serde_json::json!({"view": 0, "text": "", "position": []}));
         // Every engine command offered by the palette gets valid JSON.
-        for command in Palette::new().catalog {
+        for command in Palette::new(&cc_engine::Session::default()).catalog {
             assert!(serde_json::from_str::<serde_json::Value>(&skeleton(&command.schema)).is_ok(), "{}", command.name);
         }
     }

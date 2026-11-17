@@ -23,6 +23,14 @@ struct Settings {
     phases: Vec<crate::Phase>,
     phase_filters: BTreeMap<crate::PhaseFilterId, crate::PhaseFilter>,
     phase_graphics: crate::PhaseGraphics,
+    graph_bindings: BTreeMap<ElementId, crate::graph_binding::GraphBinding>,
+    line_styles: crate::detail::LineStyles,
+    fill_patterns: crate::fill_pattern::FillPatterns,
+    profiles: BTreeMap<crate::ProfileId, crate::structural_profile::ProfileDef>,
+    option_sets: Vec<crate::OptionSet>,
+    browser: crate::browser::BrowserOrganization,
+    bar_marking: crate::bar_marks::BarMarking,
+    sun_presets: Vec<crate::sun::SunPreset>,
 }
 
 impl Settings {
@@ -41,6 +49,14 @@ impl Settings {
             phases: p.phases.clone(),
             phase_filters: p.phase_filters.clone(),
             phase_graphics: p.phase_graphics,
+            graph_bindings: p.graph_bindings.clone(),
+            line_styles: p.line_styles.clone(),
+            fill_patterns: p.fill_patterns.clone(),
+            profiles: p.profiles.clone(),
+            option_sets: p.option_sets.clone(),
+            browser: p.browser.clone(),
+            bar_marking: p.bar_marking.clone(),
+            sun_presets: p.sun_presets.clone(),
         }
     }
 
@@ -58,6 +74,14 @@ impl Settings {
         p.phases = self.phases;
         p.phase_filters = self.phase_filters;
         p.phase_graphics = self.phase_graphics;
+        p.graph_bindings = self.graph_bindings;
+        p.line_styles = self.line_styles;
+        p.fill_patterns = self.fill_patterns;
+        p.profiles = self.profiles;
+        p.option_sets = self.option_sets;
+        p.browser = self.browser;
+        p.bar_marking = self.bar_marking;
+        p.sun_presets = self.sun_presets;
     }
 }
 
@@ -103,6 +127,17 @@ impl Transaction {
                 Some(c) => c.1 = after,
                 None => self.settings = Some((before, after)),
             }
+        }
+    }
+
+    /// Drop the changes whose "after" state equals their "before" (an
+    /// element added and removed again in merged steps).
+    fn prune(&mut self) {
+        self.elements.retain(|_, c| c.0 != c.1);
+        self.views.retain(|_, c| c.0 != c.1);
+        self.types.retain(|_, c| c.0 != c.1);
+        if self.settings.as_ref().is_some_and(|c| c.0 == c.1) {
+            self.settings = None;
         }
     }
 
@@ -152,6 +187,23 @@ impl<'a> EditCtx<'a> {
 
     pub fn alloc_id(&mut self) -> u64 {
         self.project.alloc_id()
+    }
+
+    /// The elements this edit has changed so far, each with its state before
+    /// the edit (`None`: it was added). Elements touched but left as they
+    /// were are skipped.
+    pub(crate) fn element_changes(&self) -> Vec<(ElementId, Option<&Element>)> {
+        self.tx
+            .elements
+            .iter()
+            .filter(|(id, c)| c.0.as_ref() != self.project.elements.get(id))
+            .map(|(id, c)| (*id, c.0.as_ref()))
+            .collect()
+    }
+
+    /// The types this edit has added, removed or changed so far.
+    pub(crate) fn changed_types(&self) -> std::collections::BTreeSet<ElementTypeId> {
+        self.tx.types.iter().filter(|(id, c)| c.0.as_ref() != self.project.types.get(id)).map(|(id, _)| *id).collect()
     }
 
     fn touch_element(&mut self, id: ElementId) {
@@ -207,8 +259,25 @@ impl<'a> EditCtx<'a> {
             pending.extend(self.project.hosted_by(id).map(|e| e.id));
             pending.extend(self.project.railings_of(id).map(|e| e.id));
             pending.extend(self.project.rebar_of(id).map(|(e, _)| e.id));
+            pending.extend(self.project.bar_tags_of(id).map(|(e, _)| e.id));
+            pending.extend(self.project.piles_of(id).map(|(e, _)| e.id));
+            pending.extend(self.project.connections_of(id).map(|(e, _)| e.id));
+            pending.extend(self.project.pads_of(id).map(|(e, _)| e.id));
+            pending.extend(self.project.host_members_of(id));
+            // A wall's framing goes with it (and the framing's members with the framing).
+            pending.extend(self.project.framings_of(id));
+            pending.extend(self.project.valves_of(id).map(|(e, _)| e.id));
             self.touch_element(id);
             self.project.elements.remove(&id);
+            // A pinned element removed with its host or view takes its pin along.
+            if self.project.pinned.contains(&id) {
+                self.touch_settings();
+                self.project.pinned.remove(&id);
+            }
+            if self.project.graph_bindings.contains_key(&id) {
+                self.touch_settings();
+                self.project.graph_bindings.remove(&id);
+            }
             if self.project.joined_with(id).next().is_some() {
                 self.touch_settings();
                 self.project.joins.retain(|&(a, b)| a != id && b != id);
@@ -255,8 +324,14 @@ impl<'a> EditCtx<'a> {
         self.project.views.get_mut(&id)
     }
 
-    /// Remove a view and any sheet viewports showing it.
+    /// Remove a view, the elements it owns (dimensions, text notes,
+    /// imported drawings) and any sheet viewports showing it.
     pub fn remove_view(&mut self, id: ViewId) {
+        let owned: Vec<ElementId> =
+            self.project.elements.values().filter(|e| e.owner_view() == Some(id)).map(|e| e.id).collect();
+        for e in owned {
+            self.remove_element(e);
+        }
         let sheets: Vec<_> = self
             .project
             .views
@@ -270,6 +345,13 @@ impl<'a> EditCtx<'a> {
         for sheet in sheets {
             if let Some(ViewKind::Sheet { viewports, .. }) = self.view_mut(sheet).map(|v| &mut v.kind) {
                 viewports.retain(|vp| vp.view != id);
+            }
+        }
+        // Callouts drawn in it go; their views stay (a detail view keeps its crop).
+        let details: Vec<ViewId> = self.project.callouts_in(id).map(|v| v.id).collect();
+        for d in details {
+            if let Some(v) = self.view_mut(d) {
+                v.callout = None;
             }
         }
         self.touch_view(id);
@@ -335,6 +417,16 @@ impl<'a> EditCtx<'a> {
         for id in self.project.material_users(old) {
             if let Some(t) = self.type_mut(id) {
                 t.data.rename_material(old, new);
+            }
+        }
+        for id in self.project.material_instance_users(old) {
+            if let Some(crate::ElementKind::Component(c)) = self.element_mut(id).map(|e| &mut e.kind) {
+                c.text_overrides.values_mut().filter(|v| *v == old).for_each(|v| *v = new.to_string());
+            }
+        }
+        for id in self.project.material_paint_users(old) {
+            if let Some(e) = self.element_mut(id) {
+                e.paints.iter_mut().filter(|p| p.material == old).for_each(|p| p.material = new.to_string());
             }
         }
         if let Some(m) = self.materials_mut().iter_mut().find(|m| m.name == old) {
@@ -424,6 +516,24 @@ impl<'a> EditCtx<'a> {
         &mut self.project.templates
     }
 
+    /// Detail views follow their parents (see [`Project::detail_kind`]),
+    /// details of details too, up to [`crate::callout::MAX_CHAIN`] links.
+    fn sync_callouts(&mut self) {
+        for _ in 0..crate::callout::MAX_CHAIN {
+            let p = &*self.project;
+            let changed: Vec<(ViewId, ViewKind)> =
+                p.views.values().filter_map(|v| Some((v.id, p.detail_kind(v)?))).collect();
+            if changed.is_empty() {
+                break;
+            }
+            for (id, kind) in changed {
+                if let Some(v) = self.view_mut(id) {
+                    v.kind = kind;
+                }
+            }
+        }
+    }
+
     /// Keep view graphics consistent with the model: drop overrides of
     /// missing elements and missing filters, unassign missing templates,
     /// and copy each template's controlled properties into its views.
@@ -445,7 +555,7 @@ impl<'a> EditCtx<'a> {
         let changed: Vec<(ViewId, View)> = p
             .views
             .values()
-            .filter(|v| v.template.is_some() || !v.graphics.is_empty())
+            .filter(|v| v.template.is_some() || !v.graphics.is_empty() || !v.tag_offsets.is_empty())
             .filter_map(|v| {
                 let mut new = v.clone();
                 match new.template.map(|t| p.templates.get(&t)) {
@@ -454,6 +564,8 @@ impl<'a> EditCtx<'a> {
                     None => {}
                 }
                 new.graphics.repair(&p.filters, Some(&|id| p.elements.contains_key(&id)));
+                // Tags of deleted elements go.
+                new.tag_offsets.retain(|id, o| p.elements.contains_key(id) && o.is_finite());
                 (new != *v).then_some((v.id, new))
             })
             .collect();
@@ -462,6 +574,58 @@ impl<'a> EditCtx<'a> {
                 *v = view;
             }
         }
+    }
+
+    /// The project browser's schemes and the one in use.
+    pub fn browser_mut(&mut self) -> &mut crate::browser::BrowserOrganization {
+        self.touch_settings();
+        &mut self.project.browser
+    }
+
+    /// How the project's reinforcing bars are marked.
+    pub fn bar_marking_mut(&mut self) -> &mut crate::bar_marks::BarMarking {
+        self.touch_settings();
+        &mut self.project.bar_marking
+    }
+
+    /// The project's line styles.
+    pub fn line_styles_mut(&mut self) -> &mut crate::detail::LineStyles {
+        self.touch_settings();
+        &mut self.project.line_styles
+    }
+
+    /// The project's sun presets (see [`crate::sun`]).
+    pub fn sun_presets_mut(&mut self) -> &mut Vec<crate::sun::SunPreset> {
+        self.touch_settings();
+        &mut self.project.sun_presets
+    }
+
+    /// Views whose sun's ground level is gone (deleted by this edit) lose it.
+    fn sync_sun_ground(&mut self) {
+        let p = &*self.project;
+        let stale: Vec<ViewId> = p
+            .views
+            .values()
+            .filter(|v| v.sun.as_ref().and_then(|s| s.ground).is_some_and(|l| p.level(l).is_none()))
+            .map(|v| v.id)
+            .collect();
+        for id in stale {
+            if let Some(sun) = self.view_mut(id).and_then(|v| v.sun.as_mut()) {
+                sun.ground = None;
+            }
+        }
+    }
+
+    /// The project's fill patterns.
+    pub fn fill_patterns_mut(&mut self) -> &mut crate::fill_pattern::FillPatterns {
+        self.touch_settings();
+        &mut self.project.fill_patterns
+    }
+
+    /// The project's structural profiles.
+    pub fn profiles_mut(&mut self) -> &mut BTreeMap<crate::ProfileId, crate::structural_profile::ProfileDef> {
+        self.touch_settings();
+        &mut self.project.profiles
     }
 
     /// Construction phases, in time order.
@@ -477,9 +641,148 @@ impl<'a> EditCtx<'a> {
     }
 
     /// Graphics of each phase status.
+    /// Bind an element to the graph call that made it, or unbind it with `None`.
+    pub fn set_graph_binding(&mut self, id: ElementId, binding: Option<crate::graph_binding::GraphBinding>) {
+        if self.project.graph_bindings.get(&id) == binding.as_ref() {
+            return;
+        }
+        self.touch_settings();
+        match binding {
+            Some(b) if self.project.elements.contains_key(&id) => {
+                self.project.graph_bindings.insert(id, b);
+            }
+            _ => {
+                self.project.graph_bindings.remove(&id);
+            }
+        }
+    }
+
     pub fn phase_graphics_mut(&mut self) -> &mut crate::PhaseGraphics {
         self.touch_settings();
         &mut self.project.phase_graphics
+    }
+
+    /// Walls attached to an element this edit deleted (or turned into
+    /// something that is no roof, ceiling or floor) keep their own top.
+    fn sync_attachments(&mut self) {
+        let p = &*self.project;
+        let slab = |id: ElementId| {
+            p.elements.get(&id).is_some_and(|e| {
+                matches!(
+                    e.kind,
+                    crate::ElementKind::Floor(_) | crate::ElementKind::Ceiling(_) | crate::ElementKind::Roof(_)
+                )
+            })
+        };
+        let stale: Vec<ElementId> = p
+            .elements
+            .values()
+            .filter(|e| matches!(&e.kind, crate::ElementKind::Wall(w) if w.attach_top.is_some_and(|t| !slab(t))))
+            .map(|e| e.id)
+            .collect();
+        for id in stale {
+            if let Some(crate::ElementKind::Wall(w)) = self.element_mut(id).map(|e| &mut e.kind) {
+                w.attach_top = None;
+            }
+        }
+    }
+
+    /// Floors, ceilings and roofs take the cuts of the shafts that pass
+    /// through them (see [`crate::shaft`]), in the same undo step as the
+    /// edit that moved a shaft or them; unchanged cuts are left alone.
+    fn sync_shafts(&mut self) {
+        let p = &*self.project;
+        let shafts = p.elements.values().any(|e| matches!(e.kind, crate::ElementKind::Shaft(_)));
+        let changed: Vec<(ElementId, Vec<Vec<glam::DVec2>>)> = p
+            .elements
+            .values()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    crate::ElementKind::Floor(_) | crate::ElementKind::Ceiling(_) | crate::ElementKind::Roof(_)
+                )
+            })
+            .filter_map(|e| {
+                let want = if shafts { p.shaft_cuts(e) } else { Vec::new() };
+                (want.as_slice() != e.shaft_cuts()).then_some((e.id, want))
+            })
+            .collect();
+        for (id, cuts) in changed {
+            if let Some(slot) = self.element_mut(id).and_then(|e| e.shaft_cuts_mut()) {
+                *slot = cuts;
+            }
+        }
+    }
+
+    /// Piles of pile caps stand where their caps want them, and caps have
+    /// as many as their layouts hold (see [`crate::pile`]): missing ones are
+    /// added, extra ones and those of no cap removed, the others moved.
+    fn sync_piles(&mut self) {
+        let plan = self.project.pile_sync();
+        for (id, width, length) in plan.types {
+            if let Some(crate::TypeData::Foundation { width: w, length: l, .. }) =
+                self.type_mut(id).map(|t| &mut t.data)
+            {
+                (*w, *l) = (width, length);
+            }
+        }
+        for id in plan.remove {
+            self.remove_element(id);
+        }
+        for (id, level, type_id, pile) in plan.update {
+            if let Some(e) = self.element_mut(id) {
+                e.level = level;
+                e.type_id = type_id;
+                e.kind = crate::ElementKind::Pile(pile);
+            }
+        }
+        for (level, type_id, pile) in plan.add {
+            let id = ElementId(self.alloc_id());
+            let mark = self.project.next_mark(crate::Category::Pile);
+            self.add_element(Element {
+                id,
+                level,
+                type_id,
+                mark,
+                comments: String::new(),
+                kind: crate::ElementKind::Pile(pile),
+                uid: Default::default(),
+                phase_created: Default::default(),
+                phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
+            });
+        }
+    }
+
+    /// Pads stand on their terrain's level (see [`crate::pad`]).
+    fn sync_pads(&mut self) {
+        for (id, level) in self.project.pad_levels() {
+            if let Some(e) = self.element_mut(id) {
+                e.level = level;
+            }
+        }
+    }
+
+    /// Elements (and sweep types) whose outline this edit changed without their sketch drop it
+    /// (see [`crate::sketch`]).
+    fn sync_sketches(&mut self) {
+        let ids: Vec<ElementId> = self.tx.elements.keys().copied().collect();
+        for id in ids {
+            if let Some(e) = self.project.elements.get_mut(&id) {
+                e.drop_stale_sketch();
+            }
+        }
+        // Sweep types whose profile changed without its curves.
+        let types: Vec<ElementTypeId> = self.tx.types.keys().copied().collect();
+        for id in types {
+            if let Some(crate::TypeData::Sweep { profile, sketch, .. }) =
+                self.project.types.get_mut(&id).map(|t| &mut t.data)
+                && sketch.as_ref().is_some_and(|s| !s.makes(profile, &[]))
+            {
+                *sketch = None;
+            }
+        }
     }
 
     /// Keep phases consistent: elements and views added by this edit get
@@ -527,16 +830,165 @@ impl<'a> EditCtx<'a> {
         }
     }
 
+    /// Design option sets (see [`crate::design_option`]).
+    pub fn option_sets_mut(&mut self) -> &mut Vec<crate::OptionSet> {
+        self.touch_settings();
+        &mut self.project.option_sets
+    }
+
+    /// Keep design options consistent: model elements added by this edit
+    /// without an option go into the active one, hosted elements follow
+    /// their hosts and unknown options mean the main model
+    /// ([`Project::option_fixes`]); views and templates drop choices of
+    /// deleted sets and options.
+    fn sync_options(&mut self) {
+        let p = &*self.project;
+        if p.option_sets.is_empty()
+            && p.elements.values().all(|e| e.design_option.is_none())
+            && p.views.values().all(|v| v.design_options.is_empty())
+            && p.templates.values().all(|t| t.design_options.is_empty())
+        {
+            return;
+        }
+        if let Some(active) = p.active_option() {
+            let added: Vec<ElementId> = self
+                .tx
+                .elements
+                .iter()
+                .filter(|(id, c)| {
+                    c.0.is_none()
+                        && p.elements.get(id).is_some_and(|e| {
+                            e.design_option.is_none()
+                                && e.category().is_phased()
+                                && crate::phase::phase_host(e).is_none()
+                        })
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            for id in added {
+                if let Some(e) = self.project.elements.get_mut(&id) {
+                    e.design_option = Some(active);
+                }
+            }
+        }
+        for (id, option) in self.project.option_fixes() {
+            if let Some(e) = self.element_mut(id) {
+                e.design_option = option;
+            }
+        }
+        let p = &*self.project;
+        let views: Vec<ViewId> =
+            p.views.values().filter(|v| p.stale_choices(&v.design_options)).map(|v| v.id).collect();
+        let stale_templates = p.templates.values().any(|t| p.stale_choices(&t.design_options));
+        for id in views {
+            let mut choices = self.project.views.get(&id).map(|v| v.design_options.clone()).unwrap_or_default();
+            self.project.clean_choices(&mut choices);
+            if let Some(v) = self.view_mut(id) {
+                v.design_options = choices;
+            }
+        }
+        if stale_templates {
+            let mut templates = std::mem::take(self.templates_mut());
+            for t in templates.values_mut() {
+                self.project.clean_choices(&mut t.design_options);
+            }
+            self.project.templates = templates;
+        }
+    }
+
     pub fn units_mut(&mut self) -> &mut crate::Units {
         self.touch_settings();
         &mut self.project.units
     }
 
+    /// Column and beam types with a profile keep their legacy section as the
+    /// profile's bounding box (a legacy section that is exactly the profile
+    /// stays as it is); types whose profile is gone drop the reference and
+    /// keep the box. A type whose legacy section this edit changed while
+    /// leaving its profile reference alone points to a profile made from the
+    /// new section instead (an equal one, else a new one); when both changed,
+    /// the profile wins. Runs when this edit touched settings (profiles live
+    /// there) or a column or beam type, and writes only what changes.
+    fn sync_profiles(&mut self) {
+        let settings = self.tx.settings.is_some();
+        let ids: Vec<ElementTypeId> = self
+            .project
+            .types
+            .values()
+            .filter(|t| {
+                matches!(
+                    t.data,
+                    crate::TypeData::Column { profile: Some(_), .. } | crate::TypeData::Beam { profile: Some(_), .. }
+                ) && (settings || self.tx.types.contains_key(&t.id))
+            })
+            .map(|t| t.id)
+            .collect();
+        for id in ids {
+            let Some(data) = self.project.types.get(&id).map(|t| &t.data) else { continue };
+            // A direct edit of the legacy section (the profile reference left
+            // as it was) is authoritative: the type points to a profile made
+            // from the new section instead of getting the old box back.
+            let before = self.tx.types.get(&id).and_then(|c| c.0.as_ref()).map(|t| &t.data);
+            if let Some(before) = before
+                && crate::profiles_project::type_profile(before) == crate::profiles_project::type_profile(data)
+                && !crate::profiles_project::same_legacy(before, data)
+            {
+                let legacy = self.project.legacy_profile(data);
+                self.touch_settings();
+                let pid = legacy.and_then(|(material, shape)| self.project.section_profile(material, shape));
+                // The new section is already placed: it is the profile as is.
+                if let Some(
+                    crate::TypeData::Column { profile, profile_rotation_deg, profile_mirror, .. }
+                    | crate::TypeData::Beam { profile, profile_rotation_deg, profile_mirror, .. },
+                ) = self.type_mut(id).map(|t| &mut t.data)
+                {
+                    *profile = pid;
+                    *profile_rotation_deg = 0.0;
+                    *profile_mirror = false;
+                }
+                continue;
+            }
+            let gone = match data {
+                crate::TypeData::Column { profile: Some(p), .. } | crate::TypeData::Beam { profile: Some(p), .. } => {
+                    self.project.profile(*p).is_none()
+                }
+                _ => continue,
+            };
+            if gone {
+                if let Some(crate::TypeData::Column { profile, .. } | crate::TypeData::Beam { profile, .. }) =
+                    self.type_mut(id).map(|t| &mut t.data)
+                {
+                    *profile = None;
+                }
+                continue;
+            }
+            let Some(boxed) = self.project.profile_box(data) else { continue };
+            if let Some(t) = self.type_mut(id) {
+                t.data = boxed;
+            }
+        }
+    }
+
     /// Fill in "after" states and drop no-op entries.
     fn finish(mut self) -> Transaction {
+        // Legacy sections follow their profiles first, so what reads them below sees the new size.
+        self.sync_profiles();
+        // Member hosts (steel buildings, trusses) next: they read what the
+        // edit itself did to elements, before the syncs below change any.
+        self.sync_member_hosts();
         // Associative dimensions follow what this edit changed (elements or levels).
+        self.sync_shafts();
+        self.sync_pads();
+        self.sync_piles();
+        self.sync_attachments();
         self.sync_dimensions();
         self.sync_phases();
+        self.sync_options();
+        // Members take their host's phases and option once those are settled.
+        self.sync_member_phases();
+        self.sync_sketches();
+        self.sync_callouts();
+        self.sync_sun_ground();
         self.sync_views();
         let p = &*self.project;
         self.tx.elements.retain(|id, c| {
@@ -561,7 +1013,9 @@ impl<'a> EditCtx<'a> {
     }
 }
 
-/// An open project plus its undo history and file state.
+/// An open project plus its undo history and file state. Cloned to run a
+/// long command (an import) on another thread while the app keeps drawing.
+#[derive(Clone)]
 pub struct Document {
     pub project: Project,
     pub path: Option<PathBuf>,
@@ -603,6 +1057,23 @@ impl Document {
         self.view_state_changed = true;
     }
 
+    /// Set the design option new elements go into, which views without a
+    /// choice of their own show for its set (`None`: the main model). Not
+    /// undone nor saved, but views change: the revision moves on (without
+    /// marking the document as changed).
+    pub fn set_active_option(&mut self, option: Option<crate::OptionId>) {
+        let option = option.filter(|o| self.project.option_set_of(*o).is_some());
+        if self.project.active_option == option {
+            return;
+        }
+        let clean = self.revision == self.saved_revision;
+        self.project.active_option = option;
+        self.revision += 1;
+        if clean {
+            self.saved_revision = self.revision;
+        }
+    }
+
     /// Monotonic counter bumped on every model change; use it to invalidate caches.
     pub fn revision(&self) -> u64 {
         self.revision
@@ -634,12 +1105,35 @@ impl Document {
         self.edit_impl(name.into(), Some(merge_key), f)
     }
 
-    /// End coalescing so the next merged edit starts a new undo step.
     /// Number of undoable transactions.
     pub fn undo_depth(&self) -> usize {
         self.undo.len()
     }
 
+    /// Fold the undo steps recorded since undo depth `depth` into one step
+    /// named `name` (a command made of other commands, undone at once).
+    /// Changes that cancel out are dropped, and so is the step if nothing is
+    /// left; returns whether a step remains.
+    pub fn squash_since(&mut self, depth: usize, name: impl Into<String>) -> bool {
+        if depth >= self.undo.len() {
+            return false;
+        }
+        let mut steps = self.undo.split_off(depth).into_iter();
+        let Some(mut tx) = steps.next() else { return false };
+        for newer in steps {
+            tx.merge(newer);
+        }
+        tx.prune();
+        tx.name = name.into();
+        self.last_merge_key = None;
+        if tx.is_empty() {
+            return false;
+        }
+        self.undo.push(tx);
+        true
+    }
+
+    /// End coalescing so the next merged edit starts a new undo step.
     pub fn break_merge(&mut self) {
         self.last_merge_key = None;
     }
@@ -755,6 +1249,29 @@ mod tests {
     use glam::DVec2;
 
     #[test]
+    fn squashed_steps_undo_at_once() {
+        let mut doc = Document::new(Project::from_template());
+        let before = doc.project.clone();
+        let depth = doc.undo_depth();
+        doc.edit("a", |e| e.info_mut().name = "one".into());
+        doc.edit("b", |e| e.info_mut().name = "two".into());
+        assert!(doc.squash_since(depth, "both"));
+        assert_eq!(doc.undo_depth(), depth + 1);
+        assert!(doc.undo());
+        assert_eq!(doc.project, before);
+        assert!(doc.redo());
+        assert_eq!(doc.project.info.name, "two");
+        // Steps that cancel out leave no step.
+        let depth = doc.undo_depth();
+        let name = doc.project.info.name.clone();
+        doc.edit("c", |e| e.info_mut().name = "three".into());
+        doc.edit("d", |e| e.info_mut().name = name);
+        assert!(!doc.squash_since(depth, "none"));
+        assert_eq!(doc.undo_depth(), depth);
+        assert!(!doc.squash_since(depth + 5, "past the end"));
+    }
+
+    #[test]
     fn rejected_edits_leave_no_trace() {
         let mut doc = Document::new(Project::from_template());
         let before = doc.project.clone();
@@ -811,6 +1328,8 @@ mod tests {
                 }),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             })
         })
     }
@@ -856,6 +1375,8 @@ mod tests {
                 }),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             })
         });
         doc.edit("delete", |e| e.remove_element(wall));
@@ -892,6 +1413,8 @@ mod tests {
                     uid: Default::default(),
                     phase_created: Default::default(),
                     phase_demolished: None,
+                    design_option: None,
+                    paints: Vec::new(),
                 });
             }
             let selfie = ElementId(e.alloc_id());
@@ -912,6 +1435,8 @@ mod tests {
                 uid: Default::default(),
                 phase_created: Default::default(),
                 phase_demolished: None,
+                design_option: None,
+                paints: Vec::new(),
             });
             e.remove_element(selfie);
             (a, b)

@@ -25,7 +25,7 @@ fn newell(verts: &[DVec3]) -> DVec3 {
 }
 
 /// Smooth facets meeting at less than this angle (cosine) read as one surface.
-const SMOOTH_COS: f64 = 0.85;
+pub(crate) const SMOOTH_COS: f64 = 0.85;
 
 impl Face {
     pub fn new(verts: Vec<DVec3>, normal: DVec3) -> Self {
@@ -33,7 +33,7 @@ impl Face {
     }
 
     /// Orthonormal in-plane basis `(u, v)`.
-    fn basis(&self) -> (DVec3, DVec3) {
+    pub(crate) fn basis(&self) -> (DVec3, DVec3) {
         // A face built without a normal (its points on one line, or a normal
         // that was zero) gets the normal of its points; with none, any plane.
         let n = if self.normal.length_squared() > 0.5 { self.normal } else { newell(&self.verts) };
@@ -45,11 +45,19 @@ impl Face {
 
     /// Triangles as index triples into `verts`.
     pub fn triangulate(&self) -> Vec<[usize; 3]> {
-        if self.verts.len() == 4 {
-            return vec![[0, 1, 2], [0, 2, 3]];
-        }
         let (u, v) = self.basis();
         let flat: Vec<DVec2> = self.verts.iter().map(|p| DVec2::new(p.dot(u), p.dot(v))).collect();
+        // A quad splits along a diagonal inside it (merged faces need not be convex).
+        if let [a, b, c, d] = flat[..] {
+            let turn = |p: DVec2, q: DVec2, r: DVec2| (q - p).perp_dot(r - p);
+            let ccw = turn(a, b, c) + turn(a, c, d) >= 0.0;
+            let inside = |p: DVec2, q: DVec2, r: DVec2| (turn(p, q, r) >= 0.0) == ccw;
+            return if inside(a, b, c) && inside(a, c, d) {
+                vec![[0, 1, 2], [0, 2, 3]]
+            } else {
+                vec![[1, 2, 3], [1, 3, 0]]
+            };
+        }
         polygon::triangulate(&flat)
     }
 
@@ -74,6 +82,55 @@ pub struct Solid {
     /// 0 (opaque) to 1 (invisible), from the material.
     pub transparency: f64,
     pub faces: Vec<Face>,
+    /// A part the element carries that is not its body (a roof's framing):
+    /// drawn, but left out of its volume, joins and exported body.
+    pub secondary: bool,
+    /// The detail levels of the views that draw it (a component's piece).
+    pub detail: cc_core::component::DetailLevels,
+    /// The material's appearance color and surface pattern (the textures style).
+    pub appearance: [u8; 3],
+    pub surface: cc_core::PatternFill,
+    /// The material the solid is made of (its texture in the textures style).
+    pub material: Option<String>,
+    /// Faces painted with another material, by face index (see [`crate::paint`]).
+    pub painted: std::collections::BTreeMap<usize, Look>,
+}
+
+/// The axes a texture is laid along on a face with normal `n`: plan X and Y
+/// on faces turned up or down, else level across the face (to the right,
+/// seen from outside) and up its slope. A point's plane coordinates are its
+/// dot products with them, in meters (see [`Solid::facet_shifts`]).
+pub fn plane_axes(n: DVec3) -> (DVec3, DVec3) {
+    if n.z.abs() > 0.9 {
+        return (DVec3::X, if n.z >= 0.0 { DVec3::Y } else { -DVec3::Y });
+    }
+    let u = DVec3::new(-n.y, n.x, 0.0).normalize_or(DVec3::X);
+    (u, n.cross(u).normalize_or(DVec3::Z))
+}
+
+/// How a material shows on a face: shading color, appearance color, surface
+/// pattern and transparency, and the material's name (for its texture).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Look {
+    pub material: Option<String>,
+    pub color: [u8; 3],
+    pub appearance: [u8; 3],
+    pub surface: cc_core::PatternFill,
+    pub transparency: f64,
+}
+
+impl Look {
+    /// The look of material `name`; `None` when the project has no such material.
+    pub fn of(project: &cc_core::Project, name: &str) -> Option<Self> {
+        let m = project.material(name)?;
+        Some(Self {
+            material: Some(m.name.clone()),
+            color: m.shading_color(),
+            appearance: m.appearance.color,
+            surface: m.graphics.surface,
+            transparency: project.material_transparency(name),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,15 +141,74 @@ pub struct Ray {
 
 impl Solid {
     pub fn new(element: ElementId, category: Category, color: [u8; 3]) -> Self {
-        Self { element, category, color, transparency: 0.0, faces: Vec::new() }
+        Self {
+            element,
+            category,
+            color,
+            transparency: 0.0,
+            faces: Vec::new(),
+            secondary: false,
+            detail: Default::default(),
+            appearance: color,
+            surface: Default::default(),
+            material: None,
+            painted: Default::default(),
+        }
     }
 
     /// An empty solid colored and made transparent like material `name`.
     pub fn of_material(element: ElementId, category: Category, project: &cc_core::Project, name: &str) -> Self {
-        Self {
+        let mut s = Self {
             transparency: project.material_transparency(name),
             ..Self::new(element, category, project.material_color(name))
+        };
+        s.set_appearance(project, name);
+        s
+    }
+
+    /// Take the appearance color and surface pattern of material `name`
+    /// (what the textures style shows).
+    pub fn set_appearance(&mut self, project: &cc_core::Project, name: &str) {
+        if let Some(m) = project.material(name) {
+            self.appearance = m.appearance.color;
+            self.surface = m.graphics.surface;
+            self.material = Some(m.name.clone());
         }
+    }
+
+    /// How the solid's own material shows (its faces that are not painted).
+    pub fn look(&self) -> Look {
+        Look {
+            material: self.material.clone(),
+            color: self.color,
+            appearance: self.appearance,
+            surface: self.surface,
+            transparency: self.transparency,
+        }
+    }
+
+    /// The paint of face `face`, if it is painted.
+    pub fn paint_of(&self, face: usize) -> Option<&Look> {
+        self.painted.get(&face)
+    }
+
+    /// The nearest face along `ray`: its distance and index.
+    pub fn raycast_face(&self, ray: Ray) -> Option<(f64, usize)> {
+        let mut best: Option<(f64, usize)> = None;
+        for (i, face) in self.faces.iter().enumerate() {
+            for [a, b, c] in face.triangulate() {
+                let (Some(&pa), Some(&pb), Some(&pc)) = (face.verts.get(a), face.verts.get(b), face.verts.get(c))
+                else {
+                    continue;
+                };
+                if let Some(t) = ray_triangle(ray, pa, pb, pc)
+                    && best.is_none_or(|(bt, _)| t < bt)
+                {
+                    best = Some((t, i));
+                }
+            }
+        }
+        best
     }
 
     pub fn bounds(&self) -> Option<(DVec3, DVec3)> {
@@ -175,6 +291,138 @@ impl Solid {
             }
         }
         out
+    }
+
+    /// The shading normal at each vertex of each face: a flat face's own
+    /// normal, and on a smooth facet the average of the normals of the
+    /// smooth facets meeting at that point (those that read as one surface
+    /// with it), so a curved surface shades without steps.
+    pub fn vertex_normals(&self) -> Vec<Vec<DVec3>> {
+        // Facets meet at the same points; look them up on a fine grid.
+        let key = |p: DVec3| {
+            let q = (p * 1e5).round();
+            (q.x as i64, q.y as i64, q.z as i64)
+        };
+        let mut at: std::collections::HashMap<(i64, i64, i64), Vec<usize>> = std::collections::HashMap::new();
+        for (fi, face) in self.faces.iter().enumerate().filter(|(_, f)| f.smooth) {
+            for p in &face.verts {
+                let list = at.entry(key(*p)).or_default();
+                if list.last() != Some(&fi) {
+                    list.push(fi);
+                }
+            }
+        }
+        self.faces
+            .iter()
+            .map(|face| {
+                if !face.smooth {
+                    return vec![face.normal; face.verts.len()];
+                }
+                face.verts
+                    .iter()
+                    .map(|p| {
+                        let sum: DVec3 = at
+                            .get(&key(*p))
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|fj| self.faces.get(*fj))
+                            .map(|other| other.normal)
+                            .filter(|n| n.dot(face.normal) > SMOOTH_COS)
+                            .sum();
+                        let n = sum.normalize_or_zero();
+                        if n == DVec3::ZERO || !n.is_finite() { face.normal } else { n }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// What to add to the plane coordinates of each face (see [`plane_axes`])
+    /// so they run on from one facet of a curved surface to the next: every
+    /// facet has its own axes, so without it patterns and textures would
+    /// start again at each one. Facets are reached from the first of their
+    /// surface across shared edges and agree with the facet they were reached
+    /// from at the middle of that edge (exactly along it when it runs up the
+    /// surface, as on an arc wall); a surface that closes on itself keeps one
+    /// seam.
+    pub fn facet_shifts(&self) -> Vec<[f64; 2]> {
+        let neighbors = self.smooth_neighbors();
+        let coords = |fi: usize, p: DVec3| {
+            let (u, v) = plane_axes(self.faces.get(fi)?.normal);
+            Some([p.dot(u), p.dot(v)])
+        };
+        let mut shifts = vec![[0.0; 2]; self.faces.len()];
+        let mut seen = vec![false; self.faces.len()];
+        let mut queue = std::collections::VecDeque::new();
+        for seed in 0..self.faces.len() {
+            if seen.get(seed) != Some(&false) || neighbors.get(seed).is_none_or(|n| n.is_empty()) {
+                continue;
+            }
+            if let Some(s) = seen.get_mut(seed) {
+                *s = true;
+            }
+            queue.push_back(seed);
+            while let Some(fi) = queue.pop_front() {
+                let base = shifts.get(fi).copied().unwrap_or_default();
+                for &(fj, mid) in neighbors.get(fi).into_iter().flatten() {
+                    if seen.get(fj) != Some(&false) {
+                        continue;
+                    }
+                    let (Some(here), Some(there)) = (coords(fi, mid), coords(fj, mid)) else { continue };
+                    let shift = [base[0] + here[0] - there[0], base[1] + here[1] - there[1]];
+                    if let (Some(s), Some(slot)) = (seen.get_mut(fj), shifts.get_mut(fj)) {
+                        *s = true;
+                        if shift.iter().all(|c| c.is_finite()) {
+                            *slot = shift;
+                        }
+                        queue.push_back(fj);
+                    }
+                }
+            }
+        }
+        shifts
+    }
+
+    /// Per face, the smooth facets that read as one surface with it across a
+    /// shared edge, each with that edge's midpoint (none for a flat face).
+    pub fn smooth_neighbors(&self) -> Vec<Vec<(usize, DVec3)>> {
+        // Facets share their edges' ends; look them up on a fine grid.
+        let key = |p: DVec3| {
+            let q = (p * 1e5).round();
+            (q.x as i64, q.y as i64, q.z as i64)
+        };
+        let edge = |a: DVec3, b: DVec3| {
+            let (a, b) = (key(a), key(b));
+            if a <= b { (a, b) } else { (b, a) }
+        };
+        let sides = |face: &Face| -> Vec<(DVec3, DVec3)> {
+            face.verts.iter().copied().zip(face.verts.iter().copied().cycle().skip(1)).collect()
+        };
+        let mut at: std::collections::HashMap<_, Vec<usize>> = std::collections::HashMap::new();
+        for (fi, face) in self.faces.iter().enumerate().filter(|(_, f)| f.smooth) {
+            for (a, b) in sides(face) {
+                at.entry(edge(a, b)).or_default().push(fi);
+            }
+        }
+        self.faces
+            .iter()
+            .enumerate()
+            .map(|(fi, face)| {
+                if !face.smooth {
+                    return Vec::new();
+                }
+                let mut out = Vec::new();
+                for (a, b) in sides(face) {
+                    for &fj in at.get(&edge(a, b)).into_iter().flatten() {
+                        let joins = self.faces.get(fj).is_some_and(|other| other.normal.dot(face.normal) > SMOOTH_COS);
+                        if fj != fi && joins {
+                            out.push((fj, (a + b) * 0.5));
+                        }
+                    }
+                }
+                out
+            })
+            .collect()
     }
 
     /// Edges between smooth facets (hidden by [`Self::feature_edges`]), per
@@ -273,6 +521,12 @@ impl Solid {
 
     /// Append a prism like [`Self::add_prism`] with openings: `holes` are
     /// outlines inside `footprint` (either winding).
+    ///
+    /// Faces are pushed caps first (top and bottom triangles), then one side
+    /// per edge, last: the edges of `polygon::ccw(footprint)`, then those of
+    /// each hole of three points or more, in the given order, as
+    /// `polygon::ccw(hole)` reversed (clockwise). Without holes it is
+    /// [`Self::add_prism`]. `section::add_column_body` relies on this order.
     pub fn add_prism_with_holes(
         &mut self,
         footprint: &[DVec2],
@@ -322,6 +576,9 @@ impl Solid {
 
     /// Append a prism between two copies of a polygon: `bottom(p)`/`top(p)` give
     /// the z of each footprint vertex (planar surfaces only).
+    ///
+    /// Faces are pushed top, bottom, then one side per edge, last, in the
+    /// order of the footprint wound counter-clockwise ([`polygon::ccw`]).
     pub fn add_prism(&mut self, footprint: &[DVec2], bottom: impl Fn(DVec2) -> f64, top: impl Fn(DVec2) -> f64) {
         let fp = polygon::ccw(footprint);
         let n = fp.len();
@@ -471,6 +728,23 @@ fn ray_triangle(ray: Ray, a: DVec3, b: DVec3, c: DVec3) -> Option<f64> {
 mod tests {
     use super::*;
 
+    /// A concave quad (a dart) splits along the diagonal inside it: the
+    /// triangles cover its area exactly, whichever corner is the reflex one.
+    #[test]
+    fn concave_quads_split_inside() {
+        let dart = [DVec2::new(0.0, 0.0), DVec2::new(2.0, 1.0), DVec2::new(0.0, 2.0), DVec2::new(0.5, 1.0)];
+        for shift in 0..4 {
+            let verts: Vec<DVec3> = (0..4).map(|k| dart[(k + shift) % 4].extend(0.0)).collect();
+            let face = Face::new(verts.clone(), DVec3::Z);
+            let area: f64 = face
+                .triangulate()
+                .iter()
+                .map(|t| (verts[t[1]] - verts[t[0]]).cross(verts[t[2]] - verts[t[0]]).z.abs() / 2.0)
+                .sum();
+            assert!((area - face.area()).abs() < 1e-12, "shift {shift}: {area} vs {}", face.area());
+        }
+    }
+
     /// Regression (issue #51): a prism over a footprint with no area (its
     /// points on one line) has caps without a normal; triangulating them for
     /// the 3D view or a pick in it panicked inside earcutr.
@@ -592,6 +866,40 @@ mod tests {
             f.smooth = true;
         }
         assert_eq!(s.feature_edges(), feature_edges_brute(&s));
+    }
+
+    /// Issue #22: the facets of a curved surface shade as one surface (the
+    /// normal at a shared point is their average), while flat faces and
+    /// facets meeting at a sharp angle keep their own normals.
+    #[test]
+    fn smooth_facets_share_their_vertex_normals() {
+        // Two vertical facets of a cylinder of radius 1, 10° apart, and a flat top.
+        let at = |deg: f64, z: f64| DVec3::new(deg.to_radians().cos(), deg.to_radians().sin(), z);
+        let facet = |a: f64, b: f64| {
+            let mid = ((a + b) / 2.0).to_radians();
+            let mut f =
+                Face::new(vec![at(a, 0.0), at(b, 0.0), at(b, 1.0), at(a, 1.0)], DVec3::new(mid.cos(), mid.sin(), 0.0));
+            f.smooth = true;
+            f
+        };
+        let mut s = Solid::new(ElementId(1), Category::Wall, [0; 3]);
+        s.faces = vec![
+            facet(0.0, 10.0),
+            facet(10.0, 20.0),
+            Face::new(vec![at(0.0, 1.0), at(10.0, 1.0), at(20.0, 1.0)], DVec3::Z),
+        ];
+        let normals = s.vertex_normals();
+        // On the shared edge (at 10°) both facets get the radial direction there.
+        let radial = DVec3::new(10f64.to_radians().cos(), 10f64.to_radians().sin(), 0.0);
+        assert!(normals[0][1].distance(radial) < 1e-9, "{:?}", normals[0][1]);
+        assert!(normals[1][0].distance(radial) < 1e-9, "{:?}", normals[1][0]);
+        // At the outer edges each keeps its own facet's normal; the top stays flat.
+        assert!(normals[0][0].distance(s.faces[0].normal) < 1e-9);
+        assert!(normals[2].iter().all(|n| *n == DVec3::Z));
+        // A sharp corner between smooth facets is not smoothed across.
+        s.faces[1] = facet(10.0, 80.0);
+        let normals = s.vertex_normals();
+        assert!(normals[0][1].distance(s.faces[0].normal) < 1e-9);
     }
 
     #[test]

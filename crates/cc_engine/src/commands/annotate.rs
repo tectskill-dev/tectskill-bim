@@ -16,9 +16,11 @@ use serde_json::Value;
 /// plan X/Y in plans; horizontal position and height in elevations and
 /// sections). Its ends follow the elements (or level lines) their points
 /// lie on, so it keeps measuring them. Aligned dimensions measure from `a`
-/// to `b`, linear ones along a horizontal or vertical `direction`, angular
-/// ones the angle at `vertex` between the rays through `a` and `b`, radial
-/// and diameter ones the arc centered at `a` through `b`.
+/// to `b`, linear ones along a horizontal or vertical `direction`, ordinate
+/// ones from the origin `a` to `b` along that direction (a running
+/// dimension; see `dimension_ordinate_create`), angular ones the angle at
+/// `vertex` between the rays through `a` and `b`, radial and diameter ones
+/// the arc centered at `a` through `b`.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DimensionCreate {
@@ -28,7 +30,7 @@ pub struct DimensionCreate {
     pub a: Point,
     /// Second point (a point on the arc for radial and diameter).
     pub b: Point,
-    /// `aligned` (default), `linear`, `angular`, `radial` or `diameter`.
+    /// `aligned` (default), `linear`, `ordinate`, `angular`, `radial` or `diameter`.
     #[serde(default)]
     pub kind: Option<String>,
     /// Distance of the dimension line from `a` (left of a→b positive), or the arc radius for angular ones (default 1).
@@ -37,7 +39,7 @@ pub struct DimensionCreate {
     /// Vertex of an angular dimension.
     #[serde(default)]
     pub vertex: Option<Point>,
-    /// Linear dimensions: `horizontal` or `vertical` (default: the larger extent).
+    /// Linear and ordinate dimensions: `horizontal` or `vertical` (default: the larger extent).
     #[serde(default)]
     pub direction: Option<String>,
     /// Dimension type id or name (default: the default dimension type).
@@ -52,8 +54,10 @@ impl Command for DimensionCreate {
         let p = s.project();
         let view_id = refs::view(p, &self.view)?;
         let view = p.view(view_id).ok_or_else(|| EngineError::not_found("view"))?;
-        if !(view.is_plan() || view.projection().is_some() || matches!(view.kind, cc_core::ViewKind::Legend { .. })) {
-            return Err(EngineError::invalid("dimensions go in plans, elevations, sections and legends"));
+        if !view.takes_dimensions() {
+            return Err(EngineError::invalid(
+                "dimensions go in plans, elevations, sections, legends and drafting views",
+            ));
         }
         let level = view
             .level()
@@ -63,14 +67,15 @@ impl Command for DimensionCreate {
         let offset = finite(self.offset.unwrap_or(1.0), "offset")?;
         let kind = match self.kind.as_deref().unwrap_or("aligned") {
             "aligned" => DimensionKind::Aligned,
-            "linear" => {
+            kind @ ("linear" | "ordinate") => {
                 let horizontal = match self.direction.as_deref() {
                     Some("horizontal") => true,
                     Some("vertical") => false,
                     None => (b - a).x.abs() >= (b - a).y.abs(),
                     Some(other) => return Err(EngineError::invalid(format!("unknown direction '{other}'"))),
                 };
-                DimensionKind::Linear { dir: if horizontal { DVec2::X } else { DVec2::Y } }
+                let dir = if horizontal { DVec2::X } else { DVec2::Y };
+                if kind == "linear" { DimensionKind::Linear { dir } } else { DimensionKind::Ordinate { dir } }
             }
             "angular" => {
                 let vertex =
@@ -137,8 +142,10 @@ impl Command for DimensionChainCreate {
         let p = s.project();
         let view_id = refs::view(p, &self.view)?;
         let view = p.view(view_id).ok_or_else(|| EngineError::not_found("view"))?;
-        if !(view.is_plan() || view.projection().is_some() || matches!(view.kind, cc_core::ViewKind::Legend { .. })) {
-            return Err(EngineError::invalid("dimensions go in plans, elevations, sections and legends"));
+        if !view.takes_dimensions() {
+            return Err(EngineError::invalid(
+                "dimensions go in plans, elevations, sections, legends and drafting views",
+            ));
         }
         if self.points.len() < 2 || self.points.len() > MAX_CHAIN_POINTS {
             return Err(EngineError::invalid(format!("a dimension chain needs 2 to {MAX_CHAIN_POINTS} points")));
@@ -170,6 +177,85 @@ impl Command for DimensionChainCreate {
             }
         };
         let dims = cc_core::dim_line::chain(view_id, &points, dir, offset, aligned)
+            .ok_or_else(|| EngineError::invalid(t!("msg-dimension-zero")))?;
+        let type_id = refs::type_of(p, Category::Dimension, self.type_ref.as_ref())?;
+        let drawing = s.drawing(view_id).unwrap_or_default();
+        let dims: Vec<Dimension> =
+            dims.iter().map(|d| crate::dimensions::associate(s.project(), &drawing, d)).collect();
+        let ids = edit(s, t!("tx-create-dimension"), |e| {
+            Ok(dims
+                .into_iter()
+                .map(|d| add_element(e, level, type_id, ElementKind::Dimension(Box::new(d))))
+                .collect::<Vec<_>>())
+        })?;
+        Ok(serde_json::json!({ "ids": super::ids_json(&ids), "count": ids.len() }))
+    }
+}
+
+/// Place running (ordinate) dimensions on one dimension line: one dimension
+/// from the origin (the first point) to each other point, measured along
+/// the same direction, each showing its running total from the origin, in
+/// one undo step. Points are in the view's drawing coordinates, as for
+/// `dimension_create`, and each end follows the element (or level line) it
+/// lies on, so the totals follow the model; giving one a new value with
+/// `dimension_set_value` moves what its point measures, keeping the origin.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DimensionOrdinateCreate {
+    /// View id or name.
+    pub view: Ref,
+    /// The origin, then the measured points (at least 2 in all, at most 500).
+    pub points: Vec<Point>,
+    /// Distance of the dimension line from the origin, positive to the left of the direction (default 1).
+    #[serde(default)]
+    pub offset: Option<f64>,
+    /// `horizontal` or `vertical` (default: along the origin and the second point).
+    #[serde(default)]
+    pub direction: Option<String>,
+    /// Direction to measure along, degrees counter-clockwise from the X axis (overrides `direction`).
+    #[serde(default)]
+    pub angle: Option<f64>,
+    /// Dimension type id or name (default: the default dimension type).
+    #[serde(default, rename = "type")]
+    pub type_ref: Option<Ref>,
+}
+
+impl Command for DimensionOrdinateCreate {
+    const NAME: &'static str = "dimension_ordinate_create";
+    const KIND: CommandKind = CommandKind::Edit;
+    fn run(self, s: &mut Session) -> Result<Value> {
+        let p = s.project();
+        let view_id = refs::view(p, &self.view)?;
+        let view = p.view(view_id).ok_or_else(|| EngineError::not_found("view"))?;
+        if !view.takes_dimensions() {
+            return Err(EngineError::invalid(
+                "dimensions go in plans, elevations, sections, legends and drafting views",
+            ));
+        }
+        if self.points.len() < 2 || self.points.len() > MAX_CHAIN_POINTS {
+            return Err(EngineError::invalid(format!("ordinate dimensions need 2 to {MAX_CHAIN_POINTS} points")));
+        }
+        let level = view
+            .level()
+            .or_else(|| p.levels.first().map(|l| l.id))
+            .ok_or_else(|| EngineError::rejected("no levels"))?;
+        let points = self.points.iter().map(|q| point(*q)).collect::<Result<Vec<_>>>()?;
+        let (first, second) = match points.as_slice() {
+            [a, b, ..] => (*a, *b),
+            _ => return Err(EngineError::invalid("ordinate dimensions need at least 2 points")),
+        };
+        let offset = finite(self.offset.unwrap_or(1.0), "offset")?;
+        let dir = match (self.angle, self.direction.as_deref()) {
+            (Some(angle), _) => axis_clean(DVec2::from_angle(finite(angle, "angle")?.to_radians())),
+            (None, Some("horizontal")) => DVec2::X,
+            (None, Some("vertical")) => DVec2::Y,
+            (None, Some(other)) => return Err(EngineError::invalid(format!("unknown direction '{other}'"))),
+            (None, None) => {
+                let d = second - first;
+                if d.x.abs() >= d.y.abs() { DVec2::X } else { DVec2::Y }
+            }
+        };
+        let dims = cc_core::dim_line::ordinate(view_id, &points, dir, offset)
             .ok_or_else(|| EngineError::invalid(t!("msg-dimension-zero")))?;
         let type_id = refs::type_of(p, Category::Dimension, self.type_ref.as_ref())?;
         let drawing = s.drawing(view_id).unwrap_or_default();
@@ -292,7 +378,9 @@ fn annotation_view(p: &cc_core::Project, r: &Ref) -> Result<(cc_core::ViewId, cc
     let id = refs::view(p, r)?;
     let view = p.view(id).ok_or_else(|| EngineError::not_found("view"))?;
     if matches!(view.kind, cc_core::ViewKind::Schedule { .. } | cc_core::ViewKind::Sheet { .. }) {
-        return Err(EngineError::invalid("text goes in plans, elevations, sections, 3D views and legends"));
+        return Err(EngineError::invalid(
+            "text goes in plans, elevations, sections, 3D views, legends and drafting views",
+        ));
     }
     let level =
         view.level().or_else(|| p.levels.first().map(|l| l.id)).ok_or_else(|| EngineError::rejected("no levels"))?;
@@ -378,5 +466,63 @@ impl Command for TextRemoveLeader {
             _ => Err(EngineError::invalid(format!("element {} is not a text", id.0))),
         })?;
         Ok(created(s, id))
+    }
+}
+
+/// Move the tag of an element in a plan (the tag of a door, window, beam,
+/// column or footing): by `delta` from where it is, to `offset` from its
+/// default spot, or back there with `reset`. A tag moved away from its
+/// element gets a leader to it. Each plan keeps its own tag positions.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TagMove {
+    /// Plan id or name.
+    pub view: Ref,
+    /// Id of the element the tag names.
+    pub id: u64,
+    /// Move by `[dx, dy]` meters in plan.
+    #[serde(default)]
+    pub delta: Option<Point>,
+    /// Place the tag `[dx, dy]` meters from its default spot.
+    #[serde(default)]
+    pub offset: Option<Point>,
+    /// Put the tag back in its default spot.
+    #[serde(default)]
+    pub reset: bool,
+}
+
+/// Farthest a tag may be moved from its default spot, meters.
+const MAX_TAG_OFFSET: f64 = 1000.0;
+
+impl Command for TagMove {
+    const NAME: &'static str = "tag_move";
+    const KIND: CommandKind = CommandKind::Edit;
+    fn run(self, s: &mut Session) -> Result<Value> {
+        let p = s.project();
+        let view = refs::view(p, &self.view)?;
+        if p.view(view).and_then(|v| v.level()).is_none() {
+            return Err(EngineError::invalid("tags are moved in floor and ceiling plans"));
+        }
+        let id = refs::element(p, self.id)?;
+        let current = p.view(view).and_then(|v| v.tag_offsets.get(&id).copied()).unwrap_or(DVec2::ZERO);
+        let new = match (self.delta, self.offset, self.reset) {
+            (Some(d), None, false) => current + point(d)?,
+            (None, Some(o), false) => point(o)?,
+            (None, None, true) => DVec2::ZERO,
+            _ => return Err(EngineError::invalid("give one of delta, offset or reset")),
+        };
+        if new.length() > MAX_TAG_OFFSET {
+            return Err(EngineError::invalid(format!("a tag stays within {MAX_TAG_OFFSET} m of its element")));
+        }
+        edit(s, t!("tx-move-tag"), |e| {
+            let v = e.view_mut(view).ok_or_else(|| EngineError::not_found("view"))?;
+            if new == DVec2::ZERO {
+                v.tag_offsets.remove(&id);
+            } else {
+                v.tag_offsets.insert(id, new);
+            }
+            Ok(())
+        })?;
+        Ok(serde_json::json!({ "view": view.0, "id": id.0, "offset": [new.x, new.y] }))
     }
 }

@@ -4,37 +4,22 @@ use crate::i18n::Language;
 use crate::state::{AppState, PendingAction};
 use crate::theme::PALETTE;
 use crate::tools::Tool;
-use crate::{actions, browser, canvas, dialogs, properties, ribbon, schedule_ui, sheet, t, theme, view3d};
+use crate::{actions, canvas, dialogs, ribbon, schedule_ui, sheet, t, theme, view3d};
 use cc_core::{Document, Project, ViewCategory, ViewId};
 use egui::{Event, Key, Modifiers, Ui, WidgetText};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
 
 /// Command-line options.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Args {
     pub path: Option<std::path::PathBuf>,
     /// Views (by name or tab title) to open at startup.
     pub views: Vec<String>,
     pub language: Option<Language>,
+    /// A visual programming graph to open in the graph editor.
+    pub graph: Option<std::path::PathBuf>,
 }
-
-/// eframe storage key of the UI language preference.
-const LANGUAGE_KEY: &str = "language";
-/// eframe storage key of the recent projects (one path per line).
-const RECENT_KEY: &str = "recent_files";
-/// eframe storage key of the component library folders (one path per line).
-const LIBRARY_KEY: &str = "component_library_folders";
-/// eframe storage key of the interface theme ("system", "light" or "dark").
-const THEME_KEY: &str = "theme";
-/// eframe storage key of the collapsed ribbon preference ("1" when collapsed).
-const RIBBON_KEY: &str = "ribbon_collapsed";
-/// eframe storage key of the automatic update check preference ("0" when off).
-const UPDATE_AUTO_KEY: &str = "update_check_auto";
-/// eframe storage key of the time of the last update check (seconds since the Unix epoch).
-const UPDATE_LAST_KEY: &str = "update_check_last";
-/// eframe storage key of the version whose update notice the user skipped.
-const UPDATE_SKIPPED_KEY: &str = "update_skipped_version";
 
 pub struct ConstructApp {
     state: AppState,
@@ -43,43 +28,75 @@ pub struct ConstructApp {
     dock_generation: u64,
     /// Autosave and crash recovery of the open project.
     recovery: crate::recovery::Recovery,
+    /// What the interface last applied of the preferences (theme, zoom, font size).
+    look: crate::preferences::Look,
+    /// The window title last sent (see [`set_title`]).
+    title: String,
+}
+
+/// Set the window title when it changed. Every viewport command asks egui
+/// for another frame, so sending the title each frame kept the app
+/// redrawing without pause while idle (high CPU on slow machines).
+fn set_title(ctx: &egui::Context, last: &mut String, title: String) {
+    if *last != title {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+        *last = title;
+    }
 }
 
 impl ConstructApp {
     /// Create the app; see [`Args`] for the startup options.
     pub fn new(cc: &eframe::CreationContext<'_>, args: Args) -> Self {
-        let Args { path, views, language } = args;
+        let Args { path, views, language, graph } = args;
         crate::theme::apply(&cc.egui_ctx);
         // wgpu panics on an uncaptured GPU error (a validation error or a
         // failed allocation) by default; log it and keep the app (and the
         // open project) alive instead.
         if let Some(rs) = &cc.wgpu_render_state {
-            rs.device.on_uncaptured_error(std::sync::Arc::new(|e| log::error!("GPU error: {e}")));
+            // The first one also goes to the crash log (release builds on Windows have no console).
+            let logged = std::sync::atomic::AtomicBool::new(false);
+            rs.device.on_uncaptured_error(std::sync::Arc::new(move |e| {
+                log::error!("GPU error: {e}");
+                if !logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::recovery::log_event(&format!("GPU error: {e}"));
+                }
+            }));
+            rs.device.set_device_lost_callback(|reason, message| {
+                if reason == wgpu::DeviceLostReason::Unknown {
+                    log::error!("GPU device lost: {message}");
+                    crate::recovery::log_event(&format!("GPU device lost: {message}"));
+                }
+            });
+            let info = rs.adapter.get_info();
+            log::info!("graphics: {} ({:?}, {})", info.name, info.backend, info.driver_info);
         }
-        // Command line, then saved preference, then the operating system language.
-        let saved = cc.storage.and_then(|s| s.get_string(LANGUAGE_KEY)).and_then(|c| Language::from_code(&c));
-        crate::i18n::set_language(language.or(saved).unwrap_or(Language::Th));
+        let stored = |key: &str| cc.storage.and_then(|s| s.get_string(key));
+        // Command line, then saved preference, then the operating system
+        // language; set first, since the placeholder project is named in it.
+        crate::preferences::load_language(stored, language);
         let mut state = AppState::new(Document::new(actions::new_project()));
-        if let Some(recent) = cc.storage.and_then(|s| s.get_string(RECENT_KEY)) {
-            state.recent = recent.lines().filter(|l| !l.is_empty()).map(std::path::PathBuf::from).collect();
+        crate::preferences::load(&mut state, stored, cc.egui_ctx.zoom_factor());
+        crate::plugins_ui::load(&mut state);
+        let mut look = crate::preferences::Look::current(&cc.egui_ctx);
+        crate::preferences::sync_look(&cc.egui_ctx, &mut state.prefs, &mut look);
+        state.updates.start_if_due(&cc.egui_ctx, state.prefs.check_updates);
+        // The executables an update replaced on Windows stay as `.old` until now.
+        if let Ok(exe) = std::env::current_exe() {
+            crate::update_install::remove_old_executables(&exe);
         }
-        if let Some(folders) = cc.storage.and_then(|s| s.get_string(LIBRARY_KEY)) {
-            state.library_folders = folders.lines().filter(|l| !l.is_empty()).map(std::path::PathBuf::from).collect();
-        }
-        state.ribbon_collapsed = cc.storage.and_then(|s| s.get_string(RIBBON_KEY)).is_some_and(|v| v == "1");
-        let stored = |key| cc.storage.and_then(|s| s.get_string(key));
-        state.theme = stored(THEME_KEY).and_then(|v| crate::theme::ThemeChoice::from_code(&v)).unwrap_or_default();
-        crate::theme::set_theme(&cc.egui_ctx, state.theme);
-        state.updates.auto = stored(UPDATE_AUTO_KEY).is_none_or(|v| v != "0");
-        state.updates.last_check = stored(UPDATE_LAST_KEY).and_then(|v| v.parse().ok());
-        state.updates.skipped = stored(UPDATE_SKIPPED_KEY).and_then(|v| crate::update::Version::parse(&v));
-        state.updates.start_if_due(&cc.egui_ctx);
         match path {
-            Some(path) => actions::open_path(&mut state, path),
+            Some(path) => {
+                actions::open_path(&mut state, path);
+                // Before the window shows, so the named views can be found.
+                crate::jobs::wait(&mut state);
+            }
             None => {
                 state.project_open = false;
                 state.show_home = true;
             }
+        }
+        if let Some(graph) = graph {
+            crate::graph_ui::open_path(&mut state, graph);
         }
         let mut named = Vec::new();
         for name in views {
@@ -94,7 +111,7 @@ impl ConstructApp {
         let dock = if named.is_empty() { initial_dock(state.project()) } else { named_dock(&named) };
         let dock_generation = state.generation;
         let recovery = crate::recovery::Recovery::new(crate::recovery::folder());
-        Self { state, dock, dock_generation, recovery }
+        Self { state, dock, dock_generation, recovery, look, title: String::new() }
     }
 }
 
@@ -180,6 +197,15 @@ impl TabViewer for Tabs<'_> {
         OnCloseResponse::Close
     }
 
+    /// Right-click on a tab: close the other views.
+    fn context_menu(&mut self, ui: &mut Ui, tab: &mut ViewId, _path: egui_dock::NodePath) {
+        let enabled = self.state.open_tabs > 1;
+        if ui.add_enabled(enabled, egui::Button::new(t!("action-close-other-views"))).clicked() {
+            self.state.close_others_than = Some(*tab);
+            ui.close();
+        }
+    }
+
     fn scroll_bars(&self, _tab: &ViewId) -> [bool; 2] {
         [false, false]
     }
@@ -187,115 +213,185 @@ impl TabViewer for Tabs<'_> {
 
 impl ConstructApp {
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let state = &mut self.state;
-        let cmd = |i: &mut egui::InputState, k| i.consume_key(Modifiers::COMMAND, k);
-        let cmd_shift = |i: &mut egui::InputState, k| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, k);
-        let (undo, redo, save, save_as, open, new, close) = ctx.input_mut(|i| {
-            let redo = cmd(i, Key::Y) || cmd_shift(i, Key::Z);
-            let close = cmd(i, Key::W);
-            (cmd(i, Key::Z), redo, cmd(i, Key::S), cmd_shift(i, Key::S), cmd(i, Key::O), cmd(i, Key::N), close)
-        });
-        if open {
-            actions::guarded(state, PendingAction::Open);
-        }
-        if ctx.input_mut(|i| cmd_shift(i, Key::P)) {
-            crate::palette::toggle(state);
-        }
-        if ctx.input_mut(|i| cmd(i, Key::F1)) {
-            crate::commands::run(state, ctx, crate::commands::UiCommand::ToggleRibbon);
-        }
-        if new {
-            actions::guarded(state, PendingAction::New);
-        }
-        // The remaining commands act on the project, which the home screen hides.
-        if state.show_home || !state.project_open {
-            return;
-        }
-        if close {
-            actions::guarded(state, PendingAction::Close);
-        }
-        if undo && state.interaction.is_idle() {
-            let _ = state.session.run(cc_engine::commands::project::Undo {});
-        }
-        if redo {
-            let _ = state.session.run(cc_engine::commands::project::Redo {});
-        }
-        if save_as {
-            actions::save(state, true);
-        } else if save {
-            actions::save(state, false);
-        }
+        shortcuts(ctx, &mut self.state);
+    }
+}
 
-        // Plain keys only when no text field has focus.
-        if ctx.memory(|m| m.focused().is_some()) {
-            return;
-        }
-        let (escape, delete, backspace, space, events) = ctx.input(|i| {
-            let keys = (i.key_pressed(Key::Escape), i.key_pressed(Key::Delete), i.key_pressed(Key::Backspace));
-            (keys.0, keys.1, keys.2, i.key_pressed(Key::Space), i.events.clone())
-        });
-        // Space turns or flips the selection (tools use it for their own preview).
-        if space && state.tool == Tool::Select && crate::tools::rotate_selection(state) {
-            state.message = t!("msg-rotated");
-        }
+/// The keyboard shortcuts of the app: Ctrl ones, plain keys and two-letter tool keys.
+pub(crate) fn shortcuts(ctx: &egui::Context, state: &mut AppState) {
+    let cmd = |i: &mut egui::InputState, k| i.consume_key(Modifiers::COMMAND, k);
+    let cmd_shift = |i: &mut egui::InputState, k| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, k);
+    let (undo, redo, save, save_as, open, new, close) = ctx.input_mut(|i| {
+        let redo = cmd(i, Key::Y) || cmd_shift(i, Key::Z);
+        let close = cmd(i, Key::W);
+        (cmd(i, Key::Z), redo, cmd(i, Key::S), cmd_shift(i, Key::S), cmd(i, Key::O), cmd(i, Key::N), close)
+    });
+    // A file being read: the document must stay as it is until it is installed.
+    if crate::jobs::busy(state) {
+        return;
+    }
+    if open {
+        actions::guarded(state, PendingAction::Open);
+    }
+    if ctx.input_mut(|i| cmd_shift(i, Key::P)) {
+        crate::palette::toggle(state);
+    }
+    if ctx.input_mut(|i| cmd(i, Key::Comma)) {
+        crate::commands::run(state, ctx, crate::commands::UiCommand::Preferences);
+    }
+    if ctx.input_mut(|i| cmd(i, Key::F1)) {
+        crate::commands::run(state, ctx, crate::commands::UiCommand::ToggleRibbon);
+    }
+    if new {
+        crate::new_project_dialog::open(state);
+    }
+    // The remaining commands act on the project, which the home screen hides.
+    if state.show_home || !state.project_open {
+        return;
+    }
+    // Over the graph editor, its keys go to the graph.
+    if crate::graph_ui::keys(ctx, state, undo, redo, save, save_as) {
+        return;
+    }
+    if close {
+        actions::guarded(state, PendingAction::Close);
+    }
+    // The same commands as the quick access buttons: an open sketch has its
+    // own undo, and a chain tool steps back and forth a segment (issue #161).
+    if undo {
+        crate::commands::run(state, ctx, crate::commands::UiCommand::Undo);
+    }
+    if redo {
+        crate::commands::run(state, ctx, crate::commands::UiCommand::Redo);
+    }
+    if save_as {
+        actions::save(state, true);
+    } else if save {
+        actions::save(state, false);
+    }
+
+    // Plain keys only when no text field has focus.
+    if ctx.memory(|m| m.focused().is_some()) {
+        return;
+    }
+    let (escape, delete, backspace, space, events) = ctx.input(|i| {
+        let keys = (i.key_pressed(Key::Escape), i.key_pressed(Key::Delete), i.key_pressed(Key::Backspace));
+        (keys.0, keys.1, keys.2, i.key_pressed(Key::Space), i.events.clone())
+    });
+    // Space turns or flips the selection (tools use it for their own preview).
+    if space && state.tool == Tool::Select && state.selection.is_empty() && crate::section_mark::flip(state) {
+        // The selected section mark was flipped.
+    } else if space && state.tool == Tool::Select && crate::tools::rotate_selection(state) {
+        state.message = t!("msg-rotated");
+    }
+    // An open sketch has its own picks and selection.
+    if state.sketch.is_some() {
         if escape {
-            if !state.typed.is_empty() || state.typed.angle_active {
-                state.typed.clear();
-            } else if !state.interaction.is_idle() {
-                state.interaction = Default::default();
-            } else if state.tool != Tool::Select {
-                state.set_tool(Tool::Select);
-            } else {
-                state.selection.clear();
-                state.sheet_selection = None;
+            crate::sketch_mode::escape(state);
+        }
+        if let Some(s) = state.sketch.as_mut() {
+            if delete {
+                s.delete_selected();
             }
-            state.key_buffer.clear();
+            // Lengths typed after the first point (issue #179).
+            if s.typing() {
+                if backspace {
+                    s.typed.pop();
+                }
+                let both = s.draw == crate::sketch_mode::Draw::Rect;
+                for event in &events {
+                    if let Event::Text(text) = event {
+                        text.chars().for_each(|ch| _ = s.typed.type_char(ch, both));
+                    }
+                }
+            }
+        }
+        return;
+    }
+    // The component environment has its own tools and selection.
+    if state.component_env.is_some() {
+        if escape {
+            crate::component_env::escape(state);
         }
         if delete {
-            match state.sheet_selection {
-                Some((sheet, index)) if state.active_view == Some(sheet) => {
-                    actions::remove_viewport(state, sheet, index)
+            crate::component_env::delete_pick(state);
+        }
+        return;
+    }
+    if escape {
+        if !state.typed.is_empty() || state.typed.angle_active {
+            state.typed.clear();
+        } else if crate::detail_ui::escape(state) {
+            // The curve being drawn was dropped; the tool stays.
+        } else if !state.interaction.is_idle() {
+            state.interaction = Default::default();
+        } else if state.tool != Tool::Select {
+            state.set_tool(Tool::Select);
+        } else {
+            state.selection.clear();
+            state.sheet_selection = None;
+            state.section_selection = None;
+        }
+        state.key_buffer.clear();
+    }
+    if delete {
+        match state.sheet_selection {
+            Some((sheet, index)) if state.active_view == Some(sheet) => actions::remove_viewport(state, sheet, index),
+            _ if state.selection.is_empty() && state.section_selection.is_some() => {
+                if let Some(view) = state.section_selection.take() {
+                    actions::run_command(
+                        state,
+                        cc_engine::commands::views::ViewDelete { view: cc_engine::Ref::Id(view.0) },
+                    );
                 }
-                _ => state.delete_selection(),
             }
+            _ => state.delete_selection(),
         }
-        let typing_length = state.typing_segment();
-        if backspace && typing_length {
-            state.typed.pop();
+    }
+    // The tools that take a typed length, and the detail line being drawn (issue #159).
+    let typing_length = state.typing_segment() || crate::detail_ui::typing(state);
+    let two_lengths = state.typing_two_lengths();
+    // Backspace edits a typed length, or else steps a chain back one segment.
+    if backspace {
+        if typing_length && !crate::detail_ui::typed_target(state).is_empty() {
+            crate::detail_ui::typed_target(state).pop();
+        } else {
+            crate::tools::chain_back(state);
         }
-        for event in &events {
-            match event {
-                Event::Copy => {
-                    crate::clipboard::copy(ctx, state);
-                }
-                Event::Cut => crate::clipboard::cut(ctx, state),
-                Event::Paste(_) => crate::clipboard::paste(state),
-                _ => {}
+    }
+    for event in &events {
+        match event {
+            Event::Copy => {
+                crate::clipboard::copy(ctx, state);
             }
+            Event::Cut => crate::clipboard::cut(ctx, state),
+            Event::Paste(_) => crate::clipboard::paste(state),
+            _ => {}
         }
-        for event in events {
-            let Event::Text(text) = event else { continue };
-            for ch in text.chars() {
-                if typing_length && (ch.is_ascii_digit() || ch == ',' || ch == '.') {
-                    state.typed.push(ch);
-                    continue;
-                }
-                if !ch.is_ascii_alphabetic() {
-                    continue;
-                }
-                state.key_buffer.push(ch.to_ascii_uppercase());
-                if state.key_buffer.len() > 2 {
-                    state.key_buffer.remove(0);
-                }
-                // Two-letter shortcuts come from the command table, as the tooltips show them.
-                if let Some(command) = crate::commands::UiCommand::from_keys(&state.key_buffer) {
-                    crate::commands::invoke(state, ctx, command);
-                    state.key_buffer.clear();
-                }
+    }
+    for event in events {
+        let Event::Text(text) = event else { continue };
+        for ch in text.chars() {
+            if typing_length && crate::detail_ui::typed_target(state).type_char(ch, two_lengths) {
+                continue;
+            }
+            if !ch.is_ascii_alphabetic() {
+                continue;
+            }
+            state.key_buffer.push(ch.to_ascii_uppercase());
+            if state.key_buffer.len() > 2 {
+                state.key_buffer.remove(0);
+            }
+            // Two-letter shortcuts come from the command table, as the tooltips show them.
+            if let Some(command) = crate::commands::UiCommand::from_keys(&state.key_buffer) {
+                crate::commands::invoke(state, ctx, command);
+                state.key_buffer.clear();
             }
         }
     }
+}
 
+impl ConstructApp {
     fn handle_close(&mut self, ctx: &egui::Context) {
         let state = &mut self.state;
         if state.quit_confirmed {
@@ -309,35 +405,7 @@ impl ConstructApp {
     }
 
     fn sync_dock(&mut self) {
-        let state = &mut self.state;
-        // Drop tabs whose view no longer exists (deleted or undone).
-        let project = &state.session.doc.project;
-        let mut removed = Vec::new();
-        self.dock.retain_tabs(|tab| {
-            let keep = project.views.contains_key(tab);
-            if !keep {
-                removed.push(*tab);
-            }
-            keep
-        });
-        for tab in removed {
-            if let Some(v) = state.view3d.remove(&tab) {
-                state.textures_to_free.extend(v.texture);
-            }
-        }
-        for id in std::mem::take(&mut state.open_requests) {
-            if state.project().view(id).is_none() {
-                continue;
-            }
-            match self.dock.find_tab(&id) {
-                Some(path) => {
-                    let _ = self.dock.set_active_tab(path);
-                    self.dock.set_focused_node_and_surface(path.node_path());
-                }
-                None => self.dock.push_to_focused_leaf(id),
-            }
-        }
-        state.active_view = active_tab(&mut self.dock);
+        sync_tabs(&mut self.dock, &mut self.state);
     }
 }
 
@@ -345,7 +413,9 @@ impl eframe::App for ConstructApp {
     /// While a segment is drawn, Tab switches the typed field (length or
     /// angle) instead of moving keyboard focus between widgets.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        if !self.state.typing_segment() || ctx.memory(|m| m.focused().is_some()) {
+        let sketch = self.state.sketch.as_ref().is_some_and(|s| s.typing());
+        let detail = crate::detail_ui::typing(&self.state);
+        if !(sketch || detail || self.state.typing_segment()) || ctx.memory(|m| m.focused().is_some()) {
             return;
         }
         let is_tab = |e: &Event| matches!(e, Event::Key { key: Key::Tab, .. });
@@ -353,26 +423,20 @@ impl eframe::App for ConstructApp {
             raw_input.events.iter().filter(|e| matches!(e, Event::Key { key: Key::Tab, pressed: true, .. })).count();
         raw_input.events.retain(|e| !is_tab(e));
         if presses % 2 == 1 {
-            self.state.typed.angle_active = !self.state.typed.angle_active;
+            let typed = match self.state.sketch.as_mut() {
+                Some(s) => &mut s.typed,
+                None => crate::detail_ui::typed_target(&mut self.state),
+            };
+            typed.angle_active = !typed.angle_active;
         }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        storage.set_string(LANGUAGE_KEY, crate::i18n::language().code().to_string());
-        let recent: Vec<String> = self.state.recent.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        storage.set_string(RECENT_KEY, recent.join("\n"));
-        let folders: Vec<String> =
-            self.state.library_folders.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        storage.set_string(LIBRARY_KEY, folders.join("\n"));
-        storage.set_string(RIBBON_KEY, if self.state.ribbon_collapsed { "1" } else { "0" }.to_string());
-        storage.set_string(THEME_KEY, self.state.theme.code().to_string());
-        let updates = &self.state.updates;
-        storage.set_string(UPDATE_AUTO_KEY, if updates.auto { "1" } else { "0" }.to_string());
-        storage.set_string(UPDATE_LAST_KEY, updates.last_check.map(|t| t.to_string()).unwrap_or_default());
-        storage.set_string(UPDATE_SKIPPED_KEY, updates.skipped.map(|v| v.to_string()).unwrap_or_default());
+        crate::preferences::save(&self.state, |key, value| storage.set_string(key, value));
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        crate::gpu::note_frame();
         // A panic in a frame ends the app, as before, but writes a last
         // recovery copy of the open project first (the panic hook has
         // logged it to the crash log).
@@ -386,16 +450,23 @@ impl eframe::App for ConstructApp {
     /// A clean exit: the changes were saved or discarded, so the copy goes.
     fn on_exit(&mut self) {
         self.recovery.exit();
+        // Update Now left the new version to start, or its installer to run.
+        if let Some(next) = self.state.updates.on_exit.take() {
+            crate::update_install::finish(&next);
+        }
     }
 }
 
 impl ConstructApp {
     fn frame(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        crate::preferences::sync_look(&ctx, &mut self.state.prefs, &mut self.look);
         crate::theme::sync(&ctx);
         self.state.sync();
+        self.recovery.set_interval(self.state.prefs.autosave_interval());
         self.recovery.tick(&self.state);
         self.state.updates.poll();
+        crate::jobs::poll(&mut self.state);
         self.state.follow_selection();
         if !self.state.textures_to_free.is_empty()
             && let Some(rs) = frame.wgpu_render_state()
@@ -409,6 +480,7 @@ impl ConstructApp {
             crate::thumbnails::process(&mut self.state, rs);
         }
         self.shortcuts(&ctx);
+        crate::cad_ui::dropped_files(&ctx, &mut self.state);
         if self.dock_generation != self.state.generation {
             self.dock = initial_dock(self.state.project());
             self.dock_generation = self.state.generation;
@@ -422,44 +494,75 @@ impl ConstructApp {
         } else {
             "TectSkill BIM".to_string()
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        set_title(&ctx, &mut self.title, title);
 
         if self.state.show_home {
             crate::home::show(ui, &mut self.state);
             dialogs::show(&ctx, &mut self.state);
             self.recovery.dialog(&ctx, &mut self.state);
             crate::palette::show(&ctx, &mut self.state);
+            crate::jobs::show(&ctx, &mut self.state);
             return;
         }
         let state = &mut self.state;
         let bar = |fill, y| egui::Frame::new().fill(fill).inner_margin(egui::Margin::symmetric(10, y));
-        egui::Panel::top("ribbon")
-            .frame(bar(PALETTE.panel, 6).stroke(egui::Stroke::new(1.0, PALETTE.border)))
-            .show(ui, |ui| ribbon::ribbon(ui, state));
-        egui::Panel::top("options")
-            .frame(bar(PALETTE.surface, 5).stroke(egui::Stroke::new(1.0, PALETTE.border)))
-            .show(ui, |ui| ribbon::options_bar(ui, state));
+        let env = state.component_env.is_some();
+        egui::Panel::top("ribbon").frame(bar(PALETTE.panel, 6).stroke(egui::Stroke::new(1.0, PALETTE.border))).show(
+            ui,
+            |ui| {
+                if state.sketch.is_some() {
+                    crate::sketch_mode::ribbon(ui, state)
+                } else if env {
+                    crate::component_env::ribbon(ui, state)
+                } else {
+                    ribbon::ribbon(ui, state)
+                }
+            },
+        );
+        egui::Panel::top("options").frame(bar(PALETTE.surface, 5).stroke(egui::Stroke::new(1.0, PALETTE.border))).show(
+            ui,
+            |ui| {
+                if env && state.sketch.is_some() {
+                    ui.horizontal(|ui| crate::sketch_mode::options(ui, state));
+                } else if env {
+                    crate::component_env::options(ui, state)
+                } else {
+                    ribbon::options_bar(ui, state)
+                }
+            },
+        );
         egui::Panel::bottom("status")
             .frame(bar(PALETTE.surface, 3).stroke(egui::Stroke::new(1.0, PALETTE.border)))
             .show(ui, |ui| ribbon::status_bar(ui, state));
-        egui::Panel::left("left")
-            .frame(egui::Frame::new().fill(PALETTE.panel).stroke(egui::Stroke::new(1.0, PALETTE.border)))
-            .resizable(true)
-            .default_size(290.0)
-            .size_range(220.0..=520.0)
-            .show(ui, |ui| {
-                let h = ui.available_height();
-                egui::Panel::top("browser")
-                    .frame(egui::Frame::new().fill(PALETTE.panel))
-                    .resizable(true)
-                    .default_size(h * 0.5)
-                    .size_range(120.0..=h - 120.0)
-                    .show(ui, |ui| browser::show(ui, state));
-                properties::show(ui, state);
-            });
+        // The Project Browser and Properties, docked where the user put them.
+        crate::side_panels::show(ui, state);
+        // The visual programming editor, under the views.
+        if state.graph.open && !env {
+            egui::Panel::bottom("graph")
+                .frame(
+                    egui::Frame::new()
+                        .fill(PALETTE.panel)
+                        .stroke(egui::Stroke::new(1.0, PALETTE.border))
+                        .inner_margin(egui::Margin::same(6)),
+                )
+                .resizable(true)
+                .default_size(360.0)
+                .size_range(160.0..=900.0)
+                .show(ui, |ui| crate::graph_ui::show(ui, state));
+        } else {
+            state.graph.hovered = false;
+        }
         let render_state = frame.wgpu_render_state();
         let central = egui::Frame::new().fill(PALETTE.app_bg).inner_margin(egui::Margin::same(4));
         egui::CentralPanel::no_frame().frame(central).show(ui, |ui| {
+            if self.state.component_env.is_some() {
+                crate::component_env::central(ui, &mut self.state);
+                return;
+            }
+            if crate::profile_sketch::is_open(&self.state) {
+                crate::profile_sketch::central(ui, &mut self.state);
+                return;
+            }
             if self.dock.iter_all_tabs().next().is_none() {
                 ui.centered_and_justified(|ui| ui.label(t!("msg-no-views-open")));
             }
@@ -472,12 +575,75 @@ impl ConstructApp {
         dialogs::show(&ctx, &mut self.state);
         self.recovery.dialog(&ctx, &mut self.state);
         crate::palette::show(&ctx, &mut self.state);
+        crate::jobs::show(&ctx, &mut self.state);
     }
+}
+
+/// Bring the view tabs in step with the app: drop tabs of deleted views
+/// (and, after Close Inactive Views, all but one), open requested views,
+/// and record the active view and how many tabs are open.
+fn sync_tabs(dock: &mut DockState<ViewId>, state: &mut AppState) {
+    // Drop tabs whose view no longer exists (deleted or undone).
+    let project = &state.session.doc.project;
+    // Close Inactive Views (or Close Other Views on a tab) keeps one tab.
+    let only = state.close_others_than.take();
+    let mut removed = Vec::new();
+    dock.retain_tabs(|tab| {
+        let keep = project.views.contains_key(tab) && only.is_none_or(|v| v == *tab);
+        if !keep {
+            removed.push(*tab);
+        }
+        keep
+    });
+    for tab in removed {
+        if let Some(v) = state.view3d.remove(&tab) {
+            state.textures_to_free.extend(v.texture);
+        }
+    }
+    // The tab kept takes the focus (closing the others may leave none focused).
+    if let Some(kept) = only {
+        state.open_requests.insert(0, kept);
+    }
+    for id in std::mem::take(&mut state.open_requests) {
+        if state.project().view(id).is_none() {
+            continue;
+        }
+        match dock.find_tab(&id) {
+            Some(path) => {
+                let _ = dock.set_active_tab(path);
+                dock.set_focused_node_and_surface(path.node_path());
+            }
+            None => dock.push_to_focused_leaf(id),
+        }
+    }
+    state.active_view = active_tab(dock);
+    state.open_tabs = dock.iter_all_tabs().count();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An idle app settles: the title is sent only when it changes. Sent
+    /// every frame, as it was, each frame asked for the next one and the
+    /// app redrew without pause.
+    #[test]
+    fn an_unchanged_title_lets_the_app_settle() {
+        // Frames until egui asks for no other (at most 10).
+        let settle = |send: &mut dyn FnMut(&egui::Context)| {
+            let ctx = egui::Context::default();
+            (1..=10).find(|_| {
+                let mut out = ctx.run_ui(Default::default(), |ui| send(ui.ctx()));
+                out.textures_delta.clear();
+                !ctx.has_requested_repaint()
+            })
+        };
+        let mut last = String::new();
+        assert!(settle(&mut |ctx| set_title(ctx, &mut last, "ConstructCraft".into())).is_some_and(|n| n <= 3));
+        let every_frame =
+            |ctx: &egui::Context| ctx.send_viewport_cmd(egui::ViewportCommand::Title("ConstructCraft".into()));
+        assert_eq!(settle(&mut { every_frame }), None, "sending it every frame never settles");
+    }
 
     #[test]
     fn closing_the_last_tab_leaves_no_active_view() {
@@ -492,5 +658,37 @@ mod tests {
         // Opening a view again recreates the tree.
         dock.push_to_focused_leaf(ViewId(2));
         assert_eq!(active_tab(&mut dock), Some(ViewId(2)));
+    }
+
+    /// Close Inactive Views keeps the active tab only; Close Other Views on a
+    /// tab keeps that one (#89).
+    #[test]
+    fn closing_inactive_views_keeps_one_tab() {
+        let mut state = AppState::new(cc_core::Document::new(crate::home::sample_project("casa_simples").unwrap()));
+        state.project_open = true;
+        state.show_home = false;
+        let views: Vec<ViewId> = state.project().views.keys().copied().take(4).collect();
+        let mut dock = DockState::new(vec![views[0]]);
+        let first = dock.find_tab(&views[0]).unwrap();
+        dock.set_focused_node_and_surface(first.node_path());
+        for v in &views {
+            state.open_view(*v);
+        }
+        sync_tabs(&mut dock, &mut state);
+        assert_eq!(state.open_tabs, 4);
+        let active = state.active_view.unwrap();
+        crate::commands::run(&mut state, &egui::Context::default(), crate::commands::UiCommand::CloseInactiveViews);
+        sync_tabs(&mut dock, &mut state);
+        assert_eq!(dock.iter_all_tabs().map(|(_, t)| *t).collect::<Vec<_>>(), [active]);
+        assert_eq!((state.open_tabs, state.active_view), (1, Some(active)));
+        assert!(crate::commands::UiCommand::CloseInactiveViews.unavailable(&state).is_some(), "one view left");
+        // From a tab's menu: that tab stays, even if it is not the active one.
+        for v in &views {
+            state.open_view(*v);
+        }
+        sync_tabs(&mut dock, &mut state);
+        state.close_others_than = Some(views[1]);
+        sync_tabs(&mut dock, &mut state);
+        assert_eq!(dock.iter_all_tabs().map(|(_, t)| *t).collect::<Vec<_>>(), [views[1]]);
     }
 }

@@ -37,14 +37,17 @@ pub fn legend(project: &Project, types: &[ElementTypeId], scale: u32) -> Drawing
             Some(acc.map_or((*p, *p), |(lo, hi)| (lo.min(*p), hi.max(*p))))
         });
         // Door swings and tall component outlines extend above the row; leave room for them.
+        let hinges = t.window_operation().hinges();
+        let door_hinges = t.door_operation().hinges();
         let above = match opening {
-            Some(width) if t.category() == Category::Door => width + 0.075,
+            Some(width) if t.category() == Category::Door => width / door_hinges.len().max(1) as f64 + 0.075,
+            Some(width) if !hinges.is_empty() => width / hinges.len() as f64 + 0.075,
             _ => plan_bounds.map_or(0.0, |(lo, hi)| (hi.y - lo.y) / 2.0),
         };
         y -= above;
         let o = DVec2::new(0.0, y);
         match &t.data {
-            TypeData::Wall { layers, .. } | TypeData::Floor { layers } | TypeData::Roof { layers } => {
+            TypeData::Wall { layers, .. } | TypeData::Floor { layers } | TypeData::Roof { layers, .. } => {
                 let total: f64 = layers.iter().map(|l| l.thickness).sum();
                 let mut v = total * 0.5;
                 for layer in layers {
@@ -73,9 +76,13 @@ pub fn legend(project: &Project, types: &[ElementTypeId], scale: u32) -> Drawing
                 };
                 jamb(&mut d, 0.0, 0.2);
                 jamb(&mut d, 0.2 + width, 0.4 + width);
-                let hinge = o + DVec2::new(0.2, h);
-                d.line(hinge, hinge + DVec2::Y * *width, LineStyle::Projection, None);
-                d.arc(hinge, *width, std::f64::consts::FRAC_PI_2, 0.0, LineStyle::Thin, None);
+                let leaf = width / door_hinges.len().max(1) as f64;
+                for &(at, toward) in door_hinges {
+                    let hinge = o + DVec2::new(0.2 + at * width, h);
+                    let a1 = if toward > 0.0 { 0.0 } else { std::f64::consts::PI };
+                    d.line(hinge, hinge + DVec2::Y * leaf, LineStyle::Projection, None);
+                    d.arc(hinge, leaf, std::f64::consts::FRAC_PI_2, a1, LineStyle::Thin, None);
+                }
             }
             _ if opening.is_some() => {
                 let h = 0.075;
@@ -92,8 +99,21 @@ pub fn legend(project: &Project, types: &[ElementTypeId], scale: u32) -> Drawing
                 for v in [-h, h] {
                     d.line(o + DVec2::new(0.2, v), o + DVec2::new(0.2 + width, v), LineStyle::Projection, None);
                 }
-                for v in [-0.01, 0.01] {
-                    d.line(o + DVec2::new(0.2, v), o + DVec2::new(0.2 + width, v), LineStyle::Thin, None);
+                if t.window_operation() == cc_core::WindowOperation::Sliding {
+                    let (mid, lap) = (0.2 + width / 2.0, (width / 4.0).min(0.05));
+                    d.line(o + DVec2::new(0.2, -0.02), o + DVec2::new(mid + lap, -0.02), LineStyle::Thin, None);
+                    d.line(o + DVec2::new(mid - lap, 0.02), o + DVec2::new(0.2 + width, 0.02), LineStyle::Thin, None);
+                } else {
+                    for v in [-0.01, 0.01] {
+                        d.line(o + DVec2::new(0.2, v), o + DVec2::new(0.2 + width, v), LineStyle::Thin, None);
+                    }
+                }
+                let leaf = width / hinges.len().max(1) as f64;
+                for &(at, toward) in hinges {
+                    let hinge = o + DVec2::new(0.2 + at * width, h);
+                    let a1 = if toward > 0.0 { 0.0 } else { std::f64::consts::PI };
+                    d.line(hinge, hinge + DVec2::Y * leaf, LineStyle::Projection, None);
+                    d.dashed_arc(hinge, leaf, (std::f64::consts::FRAC_PI_2, a1), LineStyle::Hidden, None, scale);
                 }
             }
             TypeData::Ceiling { thickness, .. } => {
@@ -105,32 +125,62 @@ pub fn legend(project: &Project, types: &[ElementTypeId], scale: u32) -> Drawing
                 ];
                 d.polyline(&r, true, LineStyle::Projection, None);
             }
-            TypeData::Column { section, .. } => {
-                let c = o + DVec2::new(0.4, 0.0);
-                for part in cc_geom::section::column_parts(*section, c, 0.0) {
-                    d.fill(part, POCHE, None);
-                }
-                for outline in cc_geom::section::column_loops(*section, c, 0.0) {
-                    d.polyline(&outline, true, LineStyle::Cut, None);
+            TypeData::Column { .. } | TypeData::Beam { .. } => {
+                if let Some(section) = project.type_section(&t.data) {
+                    // A column's section beside the sample's start; a beam's
+                    // standing on the baseline.
+                    let c = if matches!(t.data, TypeData::Beam { .. }) {
+                        let (lo, _) = section.outline.bbox();
+                        o - lo
+                    } else {
+                        o + DVec2::new(0.4, 0.0)
+                    };
+                    let (outer, holes) = cc_geom::section::column_body(&section.outline, c, 0.0);
+                    match cc_geom::polygon::keyhole(&outer, &holes) {
+                        Some(ring) => d.fill(ring, POCHE, None),
+                        None => {
+                            for tri in cc_geom::polygon::triangulate_with_holes(&outer, &holes) {
+                                d.fill(tri.to_vec(), POCHE, None);
+                            }
+                        }
+                    }
+                    for outline in std::iter::once(&outer).chain(&holes) {
+                        d.polyline(outline, true, LineStyle::Cut, None);
+                    }
                 }
             }
-            TypeData::Beam { width, height, shape, .. } => {
-                // Section of the beam.
-                let c = o + DVec2::new(width * 0.5, height * 0.5);
-                for (a, b) in cc_geom::section::shape_rects(*shape, *width, *height) {
-                    let r = vec![c + a, c + DVec2::new(b.x, a.y), c + b, c + DVec2::new(a.x, b.y)];
-                    d.fill(r, POCHE, None);
-                }
-                for outline in cc_geom::section::shape_loops(*shape, *width, *height) {
-                    let pts: Vec<DVec2> = outline.iter().map(|p| c + *p).collect();
-                    d.polyline(&pts, true, LineStyle::Cut, None);
-                }
+            TypeData::Pile { section, .. } => {
+                // The pile's section in plan.
+                let size = section.size();
+                let c = o + DVec2::new(size * 0.5, 0.0);
+                let outline: Vec<DVec2> = match section {
+                    cc_core::pile::PileSection::Round { .. } => (0..48)
+                        .map(|i| c + DVec2::from_angle(i as f64 / 48.0 * std::f64::consts::TAU) * (size * 0.5))
+                        .collect(),
+                    cc_core::pile::PileSection::Square { .. } => [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)]
+                        .iter()
+                        .map(|&(x, y)| c + DVec2::new(x, y) * size)
+                        .collect(),
+                };
+                d.fill(outline.clone(), POCHE, None);
+                d.polyline(&outline, true, LineStyle::Cut, None);
             }
             TypeData::Rebar { .. } => {
                 // A bar, drawn as a heavy line.
                 d.line(o, o + DVec2::new(sample, 0.0), LineStyle::Cut, None);
             }
-            TypeData::Pipe { diameter, .. } | TypeData::Conduit { diameter, .. } => {
+            TypeData::CableTray { width, height, .. } => {
+                // The tray's section: an open channel.
+                let (w, h) = (*width, *height);
+                let pts = [o + DVec2::new(0.0, h), o, o + DVec2::new(w, 0.0), o + DVec2::new(w, h)];
+                d.polyline(&pts, false, LineStyle::Cut, None);
+            }
+            TypeData::Valve { kind, .. } => {
+                crate::mep::valve_symbol(&mut d, o + DVec2::new(3.0 * mm, 0.0), DVec2::X, mm, *kind, None);
+            }
+            TypeData::Pipe { diameter, .. }
+            | TypeData::Conduit { diameter, .. }
+            | TypeData::LightningConductor { diameter, .. } => {
                 // A run of the pipe in plan, at least half a millimeter wide on paper.
                 let h = diameter.max(0.5 * mm) * 0.5;
                 let r = [
@@ -142,11 +192,18 @@ pub fn legend(project: &Project, types: &[ElementTypeId], scale: u32) -> Drawing
                 d.fill(r.to_vec(), POCHE, None);
                 d.polyline(&r, true, LineStyle::Projection, None);
             }
-            TypeData::Foundation { kind, width, thickness, .. } => {
-                // Section: a pad or strip its width wide, a slab as a band.
+            data @ TypeData::Foundation { kind, width, thickness, .. } => {
+                // Section: a pad or strip its width wide (a haunched strip as an inverted T), a slab as a band.
                 let w = if *kind == cc_core::FoundationKind::Slab { sample } else { *width };
-                let r = [o, o + DVec2::new(w, 0.0), o + DVec2::new(w, *thickness), o + DVec2::new(0.0, *thickness)];
-                d.fill(r.to_vec(), POCHE, None);
+                let r: Vec<DVec2> = match data.strip_haunch() {
+                    Some(h) => {
+                        h.outline(*width, *thickness).iter().map(|p| o + DVec2::new(p.x + w / 2.0, p.y)).collect()
+                    }
+                    None => {
+                        vec![o, o + DVec2::new(w, 0.0), o + DVec2::new(w, *thickness), o + DVec2::new(0.0, *thickness)]
+                    }
+                };
+                d.fill(r.clone(), POCHE, None);
                 d.polyline(&r, true, LineStyle::Cut, None);
             }
             TypeData::Stair { tread, max_riser, .. } => {
@@ -176,6 +233,23 @@ pub fn legend(project: &Project, types: &[ElementTypeId], scale: u32) -> Drawing
                     d.line(o + DVec2::new(x, 0.0), o + DVec2::new(x, *height), LineStyle::Thin, None);
                 }
             }
+            TypeData::Sweep { profile, material, .. } => {
+                // The profile's section, enlarged to read at the legend's scale.
+                let (lo, hi) = profile
+                    .iter()
+                    .fold((DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY)), |(lo, hi), p| {
+                        (lo.min(*p), hi.max(*p))
+                    });
+                let size = (hi - lo).max_element();
+                if size.is_finite() && size > 1e-9 {
+                    let k = (10.0 * mm / size).max(1.0);
+                    let at = o - DVec2::new(0.0, (hi.y - lo.y) * k / 2.0);
+                    let pts: Vec<DVec2> = profile.iter().map(|p| at + (*p - lo) * k).collect();
+                    let c = project.material_color(material);
+                    d.fill(pts.clone(), [c[0], c[1], c[2], 255], None);
+                    d.polyline(&pts, true, LineStyle::Cut, None);
+                }
+            }
             TypeData::Component { .. } if device.is_some() => {
                 if let Some((kind, power)) = device {
                     // Wall devices with the wall along the top of the symbol; outlets low.
@@ -194,7 +268,25 @@ pub fn legend(project: &Project, types: &[ElementTypeId], scale: u32) -> Drawing
             }
             // Filtered out above: annotation types have no legend symbol.
             TypeData::Door { .. } | TypeData::Window { .. } => {}
-            TypeData::Room {} | TypeData::Grid { .. } | TypeData::Dimension { .. } | TypeData::Text { .. } => {}
+            TypeData::Room {}
+            | TypeData::Grid { .. }
+            | TypeData::Dimension { .. }
+            | TypeData::Text { .. }
+            | TypeData::LevelMark { .. }
+            | TypeData::BarTag { .. }
+            | TypeData::CadImport {}
+            | TypeData::DetailLine {}
+            | TypeData::FilledRegion { .. }
+            | TypeData::MaskingRegion {}
+            | TypeData::Mass { .. }
+            | TypeData::Shaft {}
+            | TypeData::SteelBuilding {}
+            | TypeData::Truss {}
+            | TypeData::Bracing {}
+            | TypeData::Connection {}
+            | TypeData::WallFraming {}
+            | TypeData::Topography { .. }
+            | TypeData::Pad { .. } => {}
         }
         let width = plan_bounds.map_or(0.0, |(lo, hi)| hi.x - lo.x);
         let text_x = sample.max(width).max(t.opening_size().map_or(0.0, |(w, _)| w + 0.4)) + 6.0 * mm;

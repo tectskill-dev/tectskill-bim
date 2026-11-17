@@ -335,7 +335,7 @@ pub fn size_circuits(project: &Project, geom: &ModelGeometry) -> Vec<CircuitSizi
         let devices: Vec<(ElementId, f64)> = project
             .system_members(*sid)
             .filter_map(|e| match project.mep_data(e) {
-                Some(MepData::Device { device, power }) if device != DeviceKind::Panel => Some((e.id, power)),
+                Some(MepData::Device { device, power, .. }) if device != DeviceKind::Panel => Some((e.id, power)),
                 _ => None,
             })
             .collect();

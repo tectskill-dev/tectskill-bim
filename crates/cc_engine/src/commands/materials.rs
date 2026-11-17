@@ -24,7 +24,22 @@ fn unique_name(p: &Project, base: &str) -> String {
 }
 
 fn material_out(s: &Session, name: &str) -> Value {
-    s.project().material(name).and_then(|m| serde_json::to_value(m).ok()).unwrap_or(json!({ "name": name }))
+    s.project().material(name).map(material_json).unwrap_or(json!({ "name": name }))
+}
+
+/// A material's fields as JSON, its texture's image as a summary (format,
+/// size in pixels and bytes) instead of its bytes.
+pub(crate) fn material_json(m: &Material) -> Value {
+    let mut v = serde_json::to_value(m).unwrap_or(json!({ "name": m.name }));
+    if let (Some(t), Some(slot)) = (&m.appearance.texture, v.pointer_mut("/appearance/texture/image")) {
+        *slot = json!({
+            "format": t.image.format,
+            "width": t.image.width,
+            "height": t.image.height,
+            "bytes": t.image.data.len(),
+        });
+    }
+    v
 }
 
 /// Create a material (default name "Material"; a number is added when taken).
@@ -165,10 +180,167 @@ impl Command for MaterialDelete {
         if users > 0 {
             return Err(EngineError::rejected(format!("{users} types use this material")));
         }
+        let elements = p.material_instance_users(&name).len();
+        if elements > 0 {
+            return Err(EngineError::rejected(format!("{elements} components use this material")));
+        }
+        let painted = p.material_paint_users(&name).len();
+        if painted > 0 {
+            return Err(EngineError::rejected(format!("{painted} elements have faces painted with this material")));
+        }
         edit(s, t!("tx-modify-material"), |e| {
             e.materials_mut().retain(|m| m.name != name);
             Ok(())
         })?;
         Ok(json!({ "deleted": name }))
+    }
+}
+
+/// Give a material an image texture (shown on its faces in the textures
+/// visual style of 3D views), or change how its texture is laid out. The
+/// image comes from `path` or from `data` (base64); with neither, the
+/// current texture's size, offset and rotation change. One repeat covers
+/// `width` × `height` meters on the faces: on floors and other horizontal
+/// faces along plan X and Y, on walls and slopes level across the face and
+/// up it.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MaterialTextureSet {
+    pub material: Ref,
+    /// Path of a PNG, JPEG, GIF, BMP or WebP file.
+    #[serde(default)]
+    pub path: Option<std::path::PathBuf>,
+    /// The image file's bytes as base64 (instead of `path`).
+    #[serde(default)]
+    pub data: Option<String>,
+    /// Width of one repeat, meters (default: the current one, else 1 m).
+    #[serde(default)]
+    pub width: Option<f64>,
+    /// Height of one repeat, meters (default: the current one, else the
+    /// width in the image's proportions).
+    #[serde(default)]
+    pub height: Option<f64>,
+    /// Where a repeat starts, `[x, y]` meters along the face (default: the current one, else `[0, 0]`).
+    #[serde(default)]
+    pub offset: Option<[f64; 2]>,
+    /// Rotation of the image on the faces, degrees counter-clockwise (default: the current one, else 0).
+    #[serde(default)]
+    pub rotation: Option<f64>,
+}
+
+impl Command for MaterialTextureSet {
+    const NAME: &'static str = "material_texture_set";
+    const KIND: CommandKind = CommandKind::Edit;
+    const READS_FILES: bool = true;
+    fn run(self, s: &mut Session) -> Result<Value> {
+        use cc_core::material::{MAX_TEXTURE_BYTES, MAX_TEXTURE_SIZE, MIN_TEXTURE_SIZE, MaterialTexture};
+        let p = s.project();
+        let name = refs::material(p, &self.material)?;
+        let current = p.material(&name).ok_or_else(|| EngineError::not_found("material"))?.appearance.texture.clone();
+        let bytes = match (&self.path, &self.data) {
+            (Some(_), Some(_)) => return Err(EngineError::invalid("give either path or data, not both")),
+            (Some(path), None) => {
+                s.require_files("path")?;
+                if std::fs::metadata(path)?.len() > MAX_TEXTURE_BYTES as u64 {
+                    return Err(EngineError::invalid(t!("err-image-too-large")));
+                }
+                Some(std::fs::read(path)?)
+            }
+            (None, Some(text)) => {
+                if text.len() / 4 * 3 > MAX_TEXTURE_BYTES + 3 {
+                    return Err(EngineError::invalid(t!("err-image-too-large")));
+                }
+                Some(
+                    cc_core::raster::base64_decode(text)
+                        .ok_or_else(|| EngineError::invalid("data is not valid base64"))?,
+                )
+            }
+            (None, None) => None,
+        };
+        let size = |v: Option<f64>, what: &str| -> Result<Option<f64>> {
+            v.map(|v| {
+                if v.is_finite() && (MIN_TEXTURE_SIZE..=MAX_TEXTURE_SIZE).contains(&v) {
+                    Ok(v)
+                } else {
+                    Err(EngineError::invalid(format!(
+                        "{what} must be between {MIN_TEXTURE_SIZE} and {MAX_TEXTURE_SIZE} m"
+                    )))
+                }
+            })
+            .transpose()
+        };
+        let (width, height) = (size(self.width, "width")?, size(self.height, "height")?);
+        let offset =
+            self.offset.map(|[x, y]| Ok::<_, EngineError>([refs::finite(x, "offset")?, refs::finite(y, "offset")?]));
+        let offset = offset.transpose()?;
+        let rotation = self.rotation.map(|r| refs::finite(r, "rotation")).transpose()?;
+        let mut texture = match bytes {
+            Some(bytes) => {
+                let image = crate::session::guard(|| cc_views::raster::probe(bytes))?
+                    .ok_or_else(|| EngineError::invalid(t!("err-image-unreadable")))?;
+                let mut texture = MaterialTexture::new(image, 1.0, 1.0);
+                if !texture.image_ok() {
+                    return Err(EngineError::invalid(t!("err-image-too-large")));
+                }
+                if let Some(c) = &current {
+                    texture = MaterialTexture { image: texture.image, ..c.clone() };
+                }
+                texture
+            }
+            None => current.ok_or_else(|| EngineError::invalid("the material has no texture: give path or data"))?,
+        };
+        // A new texture without a size of its own keeps the image's proportions.
+        let aspect = f64::from(texture.image.height) / f64::from(texture.image.width.max(1));
+        match (width, height) {
+            (Some(w), Some(h)) => (texture.width, texture.height) = (w, h),
+            (Some(w), None) => {
+                texture.width = w;
+                texture.height = (w * aspect).clamp(MIN_TEXTURE_SIZE, MAX_TEXTURE_SIZE);
+            }
+            (None, Some(h)) => texture.height = h,
+            (None, None) => {}
+        }
+        if let Some(o) = offset {
+            texture.offset = o;
+        }
+        if let Some(r) = rotation {
+            texture.rotation_deg = r;
+        }
+        if texture.repair() > 0 {
+            return Err(EngineError::invalid("invalid texture values"));
+        }
+        edit(s, t!("tx-modify-material"), |e| {
+            if let Some(m) = e.materials_mut().iter_mut().find(|m| m.name == name) {
+                m.appearance.texture = Some(texture);
+            }
+            Ok(())
+        })?;
+        Ok(material_out(s, &name))
+    }
+}
+
+/// Take a material's texture away (its faces show the appearance color).
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MaterialTextureClear {
+    pub material: Ref,
+}
+
+impl Command for MaterialTextureClear {
+    const NAME: &'static str = "material_texture_clear";
+    const KIND: CommandKind = CommandKind::Edit;
+    fn run(self, s: &mut Session) -> Result<Value> {
+        let p = s.project();
+        let name = refs::material(p, &self.material)?;
+        if p.material(&name).is_none_or(|m| m.appearance.texture.is_none()) {
+            return Err(EngineError::invalid("the material has no texture"));
+        }
+        edit(s, t!("tx-modify-material"), |e| {
+            if let Some(m) = e.materials_mut().iter_mut().find(|m| m.name == name) {
+                m.appearance.texture = None;
+            }
+            Ok(())
+        })?;
+        Ok(material_out(s, &name))
     }
 }

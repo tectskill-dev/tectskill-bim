@@ -290,6 +290,8 @@ fn schedules_follow_the_phase_and_show_phases() {
         .map(|p| p["name"].as_str().unwrap().to_string())
         .collect();
     let table = s.schedule(ViewId(sched)).unwrap();
+    // Cached until the document changes.
+    assert!(std::rc::Rc::ptr_eq(&table, &s.schedule(ViewId(sched)).unwrap()));
     assert_eq!(table.headers, vec!["col-mark", "col-phase-created", "col-phase-demolished"]);
     assert_eq!(table.rows[1].cells[1].raw(), names[0]);
     assert_eq!(table.rows[1].cells[2].raw(), names[1]);

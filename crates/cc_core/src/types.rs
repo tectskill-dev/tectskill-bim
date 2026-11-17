@@ -26,71 +26,169 @@ pub enum Category {
     /// Electrical conduits.
     Conduit,
     Ramp,
+    /// Imported DWG/DXF drawings (underlays).
+    CadImport,
+    /// Conceptual masses (massing studies).
+    Mass,
+    /// Profiles swept along paths (baseboards, moldings, fascias, gutters).
+    Sweep,
+    /// Shaft openings through floors, ceilings and roofs.
+    Shaft,
+    /// Parametric steel buildings: hosts of portal frames, purlins and girts.
+    SteelBuilding,
+    /// Parametric trusses: hosts of chords, diagonals and posts.
+    Truss,
+    /// Parametric bracings: hosts of the braces of a bay of a frame.
+    Bracing,
+    /// Light steel and wood framing of walls: hosts of studs, tracks, headers and sills.
+    WallFraming,
+    /// Terrain surfaces.
+    Topography,
+    /// Building pads graded into terrain.
+    Pad,
+    /// Title blocks: sheet layouts (components drawn on sheets).
+    TitleBlock,
+    /// Detail lines: 2D lines of one view.
+    DetailLine,
+    /// Filled regions: 2D areas of one view filled with a pattern.
+    FilledRegion,
+    /// Masking regions: 2D areas of one view hiding the model under them.
+    MaskingRegion,
+    /// Level marks: the elevation of a point in a plan, elevation or section.
+    LevelMark,
+    /// Bar tags: the bars of a reinforcement set written in a view.
+    BarTag,
+    /// Piles (deep foundations), free or under pile caps.
+    Pile,
+    /// Detail components: reusable 2D components placed in one view.
+    DetailComponent,
+    /// Cable trays: open runs carrying electrical circuits.
+    CableTray,
+    /// Valves on pipes.
+    Valve,
+    /// Conductors of lightning protection systems.
+    LightningConductor,
+    /// Steel and timber connections: plates and bolts at member ends.
+    Connection,
+    /// Niches: recesses in one face of a wall, hosted like doors and windows.
+    Niche,
 }
 
 impl Category {
-    pub const ALL: [Category; 20] = [
+    pub const ALL: [Category; 42] = [
         Category::Wall,
         Category::Door,
         Category::Window,
+        Category::Niche,
         Category::Floor,
         Category::Ceiling,
         Category::Roof,
         Category::Column,
         Category::Beam,
         Category::Foundation,
+        Category::Pile,
         Category::Rebar,
+        Category::Connection,
         Category::Pipe,
         Category::Conduit,
+        Category::CableTray,
+        Category::Valve,
+        Category::LightningConductor,
         Category::Stair,
         Category::Ramp,
         Category::Railing,
+        Category::Sweep,
         Category::Component,
         Category::Room,
         Category::Grid,
         Category::Dimension,
         Category::Text,
+        Category::DetailLine,
+        Category::FilledRegion,
+        Category::MaskingRegion,
+        Category::DetailComponent,
+        Category::LevelMark,
+        Category::BarTag,
+        Category::CadImport,
+        Category::Mass,
+        Category::Shaft,
+        Category::SteelBuilding,
+        Category::Truss,
+        Category::Bracing,
+        Category::WallFraming,
+        Category::Topography,
+        Category::Pad,
     ];
 
+    /// Every category by name: [`Category::ALL`] (the ones views draw and
+    /// filter) and title blocks, whose types sheets use.
+    pub const NAMED: [Category; Category::ALL.len() + 1] = {
+        let mut out = [Category::TitleBlock; Category::ALL.len() + 1];
+        let mut i = 0;
+        while i < Category::ALL.len() {
+            out[i] = Category::ALL[i];
+            i += 1;
+        }
+        out
+    };
+
     /// Categories with physical elements (shown in legends and 3D).
-    pub const MODEL: [Category; 16] = [
+    pub const MODEL: [Category; 24] = [
         Category::Wall,
         Category::Door,
         Category::Window,
+        Category::Niche,
         Category::Floor,
         Category::Ceiling,
         Category::Roof,
         Category::Column,
         Category::Beam,
         Category::Foundation,
+        Category::Pile,
         Category::Rebar,
+        Category::Connection,
         Category::Pipe,
         Category::Conduit,
+        Category::CableTray,
+        Category::Valve,
+        Category::LightningConductor,
         Category::Stair,
         Category::Ramp,
         Category::Railing,
+        Category::Sweep,
         Category::Component,
+        Category::Topography,
     ];
 
     /// Categories that can be listed in a schedule.
-    pub const SCHEDULABLE: [Category; 17] = [
+    pub const SCHEDULABLE: [Category; 27] = [
         Category::Wall,
         Category::Door,
         Category::Window,
+        Category::Niche,
         Category::Floor,
         Category::Ceiling,
         Category::Roof,
         Category::Column,
         Category::Beam,
         Category::Foundation,
+        Category::Pile,
         Category::Rebar,
+        Category::Connection,
         Category::Pipe,
         Category::Conduit,
+        Category::CableTray,
+        Category::Valve,
+        Category::LightningConductor,
         Category::Stair,
         Category::Ramp,
         Category::Railing,
+        Category::Sweep,
         Category::Component,
         Category::Room,
+        Category::Mass,
+        Category::Topography,
+        Category::Pad,
     ];
 
     pub fn is_model(self) -> bool {
@@ -103,6 +201,7 @@ impl Category {
             Category::Wall => "category-wall",
             Category::Door => "category-door",
             Category::Window => "category-window",
+            Category::Niche => "category-niche",
             Category::Floor => "category-floor",
             Category::Ceiling => "category-ceiling",
             Category::Roof => "category-roof",
@@ -110,22 +209,47 @@ impl Category {
             Category::Grid => "category-grid",
             Category::Dimension => "category-dimension",
             Category::Text => "category-text",
+            Category::LevelMark => "category-level-mark",
+            Category::BarTag => "category-bar-tag",
+            Category::Pile => "category-pile",
+            Category::TitleBlock => "category-title-block",
             Category::Column => "category-column",
             Category::Beam => "category-beam",
             Category::Stair => "category-stair",
             Category::Ramp => "category-ramp",
             Category::Railing => "category-railing",
+            Category::Sweep => "category-sweep",
+            Category::Shaft => "category-shaft",
+            Category::SteelBuilding => "category-steel-building",
+            Category::Truss => "category-truss",
+            Category::Bracing => "category-bracing",
+            Category::Connection => "category-connection",
+            Category::WallFraming => "category-wall-framing",
+            Category::Topography => "category-topography",
+            Category::Pad => "category-pad",
             Category::Component => "category-component",
             Category::Foundation => "category-foundation",
             Category::Rebar => "category-rebar",
             Category::Pipe => "category-pipe",
             Category::Conduit => "category-conduit",
+            Category::CableTray => "category-cable-tray",
+            Category::Valve => "category-valve",
+            Category::LightningConductor => "category-lightning-conductor",
+            Category::CadImport => "category-cad-import",
+            Category::Mass => "category-mass",
+            Category::DetailLine => "category-detail-line",
+            Category::FilledRegion => "category-filled-region",
+            Category::MaskingRegion => "category-masking-region",
+            Category::DetailComponent => "category-detail-component",
         }
     }
 
     /// Whether the category belongs to the building services (MEP).
     pub fn is_mep(self) -> bool {
-        matches!(self, Category::Pipe | Category::Conduit)
+        matches!(
+            self,
+            Category::Pipe | Category::Conduit | Category::CableTray | Category::Valve | Category::LightningConductor
+        )
     }
 }
 
@@ -221,11 +345,17 @@ pub struct TypeInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// A project holds few types, so the size of the component variant does not
+// matter; boxing its definition would only add indirection.
+#[allow(clippy::large_enum_variant)]
 pub enum TypeData {
     Wall {
         layers: Vec<Layer>,
         #[serde(default)]
         function: WallFunction,
+        /// A curtain wall type: a grid of panels and mullions instead of layers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        curtain: Option<crate::curtain::CurtainSystem>,
     },
     Door {
         width: f64,
@@ -247,6 +377,12 @@ pub enum TypeData {
     },
     Roof {
         layers: Vec<Layer>,
+        /// The tiles or sheets it is covered with.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        covering: Option<crate::roofing::TileKind>,
+        /// Purlins, rafters and battens under its sloped faces.
+        #[serde(default)]
+        framing: crate::roofing::RoofFraming,
     },
     /// Rooms have no type parameters yet; the type groups them in schedules.
     Room {},
@@ -254,9 +390,11 @@ pub enum TypeData {
     Grid {
         bubble: f64,
     },
-    /// Linear dimension with text of `text_size` paper millimeters.
+    /// Dimensions with text of `text_size` paper millimeters, drawn as `style` says.
     Dimension {
         text_size: f64,
+        #[serde(default)]
+        style: crate::dim_style::DimensionStyle,
     },
     /// Text notes of `size` paper millimeters; new leaders get `symbol`.
     Text {
@@ -264,9 +402,35 @@ pub enum TypeData {
         #[serde(default)]
         symbol: crate::LeaderSymbol,
     },
+    /// Level marks with text of `text_size` paper millimeters, writing
+    /// `datum` plus each level, followed by `finished_suffix` (the finished
+    /// level) or `raw_suffix` (the raw, structural one).
+    /// Bar tags with text of `text_size` paper millimeters.
+    BarTag {
+        text_size: f64,
+    },
+    LevelMark {
+        text_size: f64,
+        #[serde(default)]
+        datum: f64,
+        #[serde(default)]
+        finished_suffix: String,
+        #[serde(default)]
+        raw_suffix: String,
+    },
     Column {
         section: ColumnSection,
         material: String,
+        /// The structural profile of the section; when set, `section` is its
+        /// bounding box, kept in step.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<crate::ProfileId>,
+        /// Turn of the profile in its section plane, degrees counterclockwise.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        profile_rotation_deg: f64,
+        /// The profile mirrored across its vertical axis (before turning).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        profile_mirror: bool,
     },
     /// Beam section `width` x `height`, solid or a profile within that box.
     Beam {
@@ -275,11 +439,30 @@ pub enum TypeData {
         material: String,
         #[serde(default)]
         shape: SectionShape,
+        /// The structural profile of the section; when set, `width`, `height`
+        /// and `shape` are its bounding box, kept in step.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<crate::ProfileId>,
+        /// Turn of the profile in its section plane, degrees counterclockwise.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        profile_rotation_deg: f64,
+        /// The profile mirrored across its vertical axis (before turning).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        profile_mirror: bool,
     },
     /// Reinforcing bars of `diameter`.
     Rebar {
         diameter: f64,
         material: String,
+        /// Steel grade (e.g. "CA-50"); empty for none. Bars of different
+        /// grades never share a mark, and bending schedules total by it.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        grade: String,
+        /// Mass per meter, kg/m, when it is not that of a round bar of
+        /// `diameter` in steel of 7850 kg/m³ (ribbed bars are listed by
+        /// their nominal mass).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mass_per_meter: Option<f64>,
     },
     /// Pipes of outside `diameter`.
     Pipe {
@@ -291,13 +474,46 @@ pub enum TypeData {
         diameter: f64,
         material: String,
     },
+    /// Cable trays of outside `width` x `height`, built as `style` says.
+    CableTray {
+        width: f64,
+        height: f64,
+        #[serde(default)]
+        style: crate::TrayStyle,
+        material: String,
+    },
+    /// Valves of `kind` (their diameter is their pipe's).
+    Valve {
+        #[serde(default)]
+        kind: crate::ValveKind,
+        material: String,
+    },
+    /// Lightning protection conductors: round conductors of `diameter`.
+    LightningConductor {
+        diameter: f64,
+        material: String,
+    },
     /// Foundation: a pad `width` x `length`, a strip `width` wide or a slab,
-    /// each `thickness` deep.
+    /// each `thickness` deep. A strip with a `haunch` is an inverted T: a
+    /// footing slab `thickness` deep at the faces of a beam on top of it.
     Foundation {
         kind: FoundationKind,
         width: f64,
         length: f64,
         thickness: f64,
+        material: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        haunch: Option<StripHaunch>,
+        /// Pile caps only: the piles and their layout (the type's `width`
+        /// and `length` are kept as its outline's size, see [`crate::pile`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pile_cap: Option<crate::pile::PileCap>,
+    },
+    /// Piles of `section` made as `kind` says, in `material`.
+    Pile {
+        section: crate::pile::PileSection,
+        #[serde(default)]
+        kind: crate::pile::PileKind,
         material: String,
     },
     /// Stair: risers at most `max_riser` high, treads `tread` deep (or from
@@ -332,14 +548,95 @@ pub enum TypeData {
         component: String,
         def: crate::component::ComponentDef,
     },
+    /// Imported CAD drawings have no type parameters; the type names them.
+    CadImport {},
+    /// Detail lines have no type parameters (each line has its style).
+    DetailLine {},
+    /// Filled regions: how they are filled (see [`crate::region`]).
+    FilledRegion {
+        #[serde(default)]
+        fill: crate::PatternFill,
+    },
+    /// Masking regions have no type parameters (they are opaque white).
+    MaskingRegion {},
+    /// Conceptual masses, shown in `material`.
+    Mass {
+        material: String,
+    },
+    /// Swept profiles: the closed `profile` (x across, to the left of the
+    /// path; y up), shown in `material`.
+    Sweep {
+        profile: Vec<glam::DVec2>,
+        material: String,
+        /// The curves the profile was drawn with (arcs kept as arcs), dropped
+        /// when the profile is changed without them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sketch: Option<crate::sketch::Sketch>,
+    },
+    /// Shaft openings (no properties of their own).
+    Shaft {},
+    /// Steel buildings (no properties of their own; types name them).
+    SteelBuilding {},
+    /// Trusses (no properties of their own; types name them).
+    Truss {},
+    /// Bracings (no properties of their own; types name them).
+    Bracing {},
+    /// Connections (no properties of their own; types name them).
+    Connection {},
+    /// Wall framings (no properties of their own; types name them).
+    WallFraming {},
+    /// Terrain surfaces: the earth `material` they are cut in, and the
+    /// spacing of their contour lines, every `major_every`-th one a major.
+    Topography {
+        material: String,
+        #[serde(default = "crate::types::default_contour_interval")]
+        contour_interval: f64,
+        #[serde(default = "crate::types::default_major_every")]
+        major_every: u32,
+    },
+    /// Building pads: the horizontal run per unit of rise of their cut and
+    /// fill slopes.
+    Pad {
+        #[serde(default = "crate::types::default_cut_slope")]
+        cut_slope: f64,
+        #[serde(default = "crate::types::default_fill_slope")]
+        fill_slope: f64,
+    },
+}
+
+pub(crate) fn default_cut_slope() -> f64 {
+    crate::pad::DEFAULT_CUT_SLOPE
+}
+
+pub(crate) fn default_fill_slope() -> f64 {
+    crate::pad::DEFAULT_FILL_SLOPE
+}
+
+pub(crate) fn default_contour_interval() -> f64 {
+    crate::topography::DEFAULT_CONTOUR_INTERVAL
+}
+
+pub(crate) fn default_major_every() -> u32 {
+    crate::topography::DEFAULT_MAJOR_EVERY
 }
 
 impl TypeData {
+    /// A type of reinforcing bars of `diameter` in `material`, with no grade
+    /// and the mass per meter of a round bar.
+    pub fn rebar(diameter: f64, material: String) -> TypeData {
+        TypeData::Rebar { diameter, material, grade: String::new(), mass_per_meter: None }
+    }
+
     /// Material names referenced by this type.
     pub fn materials(&self) -> Vec<&str> {
         match self {
-            TypeData::Wall { layers, .. } | TypeData::Floor { layers } | TypeData::Roof { layers } => {
+            TypeData::Wall { curtain: Some(c), .. } => c.materials(),
+            TypeData::Wall { layers, .. } | TypeData::Floor { layers } => {
                 layers.iter().map(|l| l.material.as_str()).collect()
+            }
+            TypeData::Roof { layers, framing, .. } => {
+                let framed = (!framing.material.is_empty()).then_some(framing.material.as_str());
+                layers.iter().map(|l| l.material.as_str()).chain(framed).collect()
             }
             TypeData::Door { material, .. }
             | TypeData::Window { material, .. }
@@ -348,15 +645,46 @@ impl TypeData {
             | TypeData::Beam { material, .. }
             | TypeData::Foundation { material, .. }
             | TypeData::Rebar { material, .. }
+            | TypeData::Pile { material, .. }
             | TypeData::Pipe { material, .. }
             | TypeData::Conduit { material, .. }
+            | TypeData::CableTray { material, .. }
+            | TypeData::Valve { material, .. }
+            | TypeData::LightningConductor { material, .. }
             | TypeData::Stair { material, .. }
             | TypeData::Ramp { material, .. }
-            | TypeData::Railing { material, .. } => vec![material.as_str()],
-            TypeData::Component { def, .. } => def.items.iter().map(|i| i.material.as_str()).collect(),
-            TypeData::Room {} | TypeData::Grid { .. } | TypeData::Dimension { .. } | TypeData::Text { .. } => {
-                Vec::new()
-            }
+            | TypeData::Railing { material, .. }
+            | TypeData::Mass { material }
+            | TypeData::Topography { material, .. }
+            | TypeData::Sweep { material, .. } => vec![material.as_str()],
+            TypeData::Component { def, .. } => def
+                .items
+                .iter()
+                .map(|i| i.material.as_str())
+                .chain(
+                    def.params
+                        .iter()
+                        .filter(|p| p.kind == crate::ParamKind::Material && !p.text.is_empty())
+                        .map(|p| p.text.as_str()),
+                )
+                .collect(),
+            TypeData::Room {}
+            | TypeData::Grid { .. }
+            | TypeData::Dimension { .. }
+            | TypeData::Text { .. }
+            | TypeData::LevelMark { .. }
+            | TypeData::BarTag { .. }
+            | TypeData::CadImport {}
+            | TypeData::DetailLine {}
+            | TypeData::FilledRegion { .. }
+            | TypeData::MaskingRegion {}
+            | TypeData::Shaft {}
+            | TypeData::SteelBuilding {}
+            | TypeData::Truss {}
+            | TypeData::Bracing {}
+            | TypeData::Connection {}
+            | TypeData::WallFraming {}
+            | TypeData::Pad { .. } => Vec::new(),
         }
     }
 
@@ -364,7 +692,8 @@ impl TypeData {
     /// structure layer of layered types (else the thickest), or the main material.
     pub fn cut_material(&self) -> &str {
         match self {
-            TypeData::Wall { layers, .. } | TypeData::Floor { layers } | TypeData::Roof { layers } => layers
+            TypeData::Wall { curtain: Some(c), .. } => c.main_material(),
+            TypeData::Wall { layers, .. } | TypeData::Floor { layers } | TypeData::Roof { layers, .. } => layers
                 .iter()
                 .find(|l| l.function == LayerFunction::Structure)
                 .or_else(|| layers.iter().max_by(|a, b| a.thickness.total_cmp(&b.thickness)))
@@ -385,8 +714,16 @@ impl TypeData {
             }
         };
         match self {
-            TypeData::Wall { layers, .. } | TypeData::Floor { layers } | TypeData::Roof { layers } => {
-                layers.iter_mut().for_each(|l| fix(&mut l.material))
+            TypeData::Wall { layers, curtain, .. } => {
+                layers.iter_mut().for_each(|l| fix(&mut l.material));
+                if let Some(c) = curtain {
+                    c.rename_material(old, new);
+                }
+            }
+            TypeData::Floor { layers } => layers.iter_mut().for_each(|l| fix(&mut l.material)),
+            TypeData::Roof { layers, framing, .. } => {
+                layers.iter_mut().for_each(|l| fix(&mut l.material));
+                fix(&mut framing.material);
             }
             TypeData::Door { material, .. }
             | TypeData::Window { material, .. }
@@ -395,15 +732,45 @@ impl TypeData {
             | TypeData::Beam { material, .. }
             | TypeData::Foundation { material, .. }
             | TypeData::Rebar { material, .. }
+            | TypeData::Pile { material, .. }
             | TypeData::Pipe { material, .. }
             | TypeData::Conduit { material, .. }
+            | TypeData::CableTray { material, .. }
+            | TypeData::Valve { material, .. }
+            | TypeData::LightningConductor { material, .. }
             | TypeData::Stair { material, .. }
             | TypeData::Ramp { material, .. }
-            | TypeData::Railing { material, .. } => fix(material),
-            TypeData::Component { def, .. } => def.items.iter_mut().for_each(|i| fix(&mut i.material)),
-            TypeData::Room {} | TypeData::Grid { .. } | TypeData::Dimension { .. } | TypeData::Text { .. } => {}
+            | TypeData::Railing { material, .. }
+            | TypeData::Mass { material }
+            | TypeData::Topography { material, .. }
+            | TypeData::Sweep { material, .. } => fix(material),
+            TypeData::Component { def, .. } => {
+                def.items.iter_mut().for_each(|i| fix(&mut i.material));
+                def.params.iter_mut().filter(|p| p.kind == crate::ParamKind::Material).for_each(|p| fix(&mut p.text));
+            }
+            TypeData::Room {}
+            | TypeData::Grid { .. }
+            | TypeData::Dimension { .. }
+            | TypeData::Text { .. }
+            | TypeData::LevelMark { .. }
+            | TypeData::BarTag { .. }
+            | TypeData::CadImport {}
+            | TypeData::DetailLine {}
+            | TypeData::FilledRegion { .. }
+            | TypeData::MaskingRegion {}
+            | TypeData::Shaft {}
+            | TypeData::SteelBuilding {}
+            | TypeData::Truss {}
+            | TypeData::Bracing {}
+            | TypeData::Connection {}
+            | TypeData::WallFraming {}
+            | TypeData::Pad { .. } => {}
         }
     }
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// Cross-section of a column type.
@@ -485,23 +852,104 @@ impl SectionShape {
     }
 }
 
-/// What a foundation type is: a pad under a column, a strip under a wall or a slab.
+/// What a foundation type is: a pad under a column, a strip under a wall, a
+/// slab, or a cap on piles (see [`crate::pile`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum FoundationKind {
     #[default]
     Pad,
     Strip,
     Slab,
+    PileCap,
+}
+
+/// The section of a strip footing with a beam on top (an inverted T): the
+/// footing slab is the type's `thickness` deep at the faces of the beam and
+/// `edge_thickness` at its edges, its top sloping between them (a haunch;
+/// flat when the two are equal), and the beam `beam_width` wide rises
+/// `beam_height` above the slab (0: a sloped footing with a flat middle).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StripHaunch {
+    pub edge_thickness: f64,
+    pub beam_width: f64,
+    pub beam_height: f64,
+}
+
+impl StripHaunch {
+    /// Highest beam, meters.
+    pub const MAX_HEIGHT: f64 = 10.0;
+
+    /// Whether the values make a section in a strip `width` wide and
+    /// `thickness` deep at the beam: an edge no thicker than that, a beam
+    /// narrower than the strip.
+    pub fn fits(&self, width: f64, thickness: f64) -> bool {
+        let positive = |v: f64| v.is_finite() && v > 1e-4;
+        positive(self.edge_thickness)
+            && self.edge_thickness <= thickness + 1e-9
+            && positive(self.beam_width)
+            && self.beam_width < width - 1e-4
+            && self.beam_height.is_finite()
+            && (0.0..=Self::MAX_HEIGHT).contains(&self.beam_height)
+    }
+
+    /// The section of a strip `width` wide and `thickness` deep at the beam:
+    /// `x` across (centered), `y` up from the bottom, counter-clockwise.
+    pub fn outline(&self, width: f64, thickness: f64) -> Vec<glam::DVec2> {
+        let (w, b) = (width / 2.0, self.beam_width / 2.0);
+        let (edge, top) = (self.edge_thickness, thickness + self.beam_height);
+        let mut pts = vec![
+            glam::DVec2::new(-w, 0.0),
+            glam::DVec2::new(w, 0.0),
+            glam::DVec2::new(w, edge),
+            glam::DVec2::new(b, thickness),
+        ];
+        if self.beam_height > 0.0 {
+            pts.extend([glam::DVec2::new(b, top), glam::DVec2::new(-b, top)]);
+        }
+        pts.extend([glam::DVec2::new(-b, thickness), glam::DVec2::new(-w, edge)]);
+        pts
+    }
+
+    /// Area of that section.
+    pub fn area(&self, width: f64, thickness: f64) -> f64 {
+        let slope = (width - self.beam_width) * (self.edge_thickness + thickness) / 2.0;
+        slope + self.beam_width * (thickness + self.beam_height)
+    }
+}
+
+impl TypeData {
+    /// Depth of a foundation from its top to its bottom: its thickness,
+    /// plus the beam on top of a haunched strip. 0 for other types.
+    pub fn foundation_depth(&self) -> f64 {
+        match self {
+            TypeData::Foundation { thickness, haunch, kind, .. } => {
+                thickness + haunch.filter(|_| *kind == FoundationKind::Strip).map_or(0.0, |h| h.beam_height)
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// The haunch of a strip footing type (`None` for a plain strip and other types).
+    pub fn strip_haunch(&self) -> Option<StripHaunch> {
+        match self {
+            TypeData::Foundation { kind: FoundationKind::Strip, width, thickness, haunch, .. } => {
+                haunch.filter(|h| h.fits(*width, *thickness))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl FoundationKind {
-    pub const ALL: [FoundationKind; 3] = [FoundationKind::Pad, FoundationKind::Strip, FoundationKind::Slab];
+    pub const ALL: [FoundationKind; 4] =
+        [FoundationKind::Pad, FoundationKind::Strip, FoundationKind::Slab, FoundationKind::PileCap];
 
     pub fn key(self) -> &'static str {
         match self {
             FoundationKind::Pad => "foundation-pad",
             FoundationKind::Strip => "foundation-strip",
             FoundationKind::Slab => "foundation-slab",
+            FoundationKind::PileCap => "foundation-pile-cap",
         }
     }
 }
@@ -531,22 +979,44 @@ impl ElementType {
             TypeData::Grid { .. } => Category::Grid,
             TypeData::Dimension { .. } => Category::Dimension,
             TypeData::Text { .. } => Category::Text,
+            TypeData::LevelMark { .. } => Category::LevelMark,
+            TypeData::BarTag { .. } => Category::BarTag,
+            TypeData::Pile { .. } => Category::Pile,
             TypeData::Column { .. } => Category::Column,
             TypeData::Beam { .. } => Category::Beam,
             TypeData::Foundation { .. } => Category::Foundation,
             TypeData::Rebar { .. } => Category::Rebar,
             TypeData::Pipe { .. } => Category::Pipe,
             TypeData::Conduit { .. } => Category::Conduit,
+            TypeData::CableTray { .. } => Category::CableTray,
+            TypeData::Valve { .. } => Category::Valve,
+            TypeData::LightningConductor { .. } => Category::LightningConductor,
             TypeData::Stair { .. } => Category::Stair,
             TypeData::Ramp { .. } => Category::Ramp,
             TypeData::Railing { .. } => Category::Railing,
             TypeData::Component { def, .. } => def.category(),
+            TypeData::CadImport {} => Category::CadImport,
+            TypeData::DetailLine {} => Category::DetailLine,
+            TypeData::FilledRegion { .. } => Category::FilledRegion,
+            TypeData::MaskingRegion {} => Category::MaskingRegion,
+            TypeData::Mass { .. } => Category::Mass,
+            TypeData::Sweep { .. } => Category::Sweep,
+            TypeData::Shaft {} => Category::Shaft,
+            TypeData::SteelBuilding {} => Category::SteelBuilding,
+            TypeData::Truss {} => Category::Truss,
+            TypeData::Bracing {} => Category::Bracing,
+            TypeData::Connection {} => Category::Connection,
+            TypeData::WallFraming {} => Category::WallFraming,
+            TypeData::Topography { .. } => Category::Topography,
+            TypeData::Pad { .. } => Category::Pad,
         }
     }
 
+    /// The layers of a layered type (none for curtain walls).
     pub fn layers(&self) -> &[Layer] {
         match &self.data {
-            TypeData::Wall { layers, .. } | TypeData::Floor { layers } | TypeData::Roof { layers } => layers,
+            TypeData::Wall { curtain: Some(_), .. } => &[],
+            TypeData::Wall { layers, .. } | TypeData::Floor { layers } | TypeData::Roof { layers, .. } => layers,
             _ => &[],
         }
     }
@@ -555,6 +1025,7 @@ impl ElementType {
     pub fn thickness(&self) -> f64 {
         match &self.data {
             TypeData::Ceiling { thickness, .. } | TypeData::Foundation { thickness, .. } => *thickness,
+            TypeData::Wall { curtain: Some(c), .. } => c.thickness(),
             _ => self.layers().iter().map(|l| l.thickness).sum(),
         }
     }
@@ -562,9 +1033,34 @@ impl ElementType {
     /// Outside diameter of pipe, conduit and rebar types.
     pub fn diameter(&self) -> Option<f64> {
         match self.data {
-            TypeData::Pipe { diameter, .. } | TypeData::Conduit { diameter, .. } | TypeData::Rebar { diameter, .. } => {
-                Some(diameter)
-            }
+            TypeData::Pipe { diameter, .. }
+            | TypeData::Conduit { diameter, .. }
+            | TypeData::Rebar { diameter, .. }
+            | TypeData::LightningConductor { diameter, .. } => Some(diameter),
+            _ => None,
+        }
+    }
+
+    /// Outside width, height and style of cable tray types.
+    pub fn tray_section(&self) -> Option<(f64, f64, crate::TrayStyle)> {
+        match self.data {
+            TypeData::CableTray { width, height, style, .. } => Some((width, height, style)),
+            _ => None,
+        }
+    }
+
+    /// What valves of a valve type do.
+    pub fn valve_kind(&self) -> Option<crate::ValveKind> {
+        match self.data {
+            TypeData::Valve { kind, .. } => Some(kind),
+            _ => None,
+        }
+    }
+
+    /// The curtain grid of a curtain wall type.
+    pub fn curtain(&self) -> Option<&crate::curtain::CurtainSystem> {
+        match &self.data {
+            TypeData::Wall { curtain, .. } => curtain.as_ref(),
             _ => None,
         }
     }
@@ -594,12 +1090,57 @@ impl ElementType {
         }
     }
 
+    /// Position of a wall's location line `line` across a wall of this type,
+    /// measured from the centerline towards the exterior (left) face.
+    pub fn location_offset(&self, line: crate::LocationLine) -> f64 {
+        use crate::LocationLine as L;
+        let half = self.thickness() * 0.5;
+        let (core_ext, core_int) = self.core_range();
+        match line {
+            L::Centerline => 0.0,
+            L::FinishExterior => half,
+            L::FinishInterior => -half,
+            L::CoreExterior => half - core_ext,
+            L::CoreInterior => half - core_int,
+            L::CoreCenter => half - (core_ext + core_int) * 0.5,
+        }
+    }
+
     /// Width/height of an opening type (doors, windows).
     pub fn opening_size(&self) -> Option<(f64, f64)> {
         match &self.data {
             TypeData::Door { width, height, .. } | TypeData::Window { width, height, .. } => Some((*width, *height)),
             TypeData::Component { def, .. } => def.opening_size(),
             _ => None,
+        }
+    }
+
+    /// The depth of a niche type's recess; `None` for types that open their
+    /// wall through (doors, windows) and for anything else.
+    pub fn opening_depth(&self) -> Option<f64> {
+        match &self.data {
+            TypeData::Component { def, .. } if def.kind == crate::ComponentKind::Niche => def.opening_depth(),
+            _ => None,
+        }
+    }
+
+    /// How the panels of a window type open (fixed for anything else).
+    pub fn window_operation(&self) -> crate::WindowOperation {
+        match &self.data {
+            TypeData::Component { def, .. } if def.kind == crate::ComponentKind::Window => {
+                def.opening.as_ref().map(|o| o.operation).unwrap_or_default()
+            }
+            _ => crate::WindowOperation::Fixed,
+        }
+    }
+
+    /// How the leaves of a door type swing (one leaf hinged on the left for anything else).
+    pub fn door_operation(&self) -> crate::DoorOperation {
+        match &self.data {
+            TypeData::Component { def, .. } if def.kind == crate::ComponentKind::Door => {
+                def.opening.as_ref().map(|o| o.door_operation).unwrap_or_default()
+            }
+            _ => crate::DoorOperation::SingleSwingLeft,
         }
     }
 
@@ -619,19 +1160,43 @@ impl ElementType {
             TypeData::Door { material, .. }
             | TypeData::Window { material, .. }
             | TypeData::Ceiling { material, .. } => material,
-            TypeData::Wall { layers, .. } | TypeData::Roof { layers } => {
+            TypeData::Wall { curtain: Some(c), .. } => c.main_material(),
+            TypeData::Wall { layers, .. } | TypeData::Roof { layers, .. } => {
                 layers.first().map_or("", |l| l.material.as_str())
             }
-            TypeData::Room {} | TypeData::Grid { .. } | TypeData::Dimension { .. } | TypeData::Text { .. } => "",
+            TypeData::Room {}
+            | TypeData::Grid { .. }
+            | TypeData::Dimension { .. }
+            | TypeData::Text { .. }
+            | TypeData::LevelMark { .. }
+            | TypeData::BarTag { .. }
+            | TypeData::CadImport {}
+            | TypeData::DetailLine {}
+            | TypeData::FilledRegion { .. }
+            | TypeData::MaskingRegion {}
+            | TypeData::Shaft {}
+            | TypeData::SteelBuilding {}
+            | TypeData::Truss {}
+            | TypeData::Bracing {}
+            | TypeData::Connection {}
+            | TypeData::WallFraming {}
+            | TypeData::Pad { .. } => "",
             TypeData::Column { material, .. }
             | TypeData::Beam { material, .. }
             | TypeData::Foundation { material, .. }
             | TypeData::Rebar { material, .. }
+            | TypeData::Pile { material, .. }
             | TypeData::Pipe { material, .. }
             | TypeData::Conduit { material, .. }
+            | TypeData::CableTray { material, .. }
+            | TypeData::Valve { material, .. }
+            | TypeData::LightningConductor { material, .. }
             | TypeData::Stair { material, .. }
             | TypeData::Ramp { material, .. }
-            | TypeData::Railing { material, .. } => material,
+            | TypeData::Railing { material, .. }
+            | TypeData::Mass { material }
+            | TypeData::Topography { material, .. }
+            | TypeData::Sweep { material, .. } => material,
             TypeData::Component { def, .. } => def.main_material(),
             TypeData::Floor { .. } => self
                 .layers()

@@ -48,7 +48,7 @@ fn target(p: &Project, view: Option<&Ref>, template: Option<&Ref>) -> Result<Tar
 /// Refuse to edit graphics of a view that its template controls.
 fn check_free(p: &Project, target: Target, filters: bool) -> Result<()> {
     if let Target::View(v) = target {
-        if !p.view(v).is_some_and(|v| ViewTemplate::applies_to(&v.kind)) {
+        if !p.view(v).is_some_and(|v| v.kind.has_graphics()) {
             return Err(EngineError::invalid("this view has no visibility/graphics"));
         }
         if let Some((t, inc)) = controlled(p, v)
@@ -89,7 +89,11 @@ pub(crate) fn patched(current: &GraphicOverride, patch: Option<&Value>, reset: b
     if out.repair() > 0 {
         return Err(EngineError::invalid("weights must be between 0 and 10 mm and transparency between 0 and 1"));
     }
-    if out.surface_fill.pattern.is_some_and(|p| !cc_core::Pattern::ALL.contains(&p)) {
+    if out
+        .surface_fill
+        .pattern
+        .is_some_and(|p| !cc_core::Pattern::ALL.contains(&p) && !matches!(p, cc_core::Pattern::Custom(_)))
+    {
         out.surface_fill.pattern = None;
     }
     Ok(out)
@@ -206,7 +210,7 @@ impl Command for ViewGraphicsSet {
         let p = s.project();
         let target = target(p, self.view.as_ref(), self.template.as_ref())?;
         check_free(p, target, false)?;
-        let category = refs::category(&self.category)?;
+        let category = refs::view_category(&self.category)?;
         let mut g = graphics_of(p, target)?;
         let mut cg = g.category(category);
         cg.overrides = patched(&cg.overrides, self.overrides.as_ref(), self.reset)?;
@@ -229,7 +233,7 @@ fn element_ids(p: &Project, ids: &[u64]) -> Result<Vec<ElementId>> {
 
 fn graphical_view(p: &Project, r: &Ref) -> Result<ViewId> {
     let v = refs::view(p, r)?;
-    if !p.view(v).is_some_and(|v| ViewTemplate::applies_to(&v.kind)) {
+    if !p.view(v).is_some_and(|v| v.kind.has_graphics()) {
         return Err(EngineError::invalid("this view has no visibility/graphics"));
     }
     Ok(v)
@@ -416,7 +420,7 @@ fn check_rules(f: &ViewFilter) -> Result<()> {
 }
 
 fn categories(names: &[String]) -> Result<BTreeSet<Category>> {
-    names.iter().map(|n| refs::category(n)).collect()
+    names.iter().map(|n| refs::view_category(n)).collect()
 }
 
 fn filter_name(p: &Project, name: &str, except: Option<FilterId>) -> Result<String> {
@@ -794,8 +798,7 @@ impl Command for ViewFilterMove {
 fn discipline_name(d: Option<MepDiscipline>) -> &'static str {
     match d {
         None => "none",
-        Some(MepDiscipline::Plumbing) => "plumbing",
-        Some(MepDiscipline::Electrical) => "electrical",
+        Some(d) => d.name(),
     }
 }
 
@@ -810,6 +813,10 @@ pub(crate) fn template_json(p: &Project, t: &ViewTemplate) -> Value {
         "structural": t.structural,
         "structure_tags": t.structure_tags,
         "phase_filter": t.phase_filter.and_then(|f| p.phase_filter(f)).map(|f| json!({"id": f.id.0, "name": f.name})),
+        "detail": t.detail.name(),
+        "visual_style": t.visual_style.map_or("default", |s| s.name()),
+        "underlay": t.underlay,
+        "design_options": t.design_options.values().map(|o| super::design_options::option_ref_json(p, Some(*o))).collect::<Vec<_>>(),
         "graphics": graphics_json(p, &t.graphics),
         "views": p.views.values().filter(|v| v.template == Some(t.id)).map(|v| v.id.0).collect::<Vec<_>>(),
     })
@@ -906,13 +913,15 @@ pub struct TemplateSet {
     /// New name.
     #[serde(default)]
     pub name: Option<String>,
-    /// Scale denominator.
+    /// Scale: the denominator (e.g. 50 for 1:50), or text such as `"1:50"`
+    /// or an imperial label like `"1/4\" = 1'-0\""` (48).
     #[serde(default)]
-    pub scale: Option<u32>,
+    pub scale: Option<refs::ScaleArg>,
     /// Plans: cut plane height, meters.
     #[serde(default)]
     pub cut_height: Option<f64>,
-    /// Floor plans: `none`, `plumbing` or `electrical` (services over a faint architecture).
+    /// Floor plans: `none`, `plumbing`, `electrical`, `communications` or `lightning` (services over a
+    /// faint architecture).
     #[serde(default)]
     pub discipline: Option<String>,
     /// Floor plans: structural (formwork) display.
@@ -924,9 +933,25 @@ pub struct TemplateSet {
     /// Phase filter (id or name), or `null` for none.
     #[serde(default, deserialize_with = "refs::nullable", skip_serializing_if = "Option::is_none")]
     pub phase_filter: Option<Option<Ref>>,
+    /// Detail level: `coarse`, `medium` or `fine`.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Visual style: `wireframe`, `hidden_line`, `shaded`,
+    /// `consistent_colors`, `textures`, or `default` (each view's usual style).
+    #[serde(default)]
+    pub visual_style: Option<String>,
+    /// Plans: other levels' plans drawn under them, merged like `view_set`'s
+    /// `underlay` (e.g. `{"below": {"level": "Next", "looking": "Down"}}`).
+    #[serde(default)]
+    pub underlay: Option<Value>,
+    /// The option shown of each design option set (replacing the
+    /// template's choices; sets left out show automatically).
+    #[serde(default)]
+    pub design_options: Option<Vec<super::design_options::OptionChoice>>,
     /// Which properties the template controls: `scale`, `categories`,
-    /// `filters`, `cut_height`, `discipline`, `structural`, `phase_filter`
-    /// (true/false).
+    /// `filters`, `cut_height`, `discipline`, `structural`, `phase_filter`,
+    /// `detail`, `visual_style`, `underlay`, `design_options` (true/false).
+    /// `design_options` is off unless set.
     #[serde(default)]
     pub include: Option<Value>,
 }
@@ -941,8 +966,8 @@ impl Command for TemplateSet {
         if let Some(n) = &self.name {
             t.name = template_name(p, n, Some(id))?;
         }
-        if let Some(sc) = self.scale {
-            t.scale = sc.max(1);
+        if let Some(sc) = &self.scale {
+            t.scale = sc.ratio()?;
         }
         if let Some(h) = self.cut_height {
             t.cut_height = refs::finite(h, "cut_height")?;
@@ -950,8 +975,7 @@ impl Command for TemplateSet {
         if let Some(d) = &self.discipline {
             t.discipline = match d.trim().to_ascii_lowercase().as_str() {
                 "none" | "" => None,
-                "plumbing" => Some(MepDiscipline::Plumbing),
-                "electrical" => Some(MepDiscipline::Electrical),
+                name if let Some(d) = MepDiscipline::ALL.into_iter().find(|d| d.name() == name) => Some(d),
                 other => return Err(EngineError::invalid(format!("unknown discipline '{other}'"))),
             };
         }
@@ -961,6 +985,12 @@ impl Command for TemplateSet {
         if let Some(v) = self.structure_tags {
             t.structure_tags = v;
         }
+        if let Some(d) = &self.detail {
+            t.detail = refs::detail_level(d)?;
+        }
+        if let Some(st) = &self.visual_style {
+            t.visual_style = refs::visual_style(st)?;
+        }
         match &self.phase_filter {
             Some(Some(r)) => t.phase_filter = Some(refs::phase_filter(p, r)?),
             Some(None) => t.phase_filter = None,
@@ -968,6 +998,16 @@ impl Command for TemplateSet {
         }
         if let Some(patch) = &self.include {
             t.include = patch_value(&t.include, patch)?;
+        }
+        if let Some(list) = &self.design_options {
+            t.design_options = super::design_options::choices(p, list)?;
+        }
+        if let Some(patch) = &self.underlay {
+            t.underlay = patch_value(&t.underlay, patch)?;
+            let levels: Vec<_> = p.levels.iter().map(|l| l.id).collect();
+            if t.underlay.clone().repair(|l| levels.contains(&l)) > 0 {
+                return Err(EngineError::not_found("level"));
+            }
         }
         edit(s, t!("tx-template-modify"), |e| {
             e.templates_mut().insert(id, t);

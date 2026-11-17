@@ -1,9 +1,11 @@
-//! Mapping of the ConstructCAD model to IFC4 entities.
+//! Mapping of the ConstructCraft model to IFC4 entities.
 
 use crate::args;
 use crate::guid::{encode, guid};
 use crate::schema::{ElementClass, TypeLayout, element_class};
 use crate::step::{Header, Id, StepWriter, Value, opt_str, reals};
+use cc_core::connection::ConnectionKind;
+use cc_core::structural_profile::{ProfileMaterial, ProfileShape, SectionOutline};
 use cc_core::{Element, ElementId, ElementKind, ElementTypeId, LevelId, Project, RoofShape, TypeData, Uid};
 use cc_geom::{FRAME_COLOR, ModelGeometry, WallGeom, opening_parts, polygon};
 use glam::{DVec2, DVec3};
@@ -11,6 +13,15 @@ use std::collections::{BTreeMap, HashMap};
 
 /// Openings extend this far beyond each wall face so the boolean cut is clean.
 const OPENING_CLEARANCE: f64 = 0.05;
+
+/// Property set of a niche's opening element: its sizes, the face of the
+/// wall it is in and the volume it takes out.
+pub const NICHE_PSET: &str = "ConstructCAD_Niche";
+
+/// Names of a connection's parts (and of their types).
+const PLATE: &str = "Plate";
+const BOLT: &str = "Bolt";
+const ANCHOR_BOLT: &str = "Anchor Bolt";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExportOptions {
@@ -20,12 +31,23 @@ pub struct ExportOptions {
     pub file_name: String,
 }
 
-/// Serialize `project` as an IFC4 STEP physical file.
+/// Serialize `project` as an IFC4 STEP physical file: the main model and
+/// the primary option of each design option set (whatever option is being
+/// edited), the option of each element in [`DESIGN_OPTION_PSET`].
 pub fn export(project: &Project, options: &ExportOptions) -> String {
+    let primary;
+    let project = if project.option_sets.is_empty() {
+        project
+    } else {
+        let mut p = project.with_options(&project.primary_options()).unwrap_or_else(|| project.clone());
+        p.active_option = None;
+        primary = p;
+        &primary
+    };
     let geom = ModelGeometry::build(project);
     let mut x = Exporter::new(project, &geom);
     x.write_all();
-    let generator = format!("ConstructCAD {}", env!("CARGO_PKG_VERSION"));
+    let generator = format!("ConstructCraft {}", env!("CARGO_PKG_VERSION"));
     let header = Header {
         description: vec!["ViewDefinition [DesignTransferView_V1.0]".into()],
         name: options.file_name.clone(),
@@ -95,11 +117,18 @@ struct Exporter<'a> {
     layer_sets: BTreeMap<ElementTypeId, Id>,
     types: BTreeMap<ElementTypeId, Id>,
     layer_usages: BTreeMap<ElementTypeId, Id>,
+    /// The profile definition, material profile set and its usage per column and beam type.
+    type_profiles: BTreeMap<ElementTypeId, Id>,
+    profile_sets: BTreeMap<ElementTypeId, Id>,
+    profile_usages: BTreeMap<ElementTypeId, Id>,
     products: BTreeMap<ElementId, Id>,
     // Relationship collectors, emitted at the end.
     typed: BTreeMap<ElementTypeId, Vec<Id>>,
+    /// Roof framing: an `IfcMemberType` per roof type and member name, with its members.
+    member_types: BTreeMap<(ElementTypeId, &'static str), (Id, Vec<Id>)>,
     contained: BTreeMap<LevelId, Vec<Id>>,
-    usage_objects: BTreeMap<Id, Vec<Id>>,
+    /// Material usages with the GlobalId tag of their association and the products using them.
+    usage_objects: BTreeMap<Id, (String, Vec<Id>)>,
     /// Storey and its placement per level.
     storeys: BTreeMap<LevelId, (Id, Id)>,
     /// Elements whose `Status` went into a common property set of their own.
@@ -133,9 +162,13 @@ impl<'a> Exporter<'a> {
             layer_sets: BTreeMap::new(),
             types: BTreeMap::new(),
             layer_usages: BTreeMap::new(),
+            type_profiles: BTreeMap::new(),
+            profile_sets: BTreeMap::new(),
+            profile_usages: BTreeMap::new(),
             products: BTreeMap::new(),
             usage_objects: BTreeMap::new(),
             typed: BTreeMap::new(),
+            member_types: BTreeMap::new(),
             contained: BTreeMap::new(),
             storeys: BTreeMap::new(),
             status_written: Default::default(),
@@ -203,13 +236,40 @@ impl<'a> Exporter<'a> {
         }
         self.write_structure();
         self.write_rebar();
+        self.write_connections();
         self.write_components();
         self.write_segments();
+        self.write_valves();
         let fittings = self.write_fittings();
         self.write_systems(&fittings);
         self.write_spaces();
         self.write_phasing(project_id);
+        self.write_design_options();
         self.write_relationships();
+    }
+
+    /// The design option of each element in one (only primary options are
+    /// exported), in [`DESIGN_OPTION_PSET`]; elements of one option share
+    /// the set.
+    fn write_design_options(&mut self) {
+        let project = self.project;
+        let mut by_option: BTreeMap<cc_core::OptionId, Vec<Id>> = BTreeMap::new();
+        for (&id, &product) in &self.products {
+            if let Some(option) = project.element(id).and_then(|e| e.design_option) {
+                by_option.entry(option).or_default().push(product);
+            }
+        }
+        let label = |s: &str| Value::Typed("IFCLABEL", Box::new(s.into()));
+        for (option, objects) in by_option {
+            let Some((set, o)) = project.design_option(option) else { continue };
+            let primary = set.primary_option() == Some(option);
+            let props = vec![
+                ("OptionSet", label(&set.name)),
+                ("Option", label(&o.name)),
+                ("Primary", Value::Typed("IFCBOOLEAN", Box::new(primary.into()))),
+            ];
+            self.property_set(&format!("option-{}", option.0), DESIGN_OPTION_PSET, objects, props);
+        }
     }
 
     /// Construction phases: the project's phases in order (a set on the
@@ -323,7 +383,8 @@ impl<'a> Exporter<'a> {
         .collect();
         let units = w.add("IFCUNITASSIGNMENT", args![units]);
         let wcs = w.add("IFCAXIS2PLACEMENT3D", args![self.origin3, self.dir_z, self.dir_x]);
-        let north = w.add("IFCDIRECTION", args![reals(&[0.0, 1.0])]);
+        let north = self.project.info.site.as_ref().map_or(glam::DVec2::Y, |site| site.north());
+        let north = w.add("IFCDIRECTION", args![reals(&[north.x, north.y])]);
         let model = w.add("IFCGEOMETRICREPRESENTATIONCONTEXT", args![Value::Null, "Model", 3i64, 1e-5, wcs, north]);
         let sub = |w: &mut StepWriter, id: &str, view: &'static str| {
             let d = Value::Derived;
@@ -344,7 +405,7 @@ impl<'a> Exporter<'a> {
         self.body_ctx = sub(w, "Body", "MODEL_VIEW");
         self.axis_ctx = sub(w, "Axis", "GRAPH_VIEW");
         let info = &self.project.info;
-        let name = if info.name.is_empty() { "ConstructCAD" } else { info.name.as_str() };
+        let name = if info.name.is_empty() { "ConstructCraft" } else { info.name.as_str() };
         let gid = self.guid_of(self.project.info.uid, "project");
         self.w.add(
             "IFCPROJECT",
@@ -362,10 +423,47 @@ impl<'a> Exporter<'a> {
         )
     }
 
+    /// The project's postal address (its address line and the site's address parts), if any.
+    fn write_address(&mut self) -> Option<Id> {
+        let info = &self.project.info;
+        let parts = info.site.as_ref().map(|s| s.address.clone()).unwrap_or_default();
+        let street = [parts.street.trim(), parts.number.trim()]
+            .iter()
+            .filter(|s| !s.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let line = if info.address.trim().is_empty() { street } else { info.address.clone() };
+        if line.is_empty() && parts.is_empty() {
+            return None;
+        }
+        let lines = if line.is_empty() { Value::Null } else { Value::List(vec![Value::Str(line)]) };
+        let args = args![
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            lines,
+            Value::Null,
+            opt_str(&parts.city),
+            opt_str(&parts.region),
+            opt_str(&parts.postcode),
+            opt_str(&parts.country)
+        ];
+        Some(self.w.add("IFCPOSTALADDRESS", args))
+    }
+
     fn write_spatial_structure(&mut self, project_id: Id) {
         let site_placement = self.local_placement(None, Frame::at(DVec3::ZERO));
         let gid = self.guid("site");
         let n = Value::Null;
+        let address = self.write_address();
+        let location = self.project.info.site.clone();
+        let angle = |deg: f64| Value::List(cc_core::site::to_dms(deg).into_iter().map(Value::Int).collect());
+        let (lat, lon, elevation, long_name) = match &location {
+            Some(l) => (angle(l.latitude), angle(l.longitude), Value::Real(l.elevation), opt_str(&l.place)),
+            None => (n.clone(), n.clone(), n.clone(), n.clone()),
+        };
         let site = self.w.add(
             "IFCSITE",
             args![
@@ -376,31 +474,15 @@ impl<'a> Exporter<'a> {
                 n.clone(),
                 site_placement,
                 n.clone(),
-                n.clone(),
+                long_name,
                 Value::Enum("ELEMENT"),
+                lat,
+                lon,
+                elevation,
                 n.clone(),
-                n.clone(),
-                n.clone(),
-                n.clone(),
-                n.clone()
+                address
             ],
         );
-        let address = (!self.project.info.address.is_empty()).then(|| {
-            let lines = vec![self.project.info.address.clone()];
-            let args = args![
-                Value::Null,
-                Value::Null,
-                Value::Null,
-                Value::Null,
-                lines,
-                Value::Null,
-                Value::Null,
-                Value::Null,
-                Value::Null,
-                Value::Null
-            ];
-            self.w.add("IFCPOSTALADDRESS", args)
-        });
         let building_placement = self.local_placement(Some(site_placement), Frame::at(DVec3::ZERO));
         let gid = self.guid("building");
         let name = opt_str(&self.project.info.name);
@@ -587,44 +669,106 @@ impl<'a> Exporter<'a> {
         self.w.add("IFCEXTRUDEDAREASOLID", args![profile, position, self.dir_z, z.1 - z.0])
     }
 
-    /// The profile of a column or beam section centered at the origin: the
-    /// parametric IFC profile when the shape has one, its solid box when its
-    /// walls fill it.
-    fn section_profile(&mut self, section: cc_core::ColumnSection) -> Id {
-        use cc_core::{ColumnSection as C, SectionShape as S};
-        let n = Value::Null;
-        let position = self.w.add("IFCAXIS2PLACEMENT2D", args![self.origin2, Value::Null]);
+    /// The `IfcProfileDef` of a column or beam section named `name`: the
+    /// parametric IFC profile of `shape` when it has one (its bounding box
+    /// centered on the position, as IFC4 places them and as the outlines are
+    /// centered; `rotation_deg` as the position's direction), else the placed
+    /// `outline` as an arbitrary profile, with voids for its holes. A
+    /// mirrored section is always written as its mirrored outline.
+    fn profile_def(
+        &mut self,
+        name: &str,
+        shape: Option<&ProfileShape>,
+        rotation_deg: f64,
+        mirror: bool,
+        outline: &SectionOutline,
+    ) -> Id {
         let area = Value::Enum("AREA");
-        match section {
-            C::Round { diameter } => self.w.add("IFCCIRCLEPROFILEDEF", args![area, n, position, diameter / 2.0]),
-            C::Pipe { diameter, wall } if 2.0 * wall < diameter => {
-                self.w.add("IFCCIRCLEHOLLOWPROFILEDEF", args![area, n, position, diameter / 2.0, wall])
-            }
-            C::Pipe { diameter, .. } => self.w.add("IFCCIRCLEPROFILEDEF", args![area, n, position, diameter / 2.0]),
-            C::Rectangular { width, depth } | C::Profile { width, depth, shape: S::Solid } => {
-                self.w.add("IFCRECTANGLEPROFILEDEF", args![area, n, position, width, depth])
-            }
-            C::Profile { width, depth, shape } => match shape.fitted(width, depth) {
-                S::I { web, flange } if web < width && 2.0 * flange < depth => self.w.add(
-                    "IFCISHAPEPROFILEDEF",
-                    args![area, n.clone(), position, width, depth, web, flange, n.clone(), n.clone(), n],
-                ),
-                S::Channel { web, flange } if web < width && 2.0 * flange < depth => self.w.add(
-                    "IFCUSHAPEPROFILEDEF",
-                    args![area, n.clone(), position, depth, width, web, flange, n.clone(), n.clone(), n],
-                ),
-                S::Angle { thickness } if thickness < width.min(depth) => self.w.add(
-                    "IFCLSHAPEPROFILEDEF",
-                    args![area, n.clone(), position, depth, width, thickness, n.clone(), n.clone(), n],
-                ),
-                S::Tube { wall } if 2.0 * wall < width.min(depth) => self.w.add(
-                    "IFCRECTANGLEHOLLOWPROFILEDEF",
-                    args![area, n.clone(), position, width, depth, wall, n.clone(), n],
-                ),
-                // The walls fill the box.
-                _ => self.w.add("IFCRECTANGLEPROFILEDEF", args![area, n, position, width, depth]),
-            },
+        if let Some((entity, values)) = shape.filter(|_| !mirror).and_then(parametric_profile) {
+            let turn = if rotation_deg.is_finite() { rotation_deg.to_radians() } else { 0.0 };
+            let direction = (turn != 0.0).then(|| {
+                let d = DVec2::from_angle(turn);
+                self.w.add("IFCDIRECTION", args![reals(&[d.x, d.y])])
+            });
+            let position = self.w.add("IFCAXIS2PLACEMENT2D", args![self.origin2, direction]);
+            let args = [area, Value::from(name), Value::Ref(position)].into_iter().chain(values).collect();
+            return self.w.add(entity, args);
         }
+        let curve = self.polyline(&outline.outer);
+        if outline.holes.is_empty() {
+            return self.w.add("IFCARBITRARYCLOSEDPROFILEDEF", args![area, name, curve]);
+        }
+        let inner: Vec<Id> = outline.holes.iter().map(|h| self.polyline(h)).collect();
+        self.w.add("IFCARBITRARYPROFILEDEFWITHVOIDS", args![area, name, curve, inner])
+    }
+
+    /// The profile definition of a column or beam type (written once): its
+    /// profile's, named after it, or for a type without one its own
+    /// section's, named after the type. `None` when the section fails.
+    fn type_profile(&mut self, type_id: ElementTypeId) -> Option<Id> {
+        if let Some(&id) = self.type_profiles.get(&type_id) {
+            return Some(id);
+        }
+        let project = self.project;
+        let ty = project.element_type(type_id)?;
+        let (TypeData::Column { profile_rotation_deg, profile_mirror, .. }
+        | TypeData::Beam { profile_rotation_deg, profile_mirror, .. }) = &ty.data
+        else {
+            return None;
+        };
+        let section = project.type_section(&ty.data)?;
+        let def = section.profile.and_then(|p| project.profile(p));
+        let name = def.map_or(ty.name.as_str(), |d| d.name.as_str());
+        let id =
+            self.profile_def(name, def.map(|d| &d.shape), *profile_rotation_deg, *profile_mirror, &section.outline);
+        self.type_profiles.insert(type_id, id);
+        Some(id)
+    }
+
+    /// The `IfcMaterialProfileSet` of a column or beam type: one material
+    /// profile of the type's material and profile, named after the profile.
+    fn profile_set(&mut self, type_id: ElementTypeId) -> Option<Id> {
+        if let Some(&id) = self.profile_sets.get(&type_id) {
+            return Some(id);
+        }
+        let project = self.project;
+        let ty = project.element_type(type_id)?;
+        let profile = self.type_profile(type_id)?;
+        let def = project.type_section(&ty.data).and_then(|s| s.profile).and_then(|p| project.profile(p));
+        let name = def.map_or(ty.name.as_str(), |d| d.name.as_str());
+        // Cold-formed sections are told apart from rolled ones by the category.
+        let category = match def.map(|d| d.material) {
+            Some(ProfileMaterial::ColdFormed) => Value::Str(COLD_FORMED_CATEGORY.into()),
+            _ => Value::Null,
+        };
+        let material = match ty.main_material() {
+            "" => Value::Null,
+            m => Value::Ref(self.material(m)),
+        };
+        let n = Value::Null;
+        let item = self.w.add("IFCMATERIALPROFILE", args![name, n.clone(), material, profile, n.clone(), category]);
+        let set = self.w.add("IFCMATERIALPROFILESET", args![name, n.clone(), vec![item], n]);
+        self.profile_sets.insert(type_id, set);
+        Some(set)
+    }
+
+    /// Assign the material profile set of `type_id` to `product` through
+    /// one usage shared per type.
+    fn profile_usage(&mut self, type_id: ElementTypeId, product: Id) {
+        let Some(set) = self.profile_set(type_id) else { return };
+        let usage = match self.profile_usages.get(&type_id) {
+            Some(&usage) => usage,
+            None => {
+                let usage = self.w.add("IFCMATERIALPROFILESETUSAGE", args![set, Value::Null, Value::Null]);
+                self.profile_usages.insert(type_id, usage);
+                usage
+            }
+        };
+        self.usage_objects
+            .entry(usage)
+            .or_insert_with(|| (format!("mat-usage-profile-{type_id}"), Vec::new()))
+            .1
+            .push(product);
     }
 
     /// Whether joined elements cut part of the element's body away (walls,
@@ -637,7 +781,7 @@ impl<'a> Exporter<'a> {
     /// points relative to `z0`.
     fn cut_body(&mut self, id: ElementId, z0: f64) -> Vec<Id> {
         let geom = self.geom;
-        geom.solids_of(id).filter(|s| !s.faces.is_empty()).map(|s| self.faceted_brep(&s.faces, z0)).collect()
+        geom.body_of(id).filter(|s| !s.faces.is_empty()).map(|s| self.faceted_brep(&s.faces, z0)).collect()
     }
 
     /// One faceted B-rep per closed piece of an element.
@@ -789,6 +933,50 @@ impl<'a> Exporter<'a> {
         Some(self.w.add("IFCPOLYGONALFACESET", args![points, Value::Null, ifc_faces, Value::Null]))
     }
 
+    /// A column's body: its type's profile extruded up in the column's
+    /// rotated frame; when the type has no section to sweep, the body as
+    /// built, else the type's legacy box. `None` when there is nothing to write.
+    fn column_product(&mut self, e: &Element, c: &cc_core::Column, level_z: f64) -> Option<StructureProduct> {
+        let project = self.project;
+        let data = &project.element_type(e.type_id)?.data;
+        let TypeData::Column { section, .. } = data else { return None };
+        let (base, top) = project.column_span(e, c);
+        let turn = if c.rotation_deg.is_finite() { c.rotation_deg.to_radians() } else { 0.0 };
+        let length = Quantity::Length(top - base);
+        let (items, volume, brep) = match self.type_profile(e.type_id) {
+            Some(profile) => {
+                let frame = Frame::horizontal(c.position.extend(base - level_z), DVec2::from_angle(turn));
+                let position = self.placement3(frame);
+                let item = self.w.add("IFCEXTRUDEDAREASOLID", args![profile, position, self.dir_z, top - base]);
+                (vec![item], section_area(project, data) * (top - base), false)
+            }
+            None => {
+                let body = self.cut_body(e.id, level_z);
+                if body.is_empty() {
+                    let (width, depth) = section.size();
+                    if !(width.is_finite() && depth.is_finite() && width > 0.0 && depth > 0.0) {
+                        return None;
+                    }
+                    let u = DVec2::from_angle(turn);
+                    let part = cc_geom::BoxPart {
+                        origin: c.position,
+                        u,
+                        v: u.perp(),
+                        u_range: (-width / 2.0, width / 2.0),
+                        v_range: (-depth / 2.0, depth / 2.0),
+                        z_range: (base, top),
+                    };
+                    (vec![self.oriented_box(&part, level_z)], width * depth * (top - base), false)
+                } else {
+                    (body, self.geom.volume(e.id), true)
+                }
+            }
+        };
+        let q = vec![("Length", length), ("NetVolume", Quantity::Volume(volume))];
+        let product = StructureProduct::new("IFCCOLUMN", "COLUMN", items).quantities("Qto_ColumnBaseQuantities", q);
+        Some(if brep { product.brep() } else { product })
+    }
+
     /// Columns, beams, stairs, ramps and railings.
     fn write_structure(&mut self) {
         let project = self.project;
@@ -800,73 +988,58 @@ impl<'a> Exporter<'a> {
             let style = self.material_style(ty.main_material());
             let mut axis = None;
             let product: StructureProduct = match (&e.kind, &ty.data) {
-                (ElementKind::Column(c), TypeData::Column { section, .. }) => {
-                    let (base, top) = project.column_span(e, c);
-                    let item = match *section {
-                        cc_core::ColumnSection::Rectangular { width, depth } => {
-                            let part = cc_geom::BoxPart {
-                                origin: c.position,
-                                u: DVec2::from_angle(c.rotation_deg.to_radians()),
-                                v: DVec2::from_angle(c.rotation_deg.to_radians()).perp(),
-                                u_range: (-width / 2.0, width / 2.0),
-                                v_range: (-depth / 2.0, depth / 2.0),
-                                z_range: (base, top),
-                            };
-                            self.oriented_box(&part, level_z)
-                        }
-                        cc_core::ColumnSection::Round { diameter } => {
-                            let center = self.point2(c.position);
-                            let position2 = self.w.add("IFCAXIS2PLACEMENT2D", args![center, Value::Null]);
-                            let profile = self.w.add(
-                                "IFCCIRCLEPROFILEDEF",
-                                args![Value::Enum("AREA"), Value::Null, position2, diameter / 2.0],
-                            );
-                            let position = self.placement3(Frame::at(DVec3::new(0.0, 0.0, base - level_z)));
-                            self.w.add("IFCEXTRUDEDAREASOLID", args![profile, position, self.dir_z, top - base])
-                        }
-                        cc_core::ColumnSection::Profile { .. } | cc_core::ColumnSection::Pipe { .. } => {
-                            // The profile in the column's rotated frame, extruded up.
-                            let profile = self.section_profile(*section);
-                            let u = DVec2::from_angle(c.rotation_deg.to_radians());
-                            let frame = Frame::horizontal(c.position.extend(base - level_z), u);
-                            let position = self.placement3(frame);
-                            self.w.add("IFCEXTRUDEDAREASOLID", args![profile, position, self.dir_z, top - base])
-                        }
-                    };
-                    let volume = section_area(*section) * (top - base);
-                    let q = vec![("Length", Quantity::Length(top - base)), ("NetVolume", Quantity::Volume(volume))];
-                    StructureProduct::new("IFCCOLUMN", "COLUMN", vec![item]).quantities("Qto_ColumnBaseQuantities", q)
+                (ElementKind::Column(c), TypeData::Column { .. }) => {
+                    let Some(product) = self.column_product(e, c, level_z) else { continue };
+                    product
                 }
                 (ElementKind::Beam(_), TypeData::Beam { .. }) => {
                     // The body as framed into columns and other beams.
                     let Some(g) = self.geom.beams.get(&e.id) else { continue };
-                    let TypeData::Beam { width, height, shape, .. } = ty.data else { continue };
-                    let solid = matches!(shape, cc_core::SectionShape::Solid);
+                    // The section the body is swept from (the type's box when its profile fails).
+                    let section = project.type_section(&ty.data).map(|s| s.outline);
+                    let rect = section.as_ref().is_none_or(is_box);
                     let level = g.slope.abs() < 1e-12;
-                    let brep = !level || (!solid && !g.is_square());
-                    let items = if brep {
-                        // Sloped, or a profile with cut ends: each part as a closed shell.
-                        g.parts()
-                            .into_iter()
-                            .map(|(footprint, (z0, z1))| {
-                                let mut s = cc_geom::Solid::new(e.id, e.category(), [0; 3]);
-                                let (origin, dir, slope, base) = (g.origin, g.dir, g.slope, g.z_range.0);
-                                let z = move |p: DVec2| base + slope * (p - origin).dot(dir);
-                                s.add_prism(&footprint, |p| z(p) + z0, |p| z(p) + z1);
-                                self.faceted_brep(&s.faces, level_z)
-                            })
-                            .collect()
-                    } else if !solid {
-                        // A profile square at both ends: the section swept along the axis.
-                        let profile =
-                            self.section_profile(cc_core::ColumnSection::Profile { width, depth: height, shape });
-                        let start = g.world(g.start_ext.0, 0.0);
-                        let center = (g.z_range.0 + g.z_range.1) * 0.5 - level_z;
-                        let frame =
-                            Frame { origin: start.extend(center), x: g.normal.extend(0.0), z: g.dir.extend(0.0) };
+                    let arc = g.arc.is_some();
+                    // A straight level profile square at both ends: the section swept along the axis.
+                    let swept = match &section {
+                        Some(outline) if level && !rect && !arc && g.is_square() => {
+                            self.type_profile(e.type_id).map(|profile| (profile, outline.bbox()))
+                        }
+                        _ => None,
+                    };
+                    let brep = swept.is_none() && (!level || !rect);
+                    // A swept profile is written exact; other bodies as their chords run.
+                    let volume = match swept {
+                        Some(_) => section_area(project, &ty.data) * (g.end_ext.0 - g.start_ext.0),
+                        None => g.volume(),
+                    };
+                    let items = if let Some((profile, (lo, hi))) = swept {
+                        // The body puts the box's middle on the axis and its bottom at the bottom.
+                        let start = g.world(g.start_ext.0, -(lo.x + hi.x) * 0.5);
+                        let z = g.z_range.0 - lo.y - level_z;
+                        let frame = Frame { origin: start.extend(z), x: g.normal.extend(0.0), z: g.dir.extend(0.0) };
                         let position = self.placement3(frame);
                         let length = g.end_ext.0 - g.start_ext.0;
                         vec![self.w.add("IFCEXTRUDEDAREASOLID", args![profile, position, self.dir_z, length])]
+                    } else if brep {
+                        // Sloped, or a profile with cut ends: the swept section as a closed shell.
+                        let mut s = cc_geom::Solid::new(e.id, e.category(), [0; 3]);
+                        g.add_to(&mut s);
+                        vec![self.faceted_brep(&s.faces, level_z)]
+                    } else if let Some(a) = &g.arc {
+                        // A rectangle along an arc: its outline of arcs and lines extruded up.
+                        let (h, l, r) = (g.half, (g.start_ext.0, g.end_ext.0), (g.start_ext.1, g.end_ext.1));
+                        let profile = self.arc_band_profile([
+                            a.at(r.0, -h),
+                            a.at((r.0 + r.1) * 0.5, -h),
+                            a.at(r.1, -h),
+                            a.at(l.1, h),
+                            a.at((l.0 + l.1) * 0.5, h),
+                            a.at(l.0, h),
+                        ]);
+                        let position = self.placement3(Frame::at(DVec3::new(0.0, 0.0, g.z_range.0 - level_z)));
+                        let depth = g.z_range.1 - g.z_range.0;
+                        vec![self.w.add("IFCEXTRUDEDAREASOLID", args![profile, position, self.dir_z, depth])]
                     } else if g.is_square() {
                         let part = cc_geom::BoxPart {
                             origin: g.origin,
@@ -878,18 +1051,16 @@ impl<'a> Exporter<'a> {
                         };
                         vec![self.oriented_box(&part, level_z)]
                     } else {
-                        // Mitered or skewed ends: the footprint in the beam's frame, extruded up.
+                        // A rectangle with mitered or skewed ends: the footprint in the beam's frame, extruded up.
                         let frame = Frame::horizontal(DVec3::new(g.origin.x, g.origin.y, g.z_range.0 - level_z), g.dir);
                         let position = self.placement3(frame);
                         let (profile, depth) = (g.local_footprint(), g.z_range.1 - g.z_range.0);
                         vec![self.extrude_polygon(&profile, position, self.dir_z, depth)]
                     };
                     // The location line, which keeps the beam's own length.
-                    let axis_start = self.point2(g.origin);
-                    let axis_end = self.point2(g.world(g.length, 0.0));
-                    axis = Some(self.w.add("IFCPOLYLINE", args![vec![axis_start, axis_end]]));
-                    let q =
-                        vec![("Length", Quantity::Length(g.cut_length())), ("NetVolume", Quantity::Volume(g.volume()))];
+                    let points: Vec<Id> = g.axis().into_iter().map(|p| self.point2(p)).collect();
+                    axis = Some(self.w.add("IFCPOLYLINE", args![points]));
+                    let q = vec![("Length", Quantity::Length(g.cut_length())), ("NetVolume", Quantity::Volume(volume))];
                     let product =
                         StructureProduct::new("IFCBEAM", "BEAM", items).quantities("Qto_BeamBaseQuantities", q);
                     if brep { product.brep() } else { product }
@@ -898,8 +1069,36 @@ impl<'a> Exporter<'a> {
                     let Some(g) = self.geom.foundations.get(&e.id) else { continue };
                     let frame = Frame::at(DVec3::new(0.0, 0.0, g.z_range.0 - level_z));
                     let position = self.placement3(frame);
-                    let item = self.extrude_polygon(&g.footprint, position, self.dir_z, g.z_range.1 - g.z_range.0);
-                    let area = polygon::area(&g.footprint);
+                    let depth = g.z_range.1 - g.z_range.0;
+                    // A haunched strip: its section swept along it, as a closed shell.
+                    let shell = g.body().map(|body| {
+                        let mut s = cc_geom::Solid::new(e.id, e.category(), [0; 3]);
+                        body.add_to(&mut s);
+                        self.faceted_brep(&s.faces, level_z)
+                    });
+                    let brep = shell.is_some();
+                    let item = match (shell, &g.arc) {
+                        (Some(shell), _) => shell,
+                        // An arc strip: its outline of arcs and lines extruded.
+                        (None, Some(a)) => {
+                            let (h, l, r) = (a.half, a.left, a.right);
+                            let profile = self.arc_band_profile([
+                                a.world(r.0, -h),
+                                a.world((r.0 + r.1) * 0.5, -h),
+                                a.world(r.1, -h),
+                                a.world(l.1, h),
+                                a.world((l.0 + l.1) * 0.5, h),
+                                a.world(l.0, h),
+                            ]);
+                            self.w.add("IFCEXTRUDEDAREASOLID", args![profile, position, self.dir_z, depth])
+                        }
+                        (None, None) => match g.cap.as_ref().and_then(|c| self.cap_item(c, position, depth)) {
+                            // A round or ring pile cap: its true circles extruded.
+                            Some(item) => item,
+                            None => self.extrude_polygon(&g.footprint, position, self.dir_z, depth),
+                        },
+                    };
+                    let area = g.area();
                     let q = vec![
                         ("Height", Quantity::Length(g.z_range.1 - g.z_range.0)),
                         ("NetVolume", Quantity::Volume(g.volume())),
@@ -908,8 +1107,9 @@ impl<'a> Exporter<'a> {
                         cc_core::FoundationKind::Pad => StructureProduct::new("IFCFOOTING", "PAD_FOOTING", vec![item])
                             .quantities("Qto_FootingBaseQuantities", q),
                         cc_core::FoundationKind::Strip => {
-                            StructureProduct::new("IFCFOOTING", "STRIP_FOOTING", vec![item])
-                                .quantities("Qto_FootingBaseQuantities", q)
+                            let product = StructureProduct::new("IFCFOOTING", "STRIP_FOOTING", vec![item])
+                                .quantities("Qto_FootingBaseQuantities", q);
+                            if brep { product.brep() } else { product }
                         }
                         cc_core::FoundationKind::Slab => {
                             let q = vec![
@@ -920,7 +1120,84 @@ impl<'a> Exporter<'a> {
                             StructureProduct::new("IFCSLAB", "BASESLAB", vec![item])
                                 .quantities("Qto_SlabBaseQuantities", q)
                         }
+                        cc_core::FoundationKind::PileCap => {
+                            let product = StructureProduct::new("IFCFOOTING", "PILE_CAP", vec![item])
+                                .quantities("Qto_FootingBaseQuantities", q);
+                            // The placement and the layout, for importers to restore the cap and its piles.
+                            let own = project.pile_cap(e).map(|c| {
+                                let text = |s: String| Value::Typed("IFCTEXT", Box::new(s.into()));
+                                let label = |s: &str| Value::Typed("IFCLABEL", Box::new(s.into()));
+                                let pile_type =
+                                    project.cap_pile_type(c.cap).map_or("", |t| project.type_name(t)).to_string();
+                                let layout = cc_core::pile::PileCap { pile_type: None, ..c.cap.clone() };
+                                let placement = cc_core::curtain::to_text(&(c.position.to_array(), c.rotation_deg));
+                                let cap = cc_core::curtain::to_text(&(c.thickness, layout));
+                                let props = vec![
+                                    ("Placement", text(placement)),
+                                    ("Cap", text(cap)),
+                                    ("PileType", label(&pile_type)),
+                                ];
+                                (PILE_CAP_PSET, props)
+                            });
+                            StructureProduct { own, ..product }
+                        }
                     }
+                }
+                (ElementKind::Pile(p), TypeData::Pile { section, kind, .. }) => {
+                    let Some(g) = self.geom.piles.get(&e.id) else { continue };
+                    let (z0, z1) = g.z_range;
+                    let item = match *section {
+                        cc_core::pile::PileSection::Round { diameter } => {
+                            let center = self.point2(g.position);
+                            let position2 = self.w.add("IFCAXIS2PLACEMENT2D", args![center, Value::Null]);
+                            let profile = self.w.add(
+                                "IFCCIRCLEPROFILEDEF",
+                                args![Value::Enum("AREA"), Value::Null, position2, diameter / 2.0],
+                            );
+                            let position = self.placement3(Frame::at(DVec3::new(0.0, 0.0, z0 - level_z)));
+                            self.w.add("IFCEXTRUDEDAREASOLID", args![profile, position, self.dir_z, z1 - z0])
+                        }
+                        cc_core::pile::PileSection::Square { side } => {
+                            let u = DVec2::from_angle(g.rotation_deg.to_radians());
+                            let part = cc_geom::BoxPart {
+                                origin: g.position,
+                                u,
+                                v: u.perp(),
+                                u_range: (-side / 2.0, side / 2.0),
+                                v_range: (-side / 2.0, side / 2.0),
+                                z_range: (z0, z1),
+                            };
+                            self.oriented_box(&part, level_z)
+                        }
+                    };
+                    let q = vec![
+                        ("Length", Quantity::Length(g.length())),
+                        ("CrossSectionArea", Quantity::Area(section.area())),
+                        ("NetVolume", Quantity::Volume(g.volume())),
+                    ];
+                    let (predefined, construction, object_type) = pile_ifc(*kind);
+                    let text = |s: String| Value::Typed("IFCTEXT", Box::new(s.into()));
+                    let label = |s: &str| Value::Typed("IFCLABEL", Box::new(s.into()));
+                    // The kind, section and embedment, and the cap it belongs to, for importers.
+                    let mut own = vec![
+                        ("Kind", label(kind.code())),
+                        ("Section", text(cc_core::curtain::to_text(section))),
+                        ("Embedment", text(cc_core::curtain::to_text(&p.embedment))),
+                    ];
+                    if let Some(r) = p.cap
+                        && let Some(cap) = project.element(r.cap)
+                        && let Value::Str(guid) = self.guid_of(cap.uid, &format!("element-{}", cap.id))
+                    {
+                        own.push(("Cap", label(&guid)));
+                        own.push(("CapIndex", text(r.index.to_string())));
+                    }
+                    StructureProduct {
+                        extra: vec![Value::Enum(construction)],
+                        object_type: object_type.map(str::to_string),
+                        own: Some((PILE_PSET, own)),
+                        ..StructureProduct::new("IFCPILE", predefined, vec![item])
+                    }
+                    .quantities("Qto_PileBaseQuantities", q)
                 }
                 (ElementKind::Stair(s), TypeData::Stair { build, .. }) => {
                     let Some(g) = cc_geom::stair_geom(project, e, s) else { continue };
@@ -943,6 +1220,7 @@ impl<'a> Exporter<'a> {
                         cc_core::StairShape::LShaped if winders => "QUARTER_WINDING_STAIR",
                         cc_core::StairShape::LShaped => "QUARTER_TURN_STAIR",
                         cc_core::StairShape::UShaped => "HALF_TURN_STAIR",
+                        cc_core::StairShape::ThreeFlight => "TWO_QUARTER_TURN_STAIR",
                         cc_core::StairShape::Spiral => "SPIRAL_STAIR",
                     };
                     StructureProduct {
@@ -963,6 +1241,36 @@ impl<'a> Exporter<'a> {
                         _ => "NOTDEFINED",
                     };
                     StructureProduct::new("IFCRAMP", shape, items).brep()
+                }
+                (ElementKind::Sweep(sw), TypeData::Sweep { .. }) => {
+                    // Baseboards, moldings, fascias: coverings along a path.
+                    let Some(faces) = cc_geom::profile_sweep::sweep_faces(project, e, sw) else { continue };
+                    let items = self.pieces(e, vec![faces], level_z);
+                    StructureProduct::new("IFCCOVERING", "MOLDING", items).brep()
+                }
+                (ElementKind::Topography(t), TypeData::Topography { material, contour_interval, major_every }) => {
+                    // The terrain's earth as a closed B-rep, and what it was made
+                    // from (points, boundary, base depth) for importers to restore.
+                    let Some(solid) = self.geom.body_of(e.id).next() else { continue };
+                    let faces: Vec<Vec<DVec3>> = solid.faces.iter().map(|f| f.verts.clone()).collect();
+                    let items = self.pieces(e, vec![faces], level_z);
+                    let text = |s: String| Value::Typed("IFCTEXT", Box::new(Value::Str(s)));
+                    let label = |s: &str| Value::Typed("IFCLABEL", Box::new(s.into()));
+                    let length = |v: f64| Value::Typed("IFCLENGTHMEASURE", Box::new(Value::Real(v)));
+                    let count = |k: u32| Value::Typed("IFCCOUNTMEASURE", Box::new(Value::Int(i64::from(k))));
+                    let props = vec![
+                        ("Points", text(crate::point_list::encode(t.points.iter().map(|p| p.to_array().to_vec())))),
+                        ("Boundary", text(crate::point_list::encode(t.boundary.iter().map(|p| p.to_array().to_vec())))),
+                        ("BaseDepth", length(t.base_depth)),
+                        ("Material", label(material)),
+                        ("ContourInterval", length(*contour_interval)),
+                        ("MajorEvery", count(*major_every)),
+                    ];
+                    StructureProduct {
+                        props: Some((TOPOGRAPHY_PSET, props)),
+                        ..StructureProduct::new("IFCGEOGRAPHICELEMENT", "TERRAIN", items)
+                    }
+                    .brep()
                 }
                 (ElementKind::Railing(r), TypeData::Railing { .. }) => {
                     let items = self.pieces(e, cc_geom::railing_pieces(project, e, r), level_z);
@@ -995,9 +1303,20 @@ impl<'a> Exporter<'a> {
             let shape = self.shape_of_type(product.items, axis, product.representation);
             let mut attrs = self.element_args(e, placement, shape);
             attrs.push(Value::Enum(product.kind));
+            attrs.extend(product.extra);
+            // A user-defined type names itself in the object type.
+            if let (Some(object_type), Some(slot)) = (product.object_type, attrs.get_mut(4)) {
+                *slot = Value::Str(object_type);
+            }
             let id = self.w.add(product.entity, attrs);
             self.products.insert(e.id, id);
             self.register(e, id);
+            if let Some((name, props)) = product.own {
+                self.property_set(&format!("own-{}-{name}", e.id), name, vec![id], props);
+            }
+            if matches!(ty.data, TypeData::Column { .. } | TypeData::Beam { .. }) {
+                self.profile_usage(e.type_id, id);
+            }
             if let Some((set, quantities)) = &product.quantities {
                 self.quantities(e, set, quantities);
             }
@@ -1006,7 +1325,66 @@ impl<'a> Exporter<'a> {
                 self.status_written.insert(e.id);
                 self.property_set_status(&format!("pset-{}-{name}", e.id), name, vec![id], props, status);
             }
+            if let ElementKind::Topography(_) = &e.kind {
+                self.pads_set(e.id, id);
+            }
         }
+    }
+
+    /// The body of a round or ring pile cap: its circle (or its ring) as a
+    /// parametric profile extruded `depth` up from `position`; `None` for
+    /// caps of straight sides (their outline is extruded as it is).
+    fn cap_item(&mut self, cap: &cc_geom::pile::CapGeom, position: Id, depth: f64) -> Option<Id> {
+        let profile = match cap.outline {
+            cc_core::pile::CapOutline::Polygon(_) => return None,
+            cc_core::pile::CapOutline::Disk { radius } => {
+                let center = self.point2(cap.position);
+                let position2 = self.w.add("IFCAXIS2PLACEMENT2D", args![center, Value::Null]);
+                self.w.add("IFCCIRCLEPROFILEDEF", args![Value::Enum("AREA"), Value::Null, position2, radius])
+            }
+            cc_core::pile::CapOutline::Ring { inner, outer } => {
+                let center = self.point2(cap.position);
+                let position2 = self.w.add("IFCAXIS2PLACEMENT2D", args![center, Value::Null]);
+                let args = args![Value::Enum("AREA"), Value::Null, position2, outer, outer - inner];
+                self.w.add("IFCCIRCLEHOLLOWPROFILEDEF", args)
+            }
+        };
+        Some(self.w.add("IFCEXTRUDEDAREASOLID", args![profile, position, self.dir_z, depth]))
+    }
+
+    /// A terrain's building pads, which IFC4 has no class for, in
+    /// [`PADS_PSET`] for importers to restore: per pad `n` (from 1),
+    /// `Pad<n>Outline`, `Pad<n>Elevation`, its own `Pad<n>CutSlope` and
+    /// `Pad<n>FillSlope` when it has them, and its type's name and ratios
+    /// (`Pad<n>Type`, `Pad<n>TypeCutSlope`, `Pad<n>TypeFillSlope`).
+    fn pads_set(&mut self, terrain: cc_core::ElementId, product: Id) {
+        let project = self.project;
+        let text = |s: String| Value::Typed("IFCTEXT", Box::new(Value::Str(s)));
+        let label = |s: &str| Value::Typed("IFCLABEL", Box::new(s.into()));
+        let length = |v: f64| Value::Typed("IFCLENGTHMEASURE", Box::new(Value::Real(v)));
+        let real = |v: f64| Value::Typed("IFCREAL", Box::new(Value::Real(v)));
+        let mut props: Vec<(String, Value)> = Vec::new();
+        for (k, (e, p)) in project.pads_of(terrain).enumerate() {
+            let n = k + 1;
+            let outline = crate::point_list::encode(p.outline.iter().map(|q| q.to_array().to_vec()));
+            props.push((format!("Pad{n}Outline"), text(outline)));
+            props.push((format!("Pad{n}Elevation"), length(p.elevation)));
+            if let Some(c) = p.cut_slope {
+                props.push((format!("Pad{n}CutSlope"), real(c)));
+            }
+            if let Some(f) = p.fill_slope {
+                props.push((format!("Pad{n}FillSlope"), real(f)));
+            }
+            if let Some(ty) = project.element_type(e.type_id)
+                && let TypeData::Pad { cut_slope, fill_slope } = ty.data
+            {
+                props.push((format!("Pad{n}Type"), label(&ty.name)));
+                props.push((format!("Pad{n}TypeCutSlope"), real(cut_slope)));
+                props.push((format!("Pad{n}TypeFillSlope"), real(fill_slope)));
+            }
+        }
+        let props: Vec<(&str, Value)> = props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        self.property_set(&format!("pads-{}", terrain.0), PADS_PSET, vec![product], props);
     }
 
     /// Reinforcement: one `IfcReinforcingBar` per set, each bar a disk swept
@@ -1014,9 +1392,28 @@ impl<'a> Exporter<'a> {
     fn write_rebar(&mut self) {
         let project = self.project;
         let geom = self.geom;
+        let marks = cc_geom::bar_marks::resolve(project, &geom.rebar);
         for set in geom.rebar.values() {
             let Some(e) = project.element(set.element) else { continue };
-            let ElementKind::Rebar(r) = &e.kind else { continue };
+            // Shaped bars carry no role (and any imported property sets).
+            let (kind, imported) = match &e.kind {
+                ElementKind::Rebar(r) => match r.layout {
+                    cc_core::RebarLayout::Longitudinal { .. }
+                    | cc_core::RebarLayout::WallHorizontal { .. }
+                    | cc_core::RebarLayout::WallVertical { .. }
+                    | cc_core::RebarLayout::SlabStraight { .. }
+                    | cc_core::RebarLayout::SlabRing { .. }
+                    | cc_core::RebarLayout::SlabRadial { .. }
+                    | cc_core::RebarLayout::StripTransverse { .. }
+                    | cc_core::RebarLayout::StripLongitudinal { .. } => ("MAIN", &[][..]),
+                    cc_core::RebarLayout::Sides { .. } | cc_core::RebarLayout::SlabTrim { .. } => ("EDGE", &[][..]),
+                    cc_core::RebarLayout::Stirrups { .. }
+                    | cc_core::RebarLayout::Ties { .. }
+                    | cc_core::RebarLayout::WallTies { .. } => ("LIGATURE", &[][..]),
+                },
+                ElementKind::ShapedRebar(r) => ("NOTDEFINED", &r.properties[..]),
+                _ => continue,
+            };
             let Some(ty) = project.element_type(e.type_id) else { continue };
             let Some(storey) = self.storey_placement(e.level) else { continue };
             let level_z = project.level_elevation(e.level);
@@ -1045,10 +1442,6 @@ impl<'a> Exporter<'a> {
             let shape = self.shape_of_type(items, None, "AdvancedSweptSolid");
             let mut attrs = self.element_args(e, placement, shape);
             let area = std::f64::consts::PI * set.diameter * set.diameter / 4.0;
-            let kind = match r.layout {
-                cc_core::RebarLayout::Longitudinal { .. } => "MAIN",
-                cc_core::RebarLayout::Stirrups { .. } => "LIGATURE",
-            };
             attrs.extend(args![
                 Value::Null,
                 set.diameter,
@@ -1060,6 +1453,35 @@ impl<'a> Exporter<'a> {
             let product = self.w.add("IFCREINFORCINGBAR", attrs);
             self.products.insert(e.id, product);
             self.register(e, product);
+            // What a set says of its bars, for importers to restore ([`REBAR_PSET`]): its
+            // partition and the mark given by hand; and `Mark`, the mark its bars have when
+            // they all have one (an override, a frozen or a numbered mark), and its steel grade.
+            let label = |s: &str| Value::Typed("IFCLABEL", Box::new(s.into()));
+            let mut props: Vec<(&str, Value)> = Vec::new();
+            if let Some(partition) = e.rebar_partition().map(str::trim).filter(|p| !p.is_empty()) {
+                props.push(("Partition", label(partition)));
+            }
+            if let Some(mark) = e.rebar_bar_mark() {
+                props.push(("BarMark", label(mark)));
+            }
+            let texts: std::collections::BTreeSet<&str> =
+                marks.of_set(e.id).into_iter().map(|m| m.mark.as_str()).collect();
+            if let (1, Some(mark)) = (texts.len(), texts.first()) {
+                props.push(("Mark", label(mark)));
+            }
+            if !set.grade.is_empty() {
+                props.push(("Grade", label(&set.grade)));
+            }
+            if !props.is_empty() {
+                self.property_set(&format!("rebar-{}", e.id.0), REBAR_PSET, vec![product], props);
+            }
+            for (i, set) in imported.iter().enumerate() {
+                if let Some(set) = self.imported_set(&format!("imported-{}-{i}", e.id), set) {
+                    let gid = self.guid(&format!("imported-rel-{}-{i}", e.id));
+                    let n = Value::Null;
+                    self.w.add("IFCRELDEFINESBYPROPERTIES", args![gid, n.clone(), n.clone(), n, vec![product], set]);
+                }
+            }
         }
     }
 
@@ -1069,16 +1491,15 @@ impl<'a> Exporter<'a> {
         let project = self.project;
         for e in project.elements.values() {
             let ElementKind::Component(c) = &e.kind else { continue };
-            let Some(TypeData::Component { def, .. }) = project.element_type(e.type_id).map(|t| &t.data) else {
-                continue;
-            };
+            let Some(ty) = project.element_type(e.type_id) else { continue };
+            let TypeData::Component { def, .. } = &ty.data else { continue };
             let Some(storey) = self.storey_placement(e.level) else { continue };
             let rot = DVec2::from_angle(c.rotation_deg.to_radians());
             let placement = self.local_placement(
                 Some(storey),
                 Frame::horizontal(DVec3::new(c.position.x, c.position.y, c.base_offset), rot),
             );
-            let mut parts = cc_geom::resolve_component(def, &c.overrides);
+            let mut parts = cc_geom::resolve_instance(ty, def, e, Some(c), &[]);
             parts.retain(|p| !p.plan_only);
             // Shapes mix no representation types: with any mesh piece, all pieces are face sets.
             let tessellated = parts.iter().any(|p| !p.faces.is_empty());
@@ -1129,20 +1550,22 @@ impl<'a> Exporter<'a> {
             self.register(e, product);
             // Instance parameter values, so importers can restore overrides.
             let values = def.values(&c.overrides);
+            let texts = def.texts(&c.text_overrides);
             let props: Vec<(&str, Value)> = def
                 .params
                 .iter()
                 .filter(|p| p.instance)
                 .filter_map(|p| {
-                    let v = *values.get(&p.name)?;
-                    let measure = match p.kind {
-                        cc_core::ParamKind::Length => "IFCLENGTHMEASURE",
-                        cc_core::ParamKind::Angle => "IFCPLANEANGLEMEASURE",
-                        cc_core::ParamKind::Number => "IFCREAL",
-                    };
-                    // Angles are stored in radians (the file's angle unit).
-                    let v = if p.kind == cc_core::ParamKind::Angle { v.to_radians() } else { v };
-                    Some((p.name.as_str(), Value::Typed(measure, Box::new(Value::Real(v)))))
+                    use cc_core::ParamKind as K;
+                    let typed = |measure, v| Some((p.name.as_str(), Value::Typed(measure, Box::new(v))));
+                    match p.kind {
+                        K::Text | K::Choice | K::Material => typed("IFCLABEL", Value::Str(texts.get(&p.name)?.clone())),
+                        K::Boolean => typed("IFCBOOLEAN", Value::Bool(*values.get(&p.name)? != 0.0)),
+                        K::Length => typed("IFCLENGTHMEASURE", Value::Real(*values.get(&p.name)?)),
+                        // Angles are stored in radians (the file's angle unit).
+                        K::Angle => typed("IFCPLANEANGLEMEASURE", Value::Real(values.get(&p.name)?.to_radians())),
+                        K::Number => typed("IFCREAL", Value::Real(*values.get(&p.name)?)),
+                    }
                 })
                 .collect();
             self.property_set(&format!("comp-{}", e.id), COMPONENT_PSET, vec![product], props);
@@ -1157,7 +1580,179 @@ impl<'a> Exporter<'a> {
         }
     }
 
-    /// Pipes and conduits: a circle extruded along the run, placed at its start.
+    /// Connections: an `IfcElementAssembly` per connection (`USERDEFINED`,
+    /// its kind's code as `ObjectType`) aggregating an `IfcPlate` per plate
+    /// (boxes as extruded rectangles) and an `IfcMechanicalFastener` per
+    /// bolt (extruded circles, its washers too; `ANCHORBOLT` under base
+    /// plates, else `BOLT`), tied to its member by an
+    /// `IfcRelConnectsElements`. Connections that built nothing are left out.
+    fn write_connections(&mut self) {
+        let project = self.project;
+        let geom = self.geom;
+        let n = Value::Null;
+        let material = cc_geom::connection::steel_material(project).map(str::to_string);
+        for g in geom.connections.values().filter(|g| g.warning.is_none()) {
+            let Some(e) = project.element(g.element) else { continue };
+            let Some(storey) = self.storey_placement(e.level) else { continue };
+            let level_z = project.level_elevation(e.level);
+            let placement = self.local_placement(Some(storey), Frame::at(DVec3::ZERO));
+            let gid = self.guid_of(e.uid, &format!("element-{}", e.id));
+            let assembly = self.w.add(
+                "IFCELEMENTASSEMBLY",
+                args![
+                    gid,
+                    n.clone(),
+                    project.type_name(e.type_id),
+                    opt_str(&e.comments),
+                    g.kind.code(),
+                    placement,
+                    n.clone(),
+                    opt_str(&e.mark),
+                    Value::Enum("NOTDEFINED"),
+                    Value::Enum("USERDEFINED")
+                ],
+            );
+            self.products.insert(e.id, assembly);
+            self.register(e, assembly);
+            let style = self.material_style(material.as_deref().unwrap_or("Steel"));
+            let mut parts = Vec::new();
+            for (i, plate) in g.plates.iter().enumerate() {
+                let items: Vec<Id> = plate.blocks.iter().map(|b| self.block_solid(b, level_z)).collect();
+                for &item in &items {
+                    self.styled(item, style);
+                }
+                let local = self.local_placement(Some(placement), Frame::at(DVec3::ZERO));
+                let shape = self.shape(items, None);
+                let gid = self.guid(&format!("connection-plate-{}-{i}", e.id));
+                let part = self.w.add(
+                    "IFCPLATE",
+                    args![
+                        gid,
+                        n.clone(),
+                        PLATE,
+                        n.clone(),
+                        n.clone(),
+                        local,
+                        shape,
+                        n.clone(),
+                        Value::Enum("NOTDEFINED")
+                    ],
+                );
+                self.connection_part_type(e.type_id, PLATE, "NOTDEFINED", part);
+                parts.push(part);
+            }
+            let (name, predefined) =
+                if g.kind == ConnectionKind::BasePlate { (ANCHOR_BOLT, "ANCHORBOLT") } else { (BOLT, "BOLT") };
+            for (i, bolt) in g.bolts.iter().enumerate() {
+                let items: Vec<Id> = std::iter::once(&bolt.shank)
+                    .chain(&bolt.washers)
+                    .filter_map(|r| self.rod_solid(r, level_z))
+                    .collect();
+                if items.is_empty() {
+                    continue;
+                }
+                for &item in &items {
+                    self.styled(item, style);
+                }
+                let local = self.local_placement(Some(placement), Frame::at(DVec3::ZERO));
+                let shape = self.shape(items, None);
+                let gid = self.guid(&format!("connection-bolt-{}-{i}", e.id));
+                let part = self.w.add(
+                    "IFCMECHANICALFASTENER",
+                    args![
+                        gid,
+                        n.clone(),
+                        name,
+                        n.clone(),
+                        n.clone(),
+                        local,
+                        shape,
+                        n.clone(),
+                        bolt.shank.diameter,
+                        bolt.shank.length(),
+                        Value::Enum(predefined)
+                    ],
+                );
+                self.connection_part_type(e.type_id, name, predefined, part);
+                parts.push(part);
+            }
+            if let Some(material) = &material {
+                let m = self.material(material);
+                self.associate_material(&format!("mat-connection-{}", e.id), parts.clone(), m);
+            }
+            if !parts.is_empty() {
+                self.aggregate(&format!("agg-connection-{}", e.id), assembly, parts);
+            }
+            if let Some(&member) = self.products.get(&g.member) {
+                let gid = self.guid(&format!("connects-{}", e.id));
+                self.w.add(
+                    "IFCRELCONNECTSELEMENTS",
+                    args![gid, n.clone(), n.clone(), n.clone(), n.clone(), member, assembly],
+                );
+            }
+        }
+    }
+
+    /// A connection's box as a rectangle extruded along its third axis, in
+    /// the coordinates of a placement at the level's elevation.
+    fn block_solid(&mut self, b: &cc_geom::connection::Block, level_z: f64) -> Id {
+        let z = b.z();
+        let position2 = self.w.add("IFCAXIS2PLACEMENT2D", args![self.origin2, Value::Null]);
+        let profile = self
+            .w
+            .add("IFCRECTANGLEPROFILEDEF", args![Value::Enum("AREA"), Value::Null, position2, b.size.x, b.size.y]);
+        let origin = b.center - z * (b.size.z / 2.0) - DVec3::Z * level_z;
+        let position = self.placement3(Frame { origin, x: b.x, z });
+        self.w.add("IFCEXTRUDEDAREASOLID", args![profile, position, self.dir_z, b.size.z])
+    }
+
+    /// A bolt or washer as a circle extruded along it (`None` when it has no length).
+    fn rod_solid(&mut self, r: &cc_geom::connection::Rod, level_z: f64) -> Option<Id> {
+        let axis = (r.b - r.a).try_normalize()?;
+        let profile =
+            self.w.add("IFCCIRCLEPROFILEDEF", args![Value::Enum("AREA"), Value::Null, Value::Null, r.diameter / 2.0]);
+        let frame = Frame { origin: r.a - DVec3::Z * level_z, x: axis.any_orthonormal_vector(), z: axis };
+        let position = self.placement3(frame);
+        Some(self.w.add("IFCEXTRUDEDAREASOLID", args![profile, position, self.dir_z, r.length()]))
+    }
+
+    /// The `IfcPlateType` or `IfcMechanicalFastenerType` of a connection
+    /// type's parts named `name` (written once), with `part` among its objects.
+    fn connection_part_type(&mut self, type_id: ElementTypeId, name: &'static str, predefined: &'static str, part: Id) {
+        let key = (type_id, name);
+        if !self.member_types.contains_key(&key) {
+            let n = Value::Null;
+            let gid = self.guid(&format!("connection-type-{type_id}-{name}"));
+            let ty_name = format!("{} - {name}", self.project.type_name(type_id));
+            let mut attrs = args![
+                gid,
+                n.clone(),
+                ty_name,
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                Value::Enum(predefined)
+            ];
+            // IFC4 ADD2 TC1: a fastener type also has NominalDiameter and NominalLength.
+            let entity = if name == PLATE {
+                "IFCPLATETYPE"
+            } else {
+                attrs.extend(args![n.clone(), n]);
+                "IFCMECHANICALFASTENERTYPE"
+            };
+            let t = self.w.add(entity, attrs);
+            self.member_types.insert(key, (t, Vec::new()));
+        }
+        if let Some((_, objects)) = self.member_types.get_mut(&key) {
+            objects.push(part);
+        }
+    }
+
+    /// Pipes and conduits: a circle extruded along the run, placed at its
+    /// start; cable trays: their open channel section extruded the same way.
     fn write_segments(&mut self) {
         let project = self.project;
         let geom = self.geom;
@@ -1167,12 +1762,27 @@ impl<'a> Exporter<'a> {
             let Some(storey) = self.storey_placement(e.level) else { continue };
             let Some(axis) = (g.b - g.a).try_normalize() else { continue };
             let origin = DVec3::new(s.start.x, s.start.y, s.start_offset);
-            let frame = Frame { origin, x: axis.any_orthonormal_vector(), z: axis };
-            let placement = self.local_placement(Some(storey), frame);
-            let profile = self
-                .w
-                .add("IFCCIRCLEPROFILEDEF", args![Value::Enum("AREA"), Value::Null, Value::Null, g.diameter / 2.0]);
-            let item = self.w.add("IFCEXTRUDEDAREASOLID", args![profile, self.identity, self.dir_z, g.length()]);
+            let item = match g.tray {
+                Some(t) => {
+                    // Local X across the tray, Y up (Z × X), Z along the run.
+                    let (side, _) = cc_geom::mep::section_frame(axis);
+                    let placement = self.local_placement(Some(storey), Frame { origin, x: side, z: axis });
+                    let profile = cc_geom::mep::tray_profile(t);
+                    let item = self.extrude_polygon(&profile, self.identity, self.dir_z, g.length());
+                    (placement, item)
+                }
+                None => {
+                    let frame = Frame { origin, x: axis.any_orthonormal_vector(), z: axis };
+                    let placement = self.local_placement(Some(storey), frame);
+                    let args = args![Value::Enum("AREA"), Value::Null, Value::Null, g.diameter / 2.0];
+                    let profile = self.w.add("IFCCIRCLEPROFILEDEF", args);
+                    (
+                        placement,
+                        self.w.add("IFCEXTRUDEDAREASOLID", args![profile, self.identity, self.dir_z, g.length()]),
+                    )
+                }
+            };
+            let (placement, item) = item;
             let color = project.system_color(e);
             let name = e.systems().first().and_then(|id| project.system(*id)).map_or("Generic", |s| s.name.as_str());
             let style = self.style(&format!("system {name}"), color, 0.0);
@@ -1182,6 +1792,13 @@ impl<'a> Exporter<'a> {
                 ElementKind::Conduit(_) => {
                     ("IFCCABLECARRIERSEGMENT", "CONDUITSEGMENT", "Qto_CableCarrierSegmentBaseQuantities")
                 }
+                ElementKind::CableTray(_) => {
+                    ("IFCCABLECARRIERSEGMENT", "CABLETRAYSEGMENT", "Qto_CableCarrierSegmentBaseQuantities")
+                }
+                // Lightning protection conductors are bare conductors.
+                ElementKind::LightningConductor(_) => {
+                    ("IFCCABLESEGMENT", "CONDUCTORSEGMENT", "Qto_CableSegmentBaseQuantities")
+                }
                 _ => ("IFCPIPESEGMENT", "RIGIDSEGMENT", "Qto_PipeSegmentBaseQuantities"),
             };
             let mut attrs = self.element_args(e, placement, shape);
@@ -1190,6 +1807,33 @@ impl<'a> Exporter<'a> {
             self.products.insert(e.id, product);
             self.register(e, product);
             self.quantities(e, qto, &[("Length", Quantity::Length(g.length()))]);
+        }
+    }
+
+    /// Valves: `IfcValve`s whose body (as in the 3D view) is a polygonal face
+    /// set placed at their center, in their pipe's system color.
+    fn write_valves(&mut self) {
+        let project = self.project;
+        let geom = self.geom;
+        for v in geom.valves.values() {
+            let Some(e) = project.element(v.element) else { continue };
+            let Some(storey) = self.storey_placement(e.level) else { continue };
+            let level_z = project.level_elevation(e.level);
+            let faces: Vec<Vec<DVec3>> = cc_geom::mep::valve(&cc_geom::ValveGeom { point: DVec3::ZERO, ..*v });
+            let Some(item) = self.face_set(&faces) else { continue };
+            let color = project.system_color(e);
+            let pipe = project.element(v.host);
+            let system = pipe.and_then(|p| p.systems().first().and_then(|id| project.system(*id)));
+            let style = self.style(&format!("system {}", system.map_or("Generic", |s| s.name.as_str())), color, 0.0);
+            self.styled(item, style);
+            let shape = self.shape_of_type(vec![item], None, "Tessellation");
+            let origin = DVec3::new(v.point.x, v.point.y, v.point.z - level_z);
+            let placement = self.local_placement(Some(storey), Frame::at(origin));
+            let mut attrs = self.element_args(e, placement, shape);
+            attrs.push(Value::Enum(valve_type(v.kind)));
+            let product = self.w.add("IFCVALVE", attrs);
+            self.products.insert(e.id, product);
+            self.register(e, product);
         }
     }
 
@@ -1206,7 +1850,11 @@ impl<'a> Exporter<'a> {
             let Some(storey) = self.storey_placement(f.level) else { continue };
             let level_z = self.project.level_elevation(f.level);
             let pipe = f.category == cc_core::Category::Pipe;
+            let conductor = f.category == cc_core::Category::LightningConductor;
             let (entity, kind, name) = match (pipe, f.kind) {
+                // Lightning conductors meet in clamps: connectors, junctions where they branch.
+                (_, K::Tee | K::Cross) if conductor => ("IFCCABLEFITTING", "JUNCTION", "Junction"),
+                _ if conductor => ("IFCCABLEFITTING", "CONNECTOR", "Connector"),
                 (true, K::Elbow { .. }) => ("IFCPIPEFITTING", "BEND", "Elbow"),
                 (true, K::Tee | K::Cross) => ("IFCPIPEFITTING", "JUNCTION", "Junction"),
                 (true, K::Coupling) => ("IFCPIPEFITTING", "CONNECTOR", "Coupling"),
@@ -1217,10 +1865,18 @@ impl<'a> Exporter<'a> {
                 (false, K::Reducer) => ("IFCCABLECARRIERFITTING", "REDUCER", "Reducer"),
                 (false, K::Coupling) => ("IFCCABLECARRIERFITTING", "NOTDEFINED", "Coupling"),
             };
+            // Cable tray fittings: the channel of the first run, half its width along each branch.
+            let tray = f.runs.first().and_then(|r| geom.segments.get(r)).and_then(|g| g.tray);
             let items: Vec<Id> = f
                 .branches
                 .iter()
                 .filter_map(|&(dir, d)| {
+                    if let Some(t) = tray {
+                        let (side, _) = cc_geom::mep::section_frame(dir);
+                        let position = self.placement3(Frame { origin: DVec3::ZERO, x: side, z: dir });
+                        let profile = cc_geom::mep::tray_profile(cc_geom::TraySection { width: d, ..t });
+                        return (d > 0.0).then(|| self.extrude_polygon(&profile, position, self.dir_z, d * 0.5));
+                    }
                     let x = dir.any_orthonormal_vector();
                     let position = self.placement3(Frame { origin: DVec3::ZERO, x, z: dir });
                     let radius = d * 0.6;
@@ -1254,8 +1910,11 @@ impl<'a> Exporter<'a> {
             written.push((f.system, product));
         }
         for ((entity, kind), objects) in typed {
-            let type_entity =
-                if entity == "IFCPIPEFITTING" { "IFCPIPEFITTINGTYPE" } else { "IFCCABLECARRIERFITTINGTYPE" };
+            let type_entity = match entity {
+                "IFCPIPEFITTING" => "IFCPIPEFITTINGTYPE",
+                "IFCCABLEFITTING" => "IFCCABLEFITTINGTYPE",
+                _ => "IFCCABLECARRIERFITTINGTYPE",
+            };
             let gid = self.guid(&format!("fitting-type-{entity}-{kind}"));
             let name = format!("{} {}", crate::schema::display_name(entity), kind.to_lowercase());
             let ty = self.w.add(
@@ -1286,6 +1945,13 @@ impl<'a> Exporter<'a> {
         for (id, system) in &project.systems {
             let mut members: Vec<Id> =
                 project.system_members(*id).filter_map(|e| self.products.get(&e.id).copied()).collect();
+            // Valves belong to their pipe's system.
+            members.extend(
+                project
+                    .system_members(*id)
+                    .flat_map(|e| project.valves_of(e.id))
+                    .filter_map(|(v, _)| self.products.get(&v.id).copied()),
+            );
             members.extend(fittings.iter().filter(|(s, _)| *s == Some(*id)).map(|(_, p)| *p));
             if let Some(panel) = system.panel.and_then(|p| self.products.get(&p).copied()) {
                 members.insert(0, panel);
@@ -1302,6 +1968,8 @@ impl<'a> Exporter<'a> {
                 K::Rainwater => ("IFCDISTRIBUTIONSYSTEM", "RAINWATER"),
                 K::Power => ("IFCDISTRIBUTIONCIRCUIT", "ELECTRICAL"),
                 K::Lighting => ("IFCDISTRIBUTIONCIRCUIT", "LIGHTING"),
+                K::Data => ("IFCDISTRIBUTIONSYSTEM", "DATA"),
+                K::Lightning => ("IFCDISTRIBUTIONSYSTEM", "LIGHTNINGPROTECTION"),
             };
             let gid = self.guid(&format!("system-{id}"));
             let group = self.w.add(
@@ -1368,7 +2036,11 @@ impl<'a> Exporter<'a> {
                 usage
             }
         };
-        self.usage_objects.entry(usage).or_default().push(product);
+        self.usage_objects
+            .entry(usage)
+            .or_insert_with(|| (format!("mat-usage-layer-{type_id}"), Vec::new()))
+            .1
+            .push(product);
     }
 
     /// The IFC type object for `type_id`, created with its material on first use.
@@ -1383,8 +2055,26 @@ impl<'a> Exporter<'a> {
         let mut base =
             args![gid, n.clone(), ty.name.as_str(), description, n.clone(), n.clone(), n.clone(), n.clone(), n.clone()];
         let (entity, extra): (&str, Vec<Value>) = match ty.data {
-            // Rooms, grids, dimensions and texts have no IFC type object.
-            TypeData::Room {} | TypeData::Grid { .. } | TypeData::Dimension { .. } | TypeData::Text { .. } => {
+            // Rooms, grids, dimensions, texts, detail lines, regions, level marks,
+            // imported drawings, masses, shafts, steel buildings, trusses and pads have no IFC type object.
+            TypeData::Room {}
+            | TypeData::Grid { .. }
+            | TypeData::Dimension { .. }
+            | TypeData::Text { .. }
+            | TypeData::LevelMark { .. }
+            | TypeData::BarTag { .. }
+            | TypeData::CadImport {}
+            | TypeData::DetailLine {}
+            | TypeData::FilledRegion { .. }
+            | TypeData::MaskingRegion {}
+            | TypeData::Mass { .. }
+            | TypeData::Shaft {}
+            | TypeData::SteelBuilding {}
+            | TypeData::Truss {}
+            | TypeData::Bracing {}
+            | TypeData::Connection {}
+            | TypeData::WallFraming {}
+            | TypeData::Pad { .. } => {
                 return None;
             }
             TypeData::Component { ref def, .. } => {
@@ -1404,19 +2094,74 @@ impl<'a> Exporter<'a> {
                 if matches!(&predefined, Value::EnumName(p) if p == "USERDEFINED") {
                     base[8] = Value::Str(class.object_type.clone());
                 }
+                // A native window's panels: how each opens, in the type's property sets.
+                let operation = (layout == TypeLayout::Window && def.ifc.is_none() && def.opening.is_some())
+                    .then(|| def.opening.as_ref().map(|o| o.operation).unwrap_or_default());
+                if let Some(op) = operation {
+                    let mut sets: Vec<Value> = match std::mem::replace(&mut base[5], Value::Null) {
+                        Value::List(sets) => sets,
+                        _ => Vec::new(),
+                    };
+                    for (i, (operation, position)) in op.ifc_panels().iter().enumerate() {
+                        let gid = self.guid(&format!("window-panel-{type_id}-{i}"));
+                        let args = args![
+                            gid,
+                            Value::Null,
+                            format!("Panel {}", i + 1),
+                            Value::Null,
+                            Value::Enum(operation),
+                            Value::Enum(position),
+                            Value::Null,
+                            Value::Null,
+                            Value::Null
+                        ];
+                        sets.push(Value::Ref(self.w.add("IFCWINDOWPANELPROPERTIES", args)));
+                    }
+                    base[5] = Value::List(sets);
+                }
+                // A native door's leaves: how they swing, on the type and as panel properties.
+                let door = (layout == TypeLayout::Door && def.ifc.is_none())
+                    .then(|| def.opening.as_ref().map(|o| o.door_operation))
+                    .flatten();
+                if let Some(op) = door {
+                    let mut sets: Vec<Value> = match std::mem::replace(&mut base[5], Value::Null) {
+                        Value::List(sets) => sets,
+                        _ => Vec::new(),
+                    };
+                    for (i, (position, share)) in op.ifc_panels().iter().enumerate() {
+                        let gid = self.guid(&format!("door-panel-{type_id}-{i}"));
+                        let args = args![
+                            gid,
+                            Value::Null,
+                            format!("Panel {}", i + 1),
+                            Value::Null,
+                            Value::Null,
+                            Value::Enum("SWINGING"),
+                            *share,
+                            Value::Enum(position),
+                            Value::Null
+                        ];
+                        sets.push(Value::Ref(self.w.add("IFCDOORPANELPROPERTIES", args)));
+                    }
+                    base[5] = Value::List(sets);
+                }
+                let door_operation = Value::Enum(door.map_or("NOTDEFINED", |op| op.ifc_operation()));
+                let partitioning = Value::Enum(operation.map_or("NOTDEFINED", |op| op.ifc_partitioning()));
                 let extra = match layout {
                     TypeLayout::Predefined => vec![predefined],
                     TypeLayout::Plain => Vec::new(),
                     // Furniture types also state where they are assembled.
                     TypeLayout::Furniture => vec![Value::Enum("NOTDEFINED"), predefined],
-                    TypeLayout::Door | TypeLayout::Window => {
-                        vec![predefined, Value::Enum("NOTDEFINED"), Value::Null, Value::Null]
-                    }
+                    TypeLayout::Door => vec![predefined, door_operation, Value::Null, Value::Null],
+                    TypeLayout::Window => vec![predefined, partitioning, Value::Null, Value::Null],
                 };
                 (entity, extra)
             }
             TypeData::Pipe { .. } => ("IFCPIPESEGMENTTYPE", args![Value::Enum("RIGIDSEGMENT")]),
             TypeData::Conduit { .. } => ("IFCCABLECARRIERSEGMENTTYPE", args![Value::Enum("CONDUITSEGMENT")]),
+            TypeData::CableTray { .. } => ("IFCCABLECARRIERSEGMENTTYPE", args![Value::Enum("CABLETRAYSEGMENT")]),
+            TypeData::LightningConductor { .. } => ("IFCCABLESEGMENTTYPE", args![Value::Enum("CONDUCTORSEGMENT")]),
+            TypeData::Valve { kind, .. } => ("IFCVALVETYPE", args![Value::Enum(valve_type(kind))]),
             TypeData::Column { .. } => ("IFCCOLUMNTYPE", args![Value::Enum("COLUMN")]),
             TypeData::Beam { .. } => ("IFCBEAMTYPE", args![Value::Enum("BEAM")]),
             TypeData::Rebar { diameter, .. } => {
@@ -1430,6 +2175,16 @@ impl<'a> Exporter<'a> {
             TypeData::Foundation { kind: cc_core::FoundationKind::Pad, .. } => {
                 ("IFCFOOTINGTYPE", args![Value::Enum("PAD_FOOTING")])
             }
+            TypeData::Foundation { kind: cc_core::FoundationKind::PileCap, .. } => {
+                ("IFCFOOTINGTYPE", args![Value::Enum("PILE_CAP")])
+            }
+            TypeData::Pile { kind, .. } => {
+                let (predefined, _, object_type) = pile_ifc(kind);
+                if let (Some(object_type), Some(slot)) = (object_type, base.get_mut(8)) {
+                    *slot = Value::Str(object_type.to_string());
+                }
+                ("IFCPILETYPE", args![Value::Enum(predefined)])
+            }
             TypeData::Foundation { kind: cc_core::FoundationKind::Strip, .. } => {
                 ("IFCFOOTINGTYPE", args![Value::Enum("STRIP_FOOTING")])
             }
@@ -1439,10 +2194,13 @@ impl<'a> Exporter<'a> {
             TypeData::Stair { .. } => ("IFCSTAIRTYPE", args![Value::Enum("STRAIGHT_RUN_STAIR")]),
             TypeData::Ramp { .. } => ("IFCRAMPTYPE", args![Value::Enum("NOTDEFINED")]),
             TypeData::Railing { .. } => ("IFCRAILINGTYPE", args![Value::Enum("GUARDRAIL")]),
+            TypeData::Wall { curtain: Some(_), .. } => ("IFCCURTAINWALLTYPE", args![Value::Enum("NOTDEFINED")]),
             TypeData::Wall { .. } => ("IFCWALLTYPE", args![Value::Enum("STANDARD")]),
             TypeData::Floor { .. } => ("IFCSLABTYPE", args![Value::Enum("FLOOR")]),
             TypeData::Ceiling { .. } => ("IFCCOVERINGTYPE", args![Value::Enum("CEILING")]),
+            TypeData::Sweep { .. } => ("IFCCOVERINGTYPE", args![Value::Enum("MOLDING")]),
             TypeData::Roof { .. } => ("IFCROOFTYPE", args![Value::Enum("NOTDEFINED")]),
+            TypeData::Topography { .. } => ("IFCGEOGRAPHICELEMENTTYPE", args![Value::Enum("TERRAIN")]),
             TypeData::Door { .. } => {
                 ("IFCDOORTYPE", args![Value::Enum("DOOR"), Value::Enum("NOTDEFINED"), Value::Null, Value::Null])
             }
@@ -1467,11 +2225,26 @@ impl<'a> Exporter<'a> {
             | TypeData::Foundation { material, .. }
             | TypeData::Pipe { material, .. }
             | TypeData::Conduit { material, .. }
-            | TypeData::Rebar { material, .. } => Some(self.material(material)),
+            | TypeData::Rebar { material, .. }
+            | TypeData::Pile { material, .. }
+            | TypeData::Topography { material, .. } => Some(self.material(material)),
+            TypeData::CableTray { material, .. }
+            | TypeData::Valve { material, .. }
+            | TypeData::LightningConductor { material, .. }
+                if !material.is_empty() =>
+            {
+                Some(self.material(material))
+            }
+            TypeData::CableTray { .. } | TypeData::Valve { .. } | TypeData::LightningConductor { .. } => None,
             TypeData::Component { def, .. } if !def.main_material().is_empty() => {
                 Some(self.material(def.main_material()))
             }
             TypeData::Component { .. } => None,
+            // A type whose section fails keeps its plain material.
+            TypeData::Column { .. } | TypeData::Beam { .. } => self.profile_set(type_id).or_else(|| {
+                let m = ty.main_material();
+                (!m.is_empty()).then(|| self.material(m))
+            }),
             _ => self.layer_set(type_id),
         };
         if let Some(m) = material {
@@ -1543,6 +2316,10 @@ impl<'a> Exporter<'a> {
             Some(storey),
             Frame::horizontal(DVec3::new(g.origin.x, g.origin.y, g.base_z - level_z), g.dir),
         );
+        if let Some(c) = &g.curtain {
+            self.write_curtain_wall(e, wall, g, c, placement, storey, level_z);
+            return;
+        }
 
         let h = g.half;
         let (body, axis) = if let Some(arc) = g.arc {
@@ -1622,6 +2399,220 @@ impl<'a> Exporter<'a> {
         for o in g.openings.clone() {
             self.write_opening(g, placement, product, &o);
         }
+        for r in g.recesses.clone() {
+            self.write_recess(g, placement, product, &r);
+        }
+    }
+
+    /// A curtain wall: an `IfcCurtainWall` (its axis only) aggregating an
+    /// `IfcPlate` per panel and an `IfcMember` per mullion piece, each a B-rep
+    /// in its material and typed by an `IfcPlateType` or `IfcMemberType` per
+    /// curtain type and kind; the type's grid and the wall's adjustments go in
+    /// [`CURTAIN_PSET`] so importers can rebuild the wall.
+    #[allow(clippy::too_many_arguments)]
+    fn write_curtain_wall(
+        &mut self,
+        e: &Element,
+        wall: &cc_core::Wall,
+        g: &WallGeom,
+        c: &cc_geom::curtain::CurtainGeom,
+        placement: Id,
+        storey: Id,
+        level_z: f64,
+    ) {
+        use cc_core::curtain::{CurtainPanel, GridAxis};
+        let project = self.project;
+        let n = Value::Null;
+        // The axis: the body centerline, a polyline or a trimmed circle.
+        let axis = match g.arc {
+            Some(arc) => {
+                let center = self.point2(wall_local(g, arc.center));
+                let position = self.w.add("IFCAXIS2PLACEMENT2D", args![center, Value::Null]);
+                let circle = self.w.add("IFCCIRCLE", args![position, arc.radius]);
+                let end = self.point2(wall_local(g, g.world(g.length, 0.0)));
+                let sense = arc.sweep >= 0.0;
+                self.w.add(
+                    "IFCTRIMMEDCURVE",
+                    args![circle, vec![self.origin2], vec![end], sense, Value::Enum("CARTESIAN")],
+                )
+            }
+            None => {
+                let end = self.point2(DVec2::new(g.length, 0.0));
+                self.w.add("IFCPOLYLINE", args![vec![self.origin2, end]])
+            }
+        };
+        let rep = self.w.add("IFCSHAPEREPRESENTATION", args![self.axis_ctx, "Axis", "Curve2D", vec![axis]]);
+        let shape = self.w.add("IFCPRODUCTDEFINITIONSHAPE", args![n.clone(), n.clone(), vec![rep]]);
+        let mut attrs = self.element_args(e, placement, shape);
+        attrs.push(Value::Enum("NOTDEFINED"));
+        let product = self.w.add("IFCCURTAINWALL", attrs);
+        self.products.insert(e.id, product);
+        self.register(e, product);
+
+        let ty = project.element_type(e.type_id);
+        let mut props =
+            vec![("Reference", Value::Typed("IFCIDENTIFIER", Box::new(project.type_name(e.type_id).into())))];
+        if let Some(function) = ty.and_then(|t| t.wall_function()) {
+            props.push(("IsExternal", Value::Typed("IFCBOOLEAN", Box::new(function.is_external().into()))));
+        }
+        let status = ifc_status(project, e);
+        self.status_written.insert(e.id);
+        self.property_set_status(&format!("curtain-{}", e.id), "Pset_CurtainWallCommon", vec![product], props, status);
+        if let Some(system) = ty.and_then(|t| t.curtain()) {
+            let text = |s: String| Value::Typed("IFCTEXT", Box::new(s.into()));
+            let props = vec![
+                ("System", text(cc_core::curtain::to_text(system))),
+                ("Edits", text(cc_core::curtain::to_text(&wall.curtain))),
+                ("Height", Value::Typed("IFCLENGTHMEASURE", Box::new(Value::Real(g.top_z - g.base_z)))),
+                ("Bulge", Value::Typed("IFCREAL", Box::new(Value::Real(wall.bulge)))),
+            ];
+            self.property_set(&format!("curtain-grid-{}", e.id), CURTAIN_PSET, vec![product], props);
+        }
+
+        // Panels and mullions as (faces, material, entity, name, predefined type).
+        let solid = || cc_geom::Solid::new(e.id, cc_core::Category::Wall, [0; 3]);
+        let mut pieces: Vec<(Vec<cc_geom::Face>, String, &'static str, &'static str, &'static str)> = Vec::new();
+        for p in &c.panels {
+            let Some(cell) = c.layout.panels.get(p.cell) else { continue };
+            match &cell.panel {
+                CurtainPanel::Glass { thickness, material } | CurtainPanel::Solid { thickness, material } => {
+                    let mut s = solid();
+                    let (d, nrm) = p.frame();
+                    let t = thickness * 0.5;
+                    s.add_box(p.start, d, nrm, 0.0, p.width(), -t, t, p.z.0, p.z.1);
+                    let name = if cell.panel.is_glazed() { "Glass Panel" } else { "Solid Panel" };
+                    pieces.push((s.faces, material.clone(), "IFCPLATE", name, "CURTAIN_PANEL"));
+                }
+                CurtainPanel::Empty => {}
+                CurtainPanel::Component { .. } => {
+                    let mut s = solid();
+                    for part in p.parts.iter().filter(|q| !q.plan_only && !q.void) {
+                        if part.faces.is_empty() {
+                            s.add_prism(&part.footprint, |_| part.z0, |_| part.z1);
+                        } else {
+                            s.add_polygons(part.faces.clone());
+                        }
+                    }
+                    let material = p.parts.first().map_or(String::new(), |q| q.material.clone());
+                    pieces.push((s.faces, material, "IFCPLATE", "Component Panel", "CURTAIN_PANEL"));
+                }
+            }
+        }
+        for m in &c.mullions {
+            let Some(layout) = c.layout.mullions.get(m.piece) else { continue };
+            let mut s = solid();
+            s.add_prism(&m.footprint, |_| m.z.0, |_| m.z.1);
+            let name = match (layout.border, layout.axis) {
+                (true, _) => "Border Mullion",
+                (false, GridAxis::Vertical) => "Vertical Mullion",
+                (false, GridAxis::Horizontal) => "Horizontal Mullion",
+            };
+            pieces.push((s.faces, layout.mullion.material.clone(), "IFCMEMBER", name, "MULLION"));
+        }
+
+        let mut parts = Vec::with_capacity(pieces.len());
+        let mut by_material: BTreeMap<String, Vec<Id>> = BTreeMap::new();
+        for (i, (faces, material, entity, name, kind)) in pieces.into_iter().enumerate() {
+            if faces.is_empty() {
+                continue;
+            }
+            let local = self.local_placement(Some(storey), Frame::at(DVec3::ZERO));
+            let body = self.faceted_brep(&faces, level_z);
+            let style = self.material_style(&material);
+            self.styled(body, style);
+            let shape = self.shape_of_type(vec![body], None, "Brep");
+            let gid = self.guid(&format!("curtain-part-{}-{i}", e.id));
+            let part = self.w.add(
+                entity,
+                args![gid, n.clone(), name, n.clone(), n.clone(), local, shape, n.clone(), Value::Enum(kind)],
+            );
+            parts.push(part);
+            if !material.is_empty() {
+                by_material.entry(material).or_default().push(part);
+            }
+            let key = (e.type_id, name);
+            if !self.member_types.contains_key(&key) {
+                let gid = self.guid(&format!("curtain-type-{}-{name}", e.type_id));
+                let ty_name = format!("{} - {name}", project.type_name(e.type_id));
+                let type_entity = if entity == "IFCPLATE" { "IFCPLATETYPE" } else { "IFCMEMBERTYPE" };
+                let t = self.w.add(
+                    type_entity,
+                    args![
+                        gid,
+                        n.clone(),
+                        ty_name,
+                        n.clone(),
+                        n.clone(),
+                        n.clone(),
+                        n.clone(),
+                        n.clone(),
+                        n.clone(),
+                        Value::Enum(kind)
+                    ],
+                );
+                self.member_types.insert(key, (t, Vec::new()));
+            }
+            if let Some((_, objects)) = self.member_types.get_mut(&key) {
+                objects.push(part);
+            }
+        }
+        for (material, objects) in by_material {
+            let m = self.material(&material);
+            self.associate_material(&format!("mat-curtain-{}-{material}", e.id), objects, m);
+        }
+        if !parts.is_empty() {
+            self.aggregate(&format!("agg-curtain-{}", e.id), product, parts);
+        }
+    }
+
+    /// A niche: an `IfcOpeningElement` `RECESS` voiding its wall from the
+    /// face it is in to its depth (not through the wall), with its sizes in
+    /// [`NICHE_PSET`]. It has no filling.
+    fn write_recess(&mut self, g: &WallGeom, wall_placement: Id, wall: Id, r: &cc_geom::Recess) {
+        let project = self.project;
+        let Some(e) = project.element(r.element) else { return };
+        let (width, height) = (r.u1 - r.u0, r.z1 - r.z0);
+        let (face, back) = r.across(g.half);
+        // Past the face it opens, so the cut is clean; exactly to its back.
+        let out = face + r.side * OPENING_CLEARANCE;
+        let (placement, body) = match g.arc {
+            Some(arc) => {
+                let at = Frame::at(DVec3::new(0.0, 0.0, r.z0 - g.base_z));
+                let placement = self.local_placement(Some(wall_placement), at);
+                // The center is to the left of an arc turning counter-clockwise: stop short of it.
+                let toward_center = if arc.sweep >= 0.0 { 1.0 } else { -1.0 };
+                let out = if r.side == toward_center { r.side * out.abs().min(arc.radius - 1e-3) } else { out };
+                let vs = (out.max(back), out.min(back));
+                let profile = self.wall_outline_profile(g, (r.u0, r.u1), (r.u0, r.u1), vs);
+                (placement, self.w.add("IFCEXTRUDEDAREASOLID", args![profile, self.identity, self.dir_z, height]))
+            }
+            None => {
+                let at = Frame::at(DVec3::new(r.u0, 0.0, r.z0 - g.base_z));
+                let placement = self.local_placement(Some(wall_placement), at);
+                let (lo, hi) = (out.min(back), out.max(back));
+                (placement, self.extrude_box(DVec3::new(0.0, lo, 0.0), DVec3::new(width, hi, height)))
+            }
+        };
+        let shape = self.shape(vec![body], None);
+        let gid = self.guid(&format!("recess-{}", e.id));
+        let n = Value::Null;
+        let name = project.type_name(e.type_id);
+        let opening = self.w.add(
+            "IFCOPENINGELEMENT",
+            args![gid, n.clone(), name, n.clone(), n.clone(), placement, shape, n, Value::Enum("RECESS")],
+        );
+        let gid = self.guid(&format!("voids-{}", e.id));
+        self.w.add("IFCRELVOIDSELEMENT", args![gid, Value::Null, Value::Null, Value::Null, wall, opening]);
+        let length = |v: f64| Value::Typed("IFCLENGTHMEASURE", Box::new(Value::Real(v)));
+        let props = vec![
+            ("Width", length(width)),
+            ("Height", length(height)),
+            ("Depth", length(r.depth)),
+            ("Sill", length(r.z0 - g.base_z)),
+            ("Face", Value::Typed("IFCLABEL", Box::new(if r.side > 0.0 { "LEFT" } else { "RIGHT" }.into()))),
+            ("Volume", Value::Typed("IFCVOLUMEMEASURE", Box::new(Value::Real(g.recess_volume(r))))),
+        ];
+        self.property_set(&format!("niche-{}", e.id), NICHE_PSET, vec![opening], props);
     }
 
     fn write_opening(&mut self, g: &WallGeom, wall_placement: Id, wall: Id, o: &cc_geom::Opening) {
@@ -1664,6 +2655,10 @@ impl<'a> Exporter<'a> {
         );
         let gid = self.guid(&format!("voids-{}", e.id));
         self.w.add("IFCRELVOIDSELEMENT", args![gid, Value::Null, Value::Null, Value::Null, wall, opening]);
+        // A curtain wall standing in the wall is written on its own: the wall only opens.
+        if matches!(e.kind, ElementKind::Wall(_)) {
+            return;
+        }
 
         // The filling shares the opening's frame.
         let fill_placement = self.local_placement(Some(placement), fill_frame);
@@ -1701,12 +2696,17 @@ impl<'a> Exporter<'a> {
         let mut attrs = self.element_args(e, fill_placement, shape);
         attrs.extend(args![type_h, type_w]);
         let (entity, set_name) = match e.kind {
-            ElementKind::Door(_) => {
-                attrs.extend(args![Value::Enum("DOOR"), Value::Enum("NOTDEFINED"), Value::Null]);
+            ElementKind::Door(ref host) => {
+                // The hand as placed: a flipped hand swaps it.
+                let operation = native_door(ty)
+                    .map(|op| if host.flip_hand { op.mirrored() } else { op })
+                    .map_or("NOTDEFINED", |op| op.ifc_operation());
+                attrs.extend(args![Value::Enum("DOOR"), Value::Enum(operation), Value::Null]);
                 ("IFCDOOR", "Qto_DoorBaseQuantities")
             }
             _ => {
-                attrs.extend(args![Value::Enum("WINDOW"), Value::Enum("SINGLE_PANEL"), Value::Null]);
+                let partitioning = ty.window_operation().ifc_partitioning();
+                attrs.extend(args![Value::Enum("WINDOW"), Value::Enum(partitioning), Value::Null]);
                 ("IFCWINDOW", "Qto_WindowBaseQuantities")
             }
         };
@@ -1739,13 +2739,14 @@ impl<'a> Exporter<'a> {
             g.world((left.0 + left.1) * 0.5, v.0),
             g.world(left.0, v.0),
         ];
-        let coords: Vec<Value> = pts
-            .iter()
-            .map(|p| {
-                let q = wall_local(g, *p);
-                reals(&[q.x, q.y])
-            })
-            .collect();
+        self.arc_band_profile(pts.map(|p| wall_local(g, p)))
+    }
+
+    /// A closed profile of two arcs and two lines through `pts` (in the
+    /// placement's coordinates): an arc through the first three points, a
+    /// line to the fourth, an arc through the last three and a line back.
+    fn arc_band_profile(&mut self, pts: [DVec2; 6]) -> Id {
+        let coords: Vec<Value> = pts.iter().map(|q| reals(&[q.x, q.y])).collect();
         let list = self.w.add("IFCCARTESIANPOINTLIST2D", args![coords]);
         let index = |kind: &'static str, ids: &[i64]| {
             Value::Typed(kind, Box::new(Value::List(ids.iter().map(|&i| Value::Int(i)).collect())))
@@ -1789,7 +2790,9 @@ impl<'a> Exporter<'a> {
             }
             // Pitched roofs, and any roof with openings, as their computed solid.
             ElementKind::Roof(r)
-                if matches!(r.shape, RoofShape::Gable { .. } | RoofShape::Hip { .. }) || !r.holes.is_empty() =>
+                if matches!(r.shape, RoofShape::Gable { .. } | RoofShape::Hip { .. })
+                    || !r.holes.is_empty()
+                    || !r.cuts.is_empty() =>
             {
                 self.write_pitched_roof(e, r, storey);
                 return;
@@ -1840,11 +2843,15 @@ impl<'a> Exporter<'a> {
         } else {
             let placement = self.local_placement(Some(storey), frame);
             let dir = self.direction(dir);
-            // Floor openings: voids of the profile, clockwise.
+            // Floor openings and shaft cuts: voids of the profile, clockwise.
+            let holes: Vec<&Vec<DVec2>> = match &e.kind {
+                ElementKind::Floor(f) => f.all_openings().collect(),
+                ElementKind::Ceiling(c) => c.cuts.iter().collect(),
+                _ => Vec::new(),
+            };
             let voids: Vec<Vec<DVec2>> = match &e.kind {
-                ElementKind::Floor(f) => f
-                    .openings
-                    .iter()
+                ElementKind::Floor(_) | ElementKind::Ceiling(_) => holes
+                    .into_iter()
                     .map(|o| {
                         let mut o = polygon::ccw(o);
                         o.reverse();
@@ -1883,7 +2890,7 @@ impl<'a> Exporter<'a> {
                 );
             }
             ElementKind::Ceiling(c) => {
-                let area = polygon::area(&c.boundary);
+                let area = (polygon::area(&c.boundary) - c.cuts.iter().map(|h| polygon::area(h)).sum::<f64>()).max(0.0);
                 self.quantities(
                     e,
                     "Qto_CoveringBaseQuantities",
@@ -1902,6 +2909,10 @@ impl<'a> Exporter<'a> {
                     "Qto_RoofBaseQuantities",
                     &[("GrossArea", Quantity::Area(gross)), ("ProjectedArea", Quantity::Area(projected))],
                 );
+                if let TypeData::Roof { covering, framing, .. } = &ty.data {
+                    let level_z = project.level_elevation(e.level);
+                    self.write_roof_framing(e, product, storey, level_z, *covering, framing);
+                }
             }
             _ => {}
         }
@@ -1913,7 +2924,7 @@ impl<'a> Exporter<'a> {
         let geom = self.geom;
         let Some(ty) = project.element_type(e.type_id) else { return };
         let level_z = project.level_elevation(e.level);
-        let faces: Vec<cc_geom::Face> = geom.solids_of(e.id).flat_map(|s| s.faces.iter().cloned()).collect();
+        let faces: Vec<cc_geom::Face> = geom.body_of(e.id).flat_map(|s| s.faces.iter().cloned()).collect();
         if faces.is_empty() {
             return;
         }
@@ -1946,6 +2957,117 @@ impl<'a> Exporter<'a> {
                 ("ProjectedArea", Quantity::Area(projected)),
             ],
         );
+        if let TypeData::Roof { covering, framing, .. } = &ty.data {
+            self.write_roof_framing(e, product, storey, level_z, *covering, framing);
+        }
+    }
+
+    /// A roof's covering and framing: the type's choices in [`ROOFING_PSET`]
+    /// (so importers can restore them) and each framing member as an
+    /// `IfcMember` (purlin, rafter, batten, or chord, post and strut of a
+    /// truss) aggregated in the roof, as a B-rep in the framing's material.
+    fn write_roof_framing(
+        &mut self,
+        e: &Element,
+        roof: Id,
+        storey: Id,
+        level_z: f64,
+        covering: Option<cc_core::roofing::TileKind>,
+        framing: &cc_core::roofing::RoofFraming,
+    ) {
+        use cc_core::roofing::FramingSystem;
+        use cc_geom::roof_framing::{MemberKind, TrussPart};
+        if covering.is_none() && framing.system == FramingSystem::None {
+            return;
+        }
+        let label = |s: &str| Value::Typed("IFCLABEL", Box::new(s.into()));
+        let length = |v: f64| Value::Typed("IFCLENGTHMEASURE", Box::new(Value::Real(v)));
+        let mut props = vec![("FramingSystem", label(framing.system.code()))];
+        if let Some(c) = covering {
+            props.push(("Covering", label(c.code())));
+        }
+        if !framing.material.is_empty() {
+            props.push(("FramingMaterial", label(&framing.material)));
+        }
+        let sizes = [framing.purlin, framing.rafter, framing.batten, framing.truss];
+        for ((_, w, h), size) in ROOFING_SIZES.iter().zip(sizes) {
+            props.push((w, length(size.width)));
+            props.push((h, length(size.height)));
+        }
+        props.push(("PurlinSpacing", length(framing.purlin_spacing)));
+        props.push(("RafterSpacing", length(framing.rafter_spacing)));
+        props.push(("TrussSpacing", length(framing.truss_spacing)));
+        self.property_set(&format!("roofing-{}", e.id), ROOFING_PSET, vec![roof], props);
+
+        let geom = self.geom;
+        let Some(g) = geom.roof_framing.get(&e.id) else { return };
+        if g.members.is_empty() {
+            return;
+        }
+        let style = self.material_style(&framing.material);
+        let mut members = Vec::with_capacity(g.members.len());
+        for (i, m) in g.members.iter().enumerate() {
+            let (name, kind, object_type) = match (m.kind, m.truss) {
+                (MemberKind::Purlin, _) => ("Purlin", "PURLIN", None),
+                (MemberKind::Rafter, _) => ("Rafter", "RAFTER", None),
+                (MemberKind::Batten, _) => ("Batten", "USERDEFINED", Some("BATTEN")),
+                (MemberKind::Truss, Some(TrussPart::Post)) => ("King Post", "POST", None),
+                (MemberKind::Truss, Some(TrussPart::Strut)) => ("Strut", "STRUT", None),
+                (MemberKind::Truss, Some(TrussPart::Tie)) => ("Tie", "CHORD", None),
+                (MemberKind::Truss, _) => ("Top Chord", "CHORD", None),
+            };
+            let placement = self.local_placement(Some(storey), Frame::at(DVec3::ZERO));
+            let body = self.faceted_brep(&m.faces(), level_z);
+            self.styled(body, style);
+            let shape = self.shape_of_type(vec![body], None, "Brep");
+            let gid = self.guid(&format!("framing-{}-{i}", e.id));
+            let n = Value::Null;
+            let object_type = object_type.map_or(n.clone(), |t| t.into());
+            let member = self.w.add(
+                "IFCMEMBER",
+                args![
+                    gid,
+                    n.clone(),
+                    name,
+                    n.clone(),
+                    object_type.clone(),
+                    placement,
+                    shape,
+                    n.clone(),
+                    Value::Enum(kind)
+                ],
+            );
+            members.push(member);
+            let key = (e.type_id, name);
+            if !self.member_types.contains_key(&key) {
+                let gid = self.guid(&format!("member-type-{}-{name}", e.type_id));
+                let ty_name = format!("{} - {name}", self.project.type_name(e.type_id));
+                let t = self.w.add(
+                    "IFCMEMBERTYPE",
+                    args![
+                        gid,
+                        n.clone(),
+                        ty_name,
+                        n.clone(),
+                        n.clone(),
+                        n.clone(),
+                        n.clone(),
+                        n.clone(),
+                        object_type.clone(),
+                        Value::Enum(kind)
+                    ],
+                );
+                self.member_types.insert(key, (t, Vec::new()));
+            }
+            if let Some((_, objects)) = self.member_types.get_mut(&key) {
+                objects.push(member);
+            }
+        }
+        if !framing.material.is_empty() {
+            let material = self.material(&framing.material);
+            self.associate_material(&format!("mat-framing-{}", e.id), members.clone(), material);
+        }
+        self.aggregate(&format!("agg-framing-{}", e.id), roof, members);
     }
 
     // --- Relationships collected while writing elements ---
@@ -1957,8 +3079,12 @@ impl<'a> Exporter<'a> {
             let gid = self.guid(&format!("deftype-{type_id}"));
             self.w.add("IFCRELDEFINESBYTYPE", args![gid, n.clone(), n.clone(), n.clone(), objects, ty]);
         }
-        for (i, (usage, objects)) in std::mem::take(&mut self.usage_objects).into_iter().enumerate() {
-            self.associate_material(&format!("mat-usage-{i}"), objects, usage);
+        for ((type_id, name), (ty, objects)) in std::mem::take(&mut self.member_types) {
+            let gid = self.guid(&format!("deftype-member-{type_id}-{name}"));
+            self.w.add("IFCRELDEFINESBYTYPE", args![gid, n.clone(), n.clone(), n.clone(), objects, ty]);
+        }
+        for (usage, (tag, objects)) in std::mem::take(&mut self.usage_objects) {
+            self.associate_material(&tag, objects, usage);
         }
         for (level, objects) in std::mem::take(&mut self.contained) {
             let Some(&(storey, _)) = self.storeys.get(&level) else { continue };
@@ -1979,11 +3105,27 @@ struct StructureProduct {
     representation: &'static str,
     quantities: Option<(&'static str, Vec<(&'static str, Quantity)>)>,
     props: Option<(&'static str, Vec<(&'static str, Value)>)>,
+    /// A property set of this program's own, for importers to restore the element.
+    own: Option<(&'static str, Vec<(&'static str, Value)>)>,
+    /// Attributes after the predefined type (a pile's construction type).
+    extra: Vec<Value>,
+    /// The object type of a user-defined predefined type.
+    object_type: Option<String>,
 }
 
 impl StructureProduct {
     fn new(entity: &'static str, kind: &'static str, items: Vec<Id>) -> Self {
-        Self { entity, kind, items, representation: "SweptSolid", quantities: None, props: None }
+        Self {
+            entity,
+            kind,
+            items,
+            representation: "SweptSolid",
+            quantities: None,
+            props: None,
+            own: None,
+            extra: Vec::new(),
+            object_type: None,
+        }
     }
 
     fn quantities(mut self, set: &'static str, quantities: Vec<(&'static str, Quantity)>) -> Self {
@@ -2004,6 +3146,16 @@ enum Quantity {
     Volume(f64),
 }
 
+/// The `IfcValveTypeEnum` of a valve kind: gate and ball valves isolate,
+/// check valves let the flow one way, globe valves regulate it.
+fn valve_type(kind: cc_core::ValveKind) -> &'static str {
+    match kind {
+        cc_core::ValveKind::Gate | cc_core::ValveKind::Ball => "ISOLATING",
+        cc_core::ValveKind::Check => "CHECK",
+        cc_core::ValveKind::Globe => "REGULATING",
+    }
+}
+
 /// The center line a bar is swept along. A closed stirrup starts in the
 /// middle of its first side and stops one diameter short of it, so the swept
 /// disk never meets itself.
@@ -2018,26 +3170,128 @@ fn directrix(bar: &cc_geom::rebar::Bar, diameter: f64) -> Vec<DVec3> {
     std::iter::once(mid).chain(pts[1..].iter().copied()).chain([a, mid + back]).collect()
 }
 
-/// Area of a column section as written: exact circles, profiles as their parts.
-fn section_area(section: cc_core::ColumnSection) -> f64 {
-    use std::f64::consts::PI;
-    match section {
-        cc_core::ColumnSection::Rectangular { width, depth } => width * depth,
-        cc_core::ColumnSection::Round { diameter } => PI * diameter * diameter / 4.0,
-        cc_core::ColumnSection::Pipe { diameter, wall } => {
-            let inner = (diameter / 2.0 - wall).max(0.0);
-            PI * (diameter * diameter / 4.0 - inner * inner)
+/// The area of a type's section as [`Exporter::type_profile`] writes it:
+/// exact when it is a parametric profile (circles, root and corner radii
+/// written as such), else its outline's, whose arcs are chords there too.
+fn section_area(project: &Project, data: &TypeData) -> f64 {
+    let (TypeData::Column { profile_mirror, .. } | TypeData::Beam { profile_mirror, .. }) = data else { return 0.0 };
+    let Some(section) = project.type_section(data) else { return 0.0 };
+    let parametric = section
+        .profile
+        .and_then(|p| project.profile(p))
+        .is_some_and(|d| !*profile_mirror && parametric_profile(&d.shape).is_some());
+    let exact = if parametric { project.exact_section_area(data) } else { None };
+    exact.unwrap_or_else(|| section.outline.properties(0.0).area)
+}
+
+/// Whether a section is a plain rectangle square to its axes (written as a
+/// box rather than as a swept profile).
+fn is_box(outline: &SectionOutline) -> bool {
+    let (lo, hi) = outline.bbox();
+    let size = hi - lo;
+    outline.holes.is_empty()
+        && outline.outer.len() == 4
+        && (polygon::area(&outline.outer).abs() - size.x * size.y).abs() <= 1e-9 * (size.x * size.y).max(1e-12)
+}
+
+/// The IFC4 parametric profile of a shape: its entity and the attributes
+/// after `ProfileType`, `ProfileName` and `Position`. `None` for shapes IFC
+/// has no parametric profile for (asymmetric I, cold-formed channels, Z and
+/// hat sections, concrete T and L, chamfered rectangles and sketches; a
+/// lipped channel IFC's rules refuse), which are written as their outline.
+/// Radii of zero are left unset.
+fn parametric_profile(shape: &ProfileShape) -> Option<(&'static str, Vec<Value>)> {
+    let r = |v: f64| if v > 0.0 { Value::Real(v) } else { Value::Null };
+    let n = || Value::Null;
+    Some(match *shape {
+        ProfileShape::I { d, bf, tw, tf, r: fillet } => {
+            ("IFCISHAPEPROFILEDEF", vec![bf.into(), d.into(), tw.into(), tf.into(), r(fillet), n(), n()])
         }
-        cc_core::ColumnSection::Profile { width, depth, shape } => {
-            cc_geom::section::shape_rects(shape, width, depth).iter().map(|(a, b)| (b.x - a.x) * (b.y - a.y)).sum()
+        ProfileShape::Channel { d, bf, tw, tf, r: fillet } => {
+            ("IFCUSHAPEPROFILEDEF", vec![d.into(), bf.into(), tw.into(), tf.into(), r(fillet), n(), n()])
         }
-    }
+        ProfileShape::T { d, bf, tw, tf, r: fillet } => {
+            ("IFCTSHAPEPROFILEDEF", vec![d.into(), bf.into(), tw.into(), tf.into(), r(fillet), n(), n(), n(), n()])
+        }
+        ProfileShape::Angle { h, b, t, r: fillet } => {
+            ("IFCLSHAPEPROFILEDEF", vec![h.into(), b.into(), t.into(), r(fillet), n(), n()])
+        }
+        // IFC's rules: wall thinner than half the width and a quarter of the
+        // depth, lips shorter than half the depth, the bends inside the walls.
+        ProfileShape::ColdLippedU { d, bf, lip, t, ri }
+            if t < bf / 2.0 && t < d / 4.0 && lip < d / 2.0 && ri <= bf / 2.0 - t && ri <= d / 2.0 - t =>
+        {
+            ("IFCCSHAPEPROFILEDEF", vec![d.into(), bf.into(), t.into(), lip.into(), r(ri)])
+        }
+        ProfileShape::RectTube { h, b, t, ro } => {
+            ("IFCRECTANGLEHOLLOWPROFILEDEF", vec![b.into(), h.into(), t.into(), r((ro - t).max(0.0)), r(ro)])
+        }
+        ProfileShape::RoundTube { d, t } => ("IFCCIRCLEHOLLOWPROFILEDEF", vec![(d / 2.0).into(), t.into()]),
+        ProfileShape::Rect { b, h, chamfer: 0.0 } => ("IFCRECTANGLEPROFILEDEF", vec![b.into(), h.into()]),
+        ProfileShape::Round { d } => ("IFCCIRCLEPROFILEDEF", vec![(d / 2.0).into()]),
+        _ => return None,
+    })
 }
 
 /// Property set with the instance parameter values of components.
 pub const COMPONENT_PSET: &str = "ConstructCAD_Parameters";
+/// Property set of the design option an element belongs to (`OptionSet`,
+/// `Option`, `Primary`).
+pub const DESIGN_OPTION_PSET: &str = "ConstructCAD_DesignOption";
+
 /// Property set of an element's construction phases (`PhaseCreated`, `PhaseDemolished`).
 pub const PHASING_PSET: &str = "ConstructCAD_Phasing";
+/// Property set of a curtain wall's grid: the type's `System` and the wall's
+/// `Edits` as text (see `cc_core::curtain::to_text`), its `Height` and `Bulge`.
+pub const CURTAIN_PSET: &str = "ConstructCAD_Curtain";
+/// Property set of a roof's covering and framing (see `write_roof_framing`).
+pub const ROOFING_PSET: &str = "ConstructCAD_Roofing";
+/// `Category` of the material profile of a cold-formed section (rolled and
+/// cold-formed steel share their materials).
+pub const COLD_FORMED_CATEGORY: &str = "ColdFormed";
+/// A terrain's points, boundary, base depth and type settings, for importers
+/// to rebuild it as terrain (points as `x y z` and the boundary as `x y`,
+/// separated by `;`).
+pub const TOPOGRAPHY_PSET: &str = "ConstructCAD_Topography";
+/// The building pads of a terrain (see `Exporter::pads_set`).
+pub const PADS_PSET: &str = "ConstructCAD_Pads";
+/// Property set of a pile cap: its `Placement` (position in plan and
+/// rotation in degrees), its `Cap` (thickness and `cc_core::pile::PileCap`
+/// without the pile type) as text (see `cc_core::curtain::to_text`), and the
+/// name of its piles' type (`PileType`).
+pub const PILE_CAP_PSET: &str = "ConstructCAD_PileCap";
+/// Property set of a pile: its `Kind` (`cc_core::pile::PileKind::code`), its
+/// `Section` and `Embedment` as text, and for a pile of a cap the cap's
+/// GlobalId (`Cap`) and the pile's place in its layout (`CapIndex`).
+pub const PILE_PSET: &str = "ConstructCAD_Pile";
+
+/// The `IfcPileTypeEnum`, `IfcPileConstructionEnum` and, for a user-defined
+/// type, the object type of a pile kind: bored piles are bored and cast in
+/// place, precast and steel piles driven; augered and micro piles, cast in
+/// place, have no predefined type of their own.
+pub fn pile_ifc(kind: cc_core::pile::PileKind) -> (&'static str, &'static str, Option<&'static str>) {
+    use cc_core::pile::PileKind as K;
+    match kind {
+        K::Bored => ("BORED", "CAST_IN_PLACE", None),
+        K::ContinuousFlightAuger => ("USERDEFINED", "CAST_IN_PLACE", Some("CONTINUOUS_FLIGHT_AUGER")),
+        K::Micro => ("USERDEFINED", "CAST_IN_PLACE", Some("MICROPILE")),
+        K::PrecastDriven => ("DRIVEN", "PRECAST_CONCRETE", None),
+        K::Steel => ("DRIVEN", "PREFAB_STEEL", None),
+        K::Other => ("NOTDEFINED", "NOTDEFINED", None),
+    }
+}
+/// What a reinforcement set says of its bars: `Partition`, `BarMark` (a mark
+/// given by hand), `Mark` (the mark its bars have, when they all have one)
+/// and `Grade` (see `Exporter::write_rebar`).
+pub const REBAR_PSET: &str = "ConstructCAD_Rebar";
+
+/// The framing's member sizes in [`ROOFING_PSET`]: member, width and height properties.
+pub const ROOFING_SIZES: [(&str, &str, &str); 4] = [
+    ("Purlin", "PurlinWidth", "PurlinHeight"),
+    ("Rafter", "RafterWidth", "RafterHeight"),
+    ("Batten", "BattenWidth", "BattenHeight"),
+    ("Truss", "TrussWidth", "TrussHeight"),
+];
 /// Property set of the project's phases, in time order (properties `1`, `2`…).
 pub const PHASES_PSET: &str = "ConstructCAD_Phases";
 
@@ -2068,7 +3322,9 @@ fn common_pset(project: &Project, e: &Element) -> Option<&'static str> {
         ElementKind::Beam(_) => "Pset_BeamCommon",
         ElementKind::Stair(_) => "Pset_StairCommon",
         ElementKind::Ramp(_) => "Pset_RampCommon",
+        ElementKind::Pile(_) => "Pset_PileCommon",
         ElementKind::Railing(_) => "Pset_RailingCommon",
+        ElementKind::Sweep(_) => "Pset_CoveringCommon",
         ElementKind::Foundation(_) => match project.element_type(e.type_id).map(|t| &t.data) {
             Some(TypeData::Foundation { kind: cc_core::FoundationKind::Slab, .. }) => "Pset_SlabCommon",
             _ => "Pset_FootingCommon",
@@ -2101,6 +3357,17 @@ impl WrittenClass {
     }
 }
 
+/// How the leaves of a native door type (one this program made, not an
+/// imported class) swing; `None` for anything else.
+fn native_door(ty: &cc_core::ElementType) -> Option<cc_core::DoorOperation> {
+    match &ty.data {
+        TypeData::Component { def, .. } if def.kind == cc_core::ComponentKind::Door && def.ifc.is_none() => {
+            def.opening.as_ref().map(|o| o.door_operation)
+        }
+        _ => None,
+    }
+}
+
 fn component_class(def: &cc_core::ComponentDef) -> WrittenClass {
     let written = |class: &ElementClass, value: &str, object_type: &str| WrittenClass {
         entity: class.entity,
@@ -2117,15 +3384,15 @@ fn component_class(def: &cc_core::ComponentDef) -> WrittenClass {
         }
         (Some(ifc), Some(proxy)) => written(proxy, "USERDEFINED", &crate::schema::display_name(&ifc.entity)),
         _ => {
-            let (entity, kind) = component_entity(def);
+            let (entity, kind, object_type) = component_entity(def);
             match element_class(entity) {
-                Some(class) => written(class, kind, ""),
+                Some(class) => written(class, kind, object_type),
                 None => WrittenClass {
                     entity,
                     attrs: 9,
                     predefined: Some(8),
                     value: kind.to_string(),
-                    object_type: String::new(),
+                    object_type: object_type.to_string(),
                     type_entity: None,
                 },
             }
@@ -2158,27 +3425,39 @@ fn typed_value(v: &cc_core::properties::IfcValue) -> Value {
     }
 }
 
-/// IFC entity and predefined type of a native component: by its device
-/// kind for electrical devices, else by its component kind.
-fn component_entity(def: &cc_core::ComponentDef) -> (&'static str, &'static str) {
+/// IFC entity, predefined type and object type (for `USERDEFINED`) of a
+/// native component: by its device kind for electrical, communications and
+/// lightning protection devices, else by its component kind. IFC4 has no
+/// class of its own for air terminals and earth electrodes: they are
+/// protective devices of a user-defined type.
+fn component_entity(def: &cc_core::ComponentDef) -> (&'static str, &'static str, &'static str) {
     use cc_core::DeviceKind as D;
     if let Some(device) = def.mep.and_then(|m| m.device()) {
         return match device {
-            D::Outlet | D::DedicatedOutlet => ("IFCOUTLET", "POWEROUTLET"),
-            D::Switch => ("IFCSWITCHINGDEVICE", "TOGGLESWITCH"),
-            D::CeilingLight | D::WallLight => ("IFCLIGHTFIXTURE", "POINTSOURCE"),
-            D::Panel => ("IFCELECTRICDISTRIBUTIONBOARD", "DISTRIBUTIONBOARD"),
+            D::Outlet | D::DedicatedOutlet => ("IFCOUTLET", "POWEROUTLET", ""),
+            D::Switch => ("IFCSWITCHINGDEVICE", "TOGGLESWITCH", ""),
+            D::CeilingLight | D::WallLight => ("IFCLIGHTFIXTURE", "POINTSOURCE", ""),
+            D::Panel => ("IFCELECTRICDISTRIBUTIONBOARD", "DISTRIBUTIONBOARD", ""),
+            D::DataOutlet => ("IFCOUTLET", "DATAOUTLET", ""),
+            D::Rack => ("IFCCOMMUNICATIONSAPPLIANCE", "USERDEFINED", "RACK"),
+            D::AirTerminal => ("IFCPROTECTIVEDEVICE", "USERDEFINED", "AIRTERMINAL"),
+            D::EarthElectrode => ("IFCPROTECTIVEDEVICE", "USERDEFINED", "EARTHELECTRODE"),
         };
     }
-    match def.kind {
+    let (entity, kind) = match def.kind {
         cc_core::ComponentKind::Furniture | cc_core::ComponentKind::Casework => ("IFCFURNITURE", "NOTDEFINED"),
         cc_core::ComponentKind::Plumbing => ("IFCSANITARYTERMINAL", "NOTDEFINED"),
         cc_core::ComponentKind::Lighting => ("IFCLIGHTFIXTURE", "NOTDEFINED"),
         cc_core::ComponentKind::Electrical => ("IFCBUILDINGELEMENTPROXY", "NOTDEFINED"),
-        cc_core::ComponentKind::Generic => ("IFCBUILDINGELEMENTPROXY", "NOTDEFINED"),
+        // A niche is written as its wall's opening, never as a product of its own.
+        cc_core::ComponentKind::Generic
+        | cc_core::ComponentKind::TitleBlock
+        | cc_core::ComponentKind::Detail
+        | cc_core::ComponentKind::Niche => ("IFCBUILDINGELEMENTPROXY", "NOTDEFINED"),
         cc_core::ComponentKind::Door => ("IFCDOOR", "DOOR"),
         cc_core::ComponentKind::Window => ("IFCWINDOW", "WINDOW"),
-    }
+    };
+    (entity, kind, "")
 }
 
 /// Current UTC time as `YYYY-MM-DDThh:mm:ss`.
@@ -2203,6 +3482,23 @@ mod tests {
     use super::*;
     use cc_core::Category;
     use std::collections::HashSet;
+
+    /// Round sections export their exact area (they are written as circle
+    /// profiles; their outlines are chorded), the column quantity with it.
+    #[test]
+    fn round_sections_export_their_exact_area() {
+        let p = cc_core::from_ron(include_str!("../tests/fixtures/structure.ccad")).unwrap();
+        let mut round = 0;
+        for ty in p.types.values() {
+            if !p.section_is_round(&ty.data) {
+                continue;
+            }
+            let Some(exact) = p.exact_section_area(&ty.data) else { continue };
+            round += 1;
+            assert!((section_area(&p, &ty.data) - exact).abs() < 1e-12, "{}", ty.name);
+        }
+        assert!(round >= 2, "the fixture has a round column and a round tube");
+    }
 
     fn sample() -> Project {
         cc_core::from_ron(include_str!("../../../examples/casa_simples.ccad")).unwrap()

@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/cc_core", "crates/cc_geom", "crates/cc_views", "crates/cc_render", "crates/cc_ifc", "crates/cc_engine", "crates/cc_cli", "crates/cc_app"]
+members = ["crates/cc_core", "crates/cc_geom", "crates/cc_views", "crates/cc_render", "crates/cc_raytracing", "crates/cc_ifc", "crates/cc_cad", "crates/cc_skp", "crates/cc_script", "crates/cc_engine", "crates/cc_plugins", "crates/cc_cli", "crates/cc_app"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.12.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 authors = ["Francis Rebouças <francisreboucas@gmail.com>"]
@@ -14,8 +14,13 @@ cc_core = { path = "crates/cc_core" }
 cc_geom = { path = "crates/cc_geom" }
 cc_views = { path = "crates/cc_views" }
 cc_render = { path = "crates/cc_render" }
+cc_raytracing = { path = "crates/cc_raytracing" }
 cc_ifc = { path = "crates/cc_ifc" }
+cc_cad = { path = "crates/cc_cad" }
+cc_skp = { path = "crates/cc_skp" }
+cc_script = { path = "crates/cc_script" }
 cc_engine = { path = "crates/cc_engine" }
+cc_plugins = { path = "crates/cc_plugins" }
 
 eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "persistence", "accesskit", "links", "x11", "wayland"] }
 egui = "0.36.2"
@@ -27,6 +32,7 @@ glam = { version = "0.34.1", features = ["serde", "bytemuck"] }
 serde = { version = "1", features = ["derive"] }
 ron = "0.12.2"
 earcutr = "0.5.0"
+spade = { version = "2.15.1", default-features = false, features = ["std"] }
 rfd = "0.17.2"
 png = "0.18.1"
 bytemuck = { version = "1.25.2", features = ["derive"] }
@@ -36,15 +42,34 @@ schemars = "1"
 log = "0.4"
 sys-locale = "0.3.2"
 env_logger = "0.11"
-resvg = { version = "0.45.1", default-features = false }
+# `raster-images`: pictures in exported PNGs (the decoders `image` brings anyway).
+resvg = { version = "0.45.1", default-features = false, features = ["raster-images"] }
+# Compressing the pixels of pictures in exported PDFs (cc_views).
+miniz_oxide = "0.8.9"
+# Decoding imported pictures (cc_views), the version eframe already uses.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 # Glyph outlines for raster export (cc_views), the version egui already uses.
 skrifa = { version = "0.44.0", default-features = false, features = ["std"] }
 # Text shaping for exported glyphs (the version egui already uses).
 harfrust = "0.12.0"
 # Font subsets embedded in exported PDFs.
 subsetter = { version = "0.2.6", default-features = false }
+# DWG reading (cc_cad), MPL-2.0, pure Rust; without `parallel` (no rayon).
+acadrust = { version = "0.6.8", default-features = false }
+# Code-page text of pre-2007 DXF files (cc_cad), already used by acadrust.
+encoding_rs = "0.8"
 # Update notice (cc_app): HTTPS with rustls, no other TLS stack.
 ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
+# SHA-256 of downloaded updates (cc_app), checked against the release's SHA256SUMS.txt.
+sha2 = "0.10.9"
+# Path tracing of 3D views (cc_raytracing), GPL-3.0-only, pure Rust; it brings rayon, gltf and the
+# `hdr`/`exr` features of `image`.
+sort-raytracing = "0.1.1"
+
+# Lua scripts and plugins (cc_plugins): Lua 5.4 built from source (MIT), no system Lua.
+mlua = { version = "0.11", features = ["lua54", "vendored", "serde"] }
+# Plugin manifests (cc_plugins), the version already in the lock file.
+toml = { version = "1.1.8", default-features = false, features = ["parse", "serde"] }
 
 # Robustness rules (see AGENTS.md): no unsafe, and no panics outside tests.
 [workspace.lints.rust]
@@ -57,3 +82,14 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 unreachable = "deny"
+
+# Dependencies (geometry, wgpu, egui, image decoding) are optimized in debug builds so the app and the
+# tests run at a usable speed; the workspace crates keep the default level and compile quickly.
+[profile.dev.package."*"]
+opt-level = 2
+
+# Release builds trade build time for a smaller, faster binary. Panics still unwind (AGENTS.md:
+# `actions::guard` turns a panic while opening, saving or exporting into an error message).
+[profile.release]
+lto = "thin"
+codegen-units = 1

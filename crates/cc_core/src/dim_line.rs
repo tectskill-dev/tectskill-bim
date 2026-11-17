@@ -108,6 +108,31 @@ pub fn chain(view: ViewId, points: &[DVec2], dir: DVec2, offset: f64, aligned: b
         .collect()
 }
 
+/// The running (ordinate) dimensions from the origin `points[0]` to each
+/// other point, measured along `dir`, all on the line at `offset` from the
+/// origin (left of `dir` positive). `None` when `dir` is degenerate, a value
+/// is not finite, or a point measures nothing from the origin along `dir`
+/// (closer than 1e-6).
+pub fn ordinate(view: ViewId, points: &[DVec2], dir: DVec2, offset: f64) -> Option<Vec<Dimension>> {
+    let dir = dir.try_normalize()?;
+    let (origin, rest) = points.split_first()?;
+    if !offset.is_finite() || rest.is_empty() || points.iter().any(|p| !p.is_finite()) {
+        return None;
+    }
+    rest.iter()
+        .map(|b| {
+            ((*b - *origin).dot(dir).abs() > 1e-6).then(|| Dimension {
+                view,
+                a: *origin,
+                b: *b,
+                offset,
+                kind: DimensionKind::Ordinate { dir },
+                refs: Default::default(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +240,24 @@ mod tests {
         assert!(chain(id, &[DVec2::ZERO, DVec2::new(0.0, 3.0)], DVec2::X, 1.0, false).is_none());
         assert!(chain(id, &[DVec2::ZERO, DVec2::X], DVec2::X, f64::INFINITY, false).is_none());
         assert!(chain(id, &[DVec2::ZERO, DVec2::new(f64::NAN, 0.0)], DVec2::X, 1.0, false).is_none());
+    }
+
+    #[test]
+    fn ordinate_sets_share_their_origin_and_line() {
+        let points = [DVec2::new(1.0, 1.0), DVec2::new(1.6, 1.2), DVec2::new(3.4, 0.9)];
+        let dims = ordinate(ViewId(1), &points, DVec2::new(2.0, 0.0), 0.5).unwrap();
+        assert_eq!(dims.len(), 2);
+        for (d, value) in dims.iter().zip([0.6, 2.4]) {
+            assert_eq!(d.a, points[0]);
+            assert!((d.value() - value).abs() < 1e-12);
+            assert_eq!(d.kind, DimensionKind::Ordinate { dir: DVec2::X });
+            // Every line at y = 1.5.
+            let (pa, pb) = extent(d).unwrap();
+            assert!((pa.y - 1.5).abs() < 1e-12 && (pb.y - 1.5).abs() < 1e-12);
+        }
+        assert!(ordinate(ViewId(1), &points[..1], DVec2::X, 0.5).is_none());
+        assert!(ordinate(ViewId(1), &points, DVec2::ZERO, 0.5).is_none());
+        assert!(ordinate(ViewId(1), &[points[0], DVec2::new(1.0, 5.0)], DVec2::X, 0.5).is_none());
+        assert!(ordinate(ViewId(1), &points, DVec2::X, f64::NAN).is_none());
     }
 }

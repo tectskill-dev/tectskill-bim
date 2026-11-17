@@ -3,29 +3,41 @@
 use super::{edit, patch_value};
 use crate::error::{EngineError, Result};
 use crate::registry::{Command, CommandKind};
-use crate::session::{Session, guard, new_project};
+use crate::session::{Session, guard, new_project_with};
 use crate::t;
-use cc_core::Document;
+use cc_core::{Document, MeasurementSystem};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
-/// Start a new project from the template (unsaved changes are discarded).
+/// Start a new project from a template (unsaved changes are discarded).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectNew {}
+pub struct ProjectNew {
+    /// The template: `metric` (the default; meters, metric sizes) or
+    /// `imperial` (feet and inches, round imperial sizes).
+    #[serde(default)]
+    pub template: Option<String>,
+}
 
 impl Command for ProjectNew {
     const NAME: &'static str = "project_new";
     const KIND: CommandKind = CommandKind::File;
     fn run(self, s: &mut Session) -> Result<Value> {
-        s.replace(Document::new(new_project()));
+        let system = match self.template.as_deref() {
+            None => MeasurementSystem::Metric,
+            Some(code) => MeasurementSystem::from_code(code).ok_or_else(|| {
+                let known: Vec<&str> = MeasurementSystem::ALL.iter().map(|m| m.code()).collect();
+                EngineError::invalid(format!("unknown template '{code}': use {}", known.join(" or ")))
+            })?,
+        };
+        s.replace(Document::new(new_project_with(system)));
         Ok(summary(s))
     }
 }
 
-/// Open a ConstructCAD project (.ccad), replacing the session's project.
+/// Open a ConstructCraft project (.ccad), replacing the session's project.
 /// Damaged files are repaired and the number of repairs reported.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -39,7 +51,8 @@ impl Command for ProjectOpen {
     const KIND: CommandKind = CommandKind::File;
     fn run(self, s: &mut Session) -> Result<Value> {
         let (opened, repairs) = Session::open(&self.path)?;
-        *s = opened;
+        // Replace the document only: plugins and the running command stay.
+        s.replace(opened.doc);
         let mut out = summary(s);
         out["repairs"] = json!(repairs);
         Ok(out)
@@ -92,6 +105,7 @@ fn summary(s: &Session) -> Value {
         "client": i.client,
         "address": i.address,
         "author": i.author,
+        "fields": i.fields.iter().map(|f| (f.name.clone(), json!(f.value))).collect::<serde_json::Map<_, _>>(),
         "path": s.doc.path,
         "unsaved_changes": s.doc.is_dirty(),
         "can_undo": s.doc.undo_name(),
@@ -101,6 +115,7 @@ fn summary(s: &Session) -> Value {
         "types": p.types.len(),
         "views": p.views.len(),
         "materials": p.materials.len(),
+        "system": p.measurement_system().code(),
     })
 }
 
@@ -123,12 +138,39 @@ pub struct ProjectInfoSet {
     /// Author of the drawings.
     #[serde(default)]
     pub author: Option<String>,
+    /// Project fields by name: a text sets the field (adding it; a new name holds no braces and at most 192 bytes), `null` removes it.
+    #[serde(default)]
+    pub fields: Option<serde_json::Map<String, Value>>,
 }
 
 impl Command for ProjectInfoSet {
     const NAME: &'static str = "project_info_set";
     const KIND: CommandKind = CommandKind::Edit;
     fn run(self, s: &mut Session) -> Result<Value> {
+        let mut changes: Vec<(String, Option<String>)> = Vec::new();
+        for (name, value) in self.fields.iter().flatten() {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(EngineError::invalid("a project field needs a name"));
+            }
+            let value = match value {
+                Value::Null => None,
+                Value::String(v) => Some(v.clone()),
+                other => {
+                    return Err(EngineError::invalid(format!("field '{name}': expected text or null, got {other}")));
+                }
+            };
+            // A new field must be one a text can read as `{project:Name}`
+            // (fields already there may still be set or removed).
+            let new = value.is_some() && s.project().info.field(name).is_none();
+            if new && !cc_core::title_block::project_field_name_ok(name) {
+                return Err(EngineError::invalid(format!(
+                    "project field '{name}': a name holds no braces and at most {} bytes",
+                    cc_core::title_block::MAX_FIELD_KEY - cc_core::title_block::PROJECT_FIELD_PREFIX.len()
+                )));
+            }
+            changes.push((name.to_string(), value));
+        }
         edit(s, t!("tx-project-info"), |e| {
             let info = e.info_mut();
             for (field, value) in [
@@ -140,6 +182,20 @@ impl Command for ProjectInfoSet {
             ] {
                 if let Some(v) = value {
                     *field = v;
+                }
+            }
+            for (name, value) in changes {
+                match (info.fields.iter().position(|f| f.name == name), value) {
+                    (Some(i), Some(v)) => {
+                        if let Some(f) = info.fields.get_mut(i) {
+                            f.value = v;
+                        }
+                    }
+                    (Some(i), None) => {
+                        info.fields.remove(i);
+                    }
+                    (None, Some(v)) => info.fields.push(cc_core::ProjectField { name, value: v }),
+                    (None, None) => {}
                 }
             }
             Ok(())
@@ -196,19 +252,33 @@ impl Command for UnitsGet {
 }
 
 /// Change the project units: `values` is merged into the object `units_get`
-/// returns (only the fields given change).
+/// returns (only the fields given change), after `preset` when given.
+/// Length units are `Millimeter`, `Centimeter`, `Meter`, `Foot`, `Inch`,
+/// `FeetInches` (`12'-6 1/2"`) and `FractionalInch`; for the last two,
+/// `decimals` is the precision, 1/2^decimals of an inch.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UnitsSet {
     /// Fields to change, shaped like the result of `units_get`.
+    #[serde(default)]
     pub values: Value,
+    /// Start from `metric` (the defaults) or `imperial` (feet and inches to 1/16", square and cubic feet).
+    #[serde(default)]
+    pub preset: Option<String>,
 }
 
 impl Command for UnitsSet {
     const NAME: &'static str = "units_set";
     const KIND: CommandKind = CommandKind::Edit;
     fn run(self, s: &mut Session) -> Result<Value> {
-        let mut units = patch_value(&s.project().units, &self.values)?;
+        let base = match self.preset.as_deref() {
+            None => s.project().units.clone(),
+            Some("metric") => cc_core::Units::default(),
+            Some("imperial") => cc_core::Units::imperial(),
+            Some(other) => return Err(EngineError::invalid(format!("unknown preset '{other}' (metric or imperial)"))),
+        };
+        let values = if self.values.is_null() { serde_json::json!({}) } else { self.values };
+        let mut units = patch_value(&base, &values)?;
         if units.repair() {
             return Err(EngineError::invalid("invalid unit values"));
         }
@@ -220,11 +290,11 @@ impl Command for UnitsSet {
     }
 }
 
-/// Language of default names, messages and sheet labels (`en`, `pt-BR`, `es`, `fr`, `de`, `it`, `lo`, `pl`, `uk-UA` or `zh-TW`).
+/// Language of default names, messages and sheet labels (`en`, `pt-BR`, `es`, `fr`, `de`, `it`, `lo`, `pl`, `uk-UA`, `zh-TW`, `zh-CN` or `ja`).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LanguageSet {
-    /// Language code: `en`, `pt-BR`, `es`, `fr`, `de`, `it`, `lo`, `pl`, `uk-UA` or `zh-TW`.
+    /// Language code: `en`, `pt-BR`, `es`, `fr`, `de`, `it`, `lo`, `pl`, `uk-UA`, `zh-TW`, `zh-CN` or `ja`.
     pub language: String,
 }
 

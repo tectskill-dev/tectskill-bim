@@ -1,36 +1,41 @@
 //! Views and sheets: create, change, duplicate, delete, place on sheets.
 
 use super::query::view_json;
-use super::{edit, patch_variant};
+use super::{edit, merge, patch_variant};
 use crate::error::{EngineError, Result};
-use crate::refs::{self, Point, Ref, point, positive};
+use crate::refs::{self, Point, Ref, ScaleArg, point, positive};
 use crate::registry::{Command, CommandKind};
 use crate::session::Session;
 use crate::t;
-use cc_core::{CameraState, Direction, Project, SheetSize, View, ViewCategory, ViewId, ViewKind, Viewport};
+use cc_core::{
+    CameraState, Direction, Project, RenderSettings, SheetSize, View, ViewCategory, ViewId, ViewKind, Viewport,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-fn view_out(s: &Session, id: ViewId) -> Value {
+pub(crate) fn view_out(s: &Session, id: ViewId) -> Value {
     view_json(s, id).unwrap_or(json!({ "id": id.0 }))
 }
 
 /// Create a view. `kind` is `floor_plan` or `ceiling_plan` (with `level`),
 /// `section` (with `start`, `end` and optional `depth`), `elevation` (with
 /// `direction`: north, south, east or west), `structural_plan` (with `level`:
-/// a formwork plan of the structure, tagged), `plumbing_plan` and
-/// `electrical_plan` (with `level`: the pipes, or the conduits and devices,
-/// over the architecture, tagged), `three_d`, `analytical` (a 3D
+/// a formwork plan of the structure, tagged), `plumbing_plan`,
+/// `electrical_plan`, `communications_plan` and `lightning_plan` (with
+/// `level`: the pipes, the conduits and devices, the structured cabling, or
+/// the lightning protection, over the architecture, tagged), `three_d`, `analytical` (a 3D
 /// view of the analytical model), `rebar` (a 3D view of the reinforcement), `legend` (all types),
-/// `schedule` (with `category`), `panel_diagram` (with `panel`: the
+/// `drafting` (a 2D view independent of the model, showing only the text,
+/// dimensions and imported drawings placed in it; 1:10 by default), `schedule` (with `category`), `panel_diagram` (with `panel`: the
 /// single-line diagram and load schedule of a distribution board; default
-/// the only board) or `sheet` (A3, numbered after the others).
+/// the only board) or `sheet` (A3, ANSI B in imperial projects, numbered after the others, with
+/// the first title block type).
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ViewCreate {
-    /// `floor_plan`, `ceiling_plan`, `structural_plan`, `plumbing_plan`, `electrical_plan`, `section`,
-    /// `elevation`, `three_d`, `analytical`, `rebar`, `legend`, `schedule`, `panel_diagram` or `sheet`.
+    /// `floor_plan`, `ceiling_plan`, `structural_plan`, `plumbing_plan`, `electrical_plan`,
+    /// `communications_plan`, `lightning_plan`, `section`, `elevation`, `three_d`, `analytical`, `rebar`, `legend`, `drafting`, `schedule`, `panel_diagram` or `sheet`.
     pub kind: String,
     /// View name (default: by kind).
     #[serde(default)]
@@ -53,9 +58,10 @@ pub struct ViewCreate {
     /// Elevations: `north`, `south` (default), `east` or `west`.
     #[serde(default)]
     pub direction: Option<String>,
-    /// Scale denominator (e.g. 50 for 1:50).
+    /// Scale: the denominator (e.g. 50 for 1:50), or text such as `"1:50"`
+    /// or an imperial label like `"1/4\" = 1'-0\""` (48).
     #[serde(default)]
-    pub scale: Option<u32>,
+    pub scale: Option<ScaleArg>,
     /// Distribution board element id, for a panel diagram.
     #[serde(default)]
     pub panel: Option<u64>,
@@ -70,30 +76,38 @@ impl Command for ViewCreate {
     const KIND: CommandKind = CommandKind::Edit;
     fn run(self, s: &mut Session) -> Result<Value> {
         let p = s.project();
+        let given_scale = self.scale.as_ref().map(ScaleArg::ratio).transpose()?;
         let (name, scale, kind, tx) = match self.kind.as_str() {
             "floor_plan" | "ceiling_plan" => {
                 let level = refs::level_or_first(p, self.level.as_ref())?;
-                let kind = if self.kind == "floor_plan" {
-                    ViewKind::floor_plan(level)
-                } else {
-                    ViewKind::CeilingPlan { level, cut_height: 1.2 }
-                };
+                let kind =
+                    if self.kind == "floor_plan" { ViewKind::floor_plan(level) } else { ViewKind::ceiling_plan(level) };
                 (p.level_name(level).to_string(), 50, kind, t!("tx-new-view"))
             }
             "structural_plan" => {
                 let level = refs::level_or_first(p, self.level.as_ref())?;
-                let kind =
-                    ViewKind::FloorPlan { level, cut_height: 1.2, structural: true, structure_tags: true, mep: None };
+                let kind = ViewKind::FloorPlan {
+                    level,
+                    cut_height: 1.2,
+                    structural: true,
+                    structure_tags: true,
+                    mep: None,
+                    underlay: Default::default(),
+                };
                 let name = t!("default-structural-plan-name", "level" => p.level_name(level));
                 (name, 50, kind, t!("tx-new-view"))
             }
-            "plumbing_plan" | "electrical_plan" => {
+            "plumbing_plan" | "electrical_plan" | "communications_plan" | "lightning_plan" => {
                 let level = refs::level_or_first(p, self.level.as_ref())?;
                 let level_name = p.level_name(level);
-                let (discipline, name) = if self.kind == "plumbing_plan" {
-                    (cc_core::MepDiscipline::Plumbing, t!("default-plumbing-plan-name", "level" => level_name))
-                } else {
-                    (cc_core::MepDiscipline::Electrical, t!("default-electrical-plan-name", "level" => level_name))
+                use cc_core::MepDiscipline as D;
+                let (discipline, name) = match self.kind.as_str() {
+                    "plumbing_plan" => (D::Plumbing, t!("default-plumbing-plan-name", "level" => level_name)),
+                    "electrical_plan" => (D::Electrical, t!("default-electrical-plan-name", "level" => level_name)),
+                    "communications_plan" => {
+                        (D::Communications, t!("default-communications-plan-name", "level" => level_name))
+                    }
+                    _ => (D::Lightning, t!("default-lightning-plan-name", "level" => level_name)),
                 };
                 let kind = ViewKind::FloorPlan {
                     level,
@@ -101,6 +115,7 @@ impl Command for ViewCreate {
                     structural: false,
                     structure_tags: false,
                     mep: Some(discipline),
+                    underlay: Default::default(),
                 };
                 (name, 50, kind, t!("tx-new-view"))
             }
@@ -115,7 +130,7 @@ impl Command for ViewCreate {
                 let depth = positive(self.depth.unwrap_or(8.0), "depth")?;
                 let n = count(p, ViewCategory::Section) + 1;
                 let name = t!("default-section-name", "n" => n);
-                (name, 50, ViewKind::Section { start, end, depth }, t!("tx-create-section"))
+                (name, 50, ViewKind::Section { start, end, depth, segments: None }, t!("tx-create-section"))
             }
             "elevation" => {
                 let d = self.direction.as_deref().unwrap_or("south");
@@ -161,6 +176,10 @@ impl Command for ViewCreate {
                 let n = count(p, ViewCategory::Legend) + 1;
                 (t!("default-legend-name", "n" => n), 50, ViewKind::Legend { types }, t!("tx-new-view"))
             }
+            "drafting" => {
+                let n = count(p, ViewCategory::Drafting) + 1;
+                (t!("default-drafting-name", "n" => n), 10, ViewKind::Drafting {}, t!("tx-new-view"))
+            }
             "schedule" => {
                 let category = refs::category(self.category.as_deref().unwrap_or("wall"))?;
                 if !cc_core::Category::SCHEDULABLE.contains(&category) {
@@ -193,13 +212,22 @@ impl Command for ViewCreate {
             }
             "sheet" => {
                 let n = count(p, ViewCategory::Sheet) + 101;
-                let kind = ViewKind::Sheet { number: format!("A{n}"), size: SheetSize::A3, viewports: Vec::new() };
+                let size = SheetSize::default_for(p.measurement_system());
+                let kind = ViewKind::Sheet {
+                    number: format!("A{n}"),
+                    size,
+                    portrait: false,
+                    viewports: Vec::new(),
+                    title_block: p.title_blocks().first().copied(),
+                    fields: Default::default(),
+                    issue_date: String::new(),
+                };
                 (t!("default-sheet-name"), 1, kind, t!("tx-new-sheet"))
             }
             other => return Err(EngineError::invalid(format!("unknown view kind '{other}'"))),
         };
         let name = self.name.unwrap_or(name);
-        let scale = self.scale.unwrap_or(scale).max(1);
+        let scale = given_scale.unwrap_or(scale).max(1);
         let id = edit(s, tx, |e| {
             let id = ViewId(e.alloc_id());
             Ok(e.add_view(View::new(id, name, scale, kind)))
@@ -217,26 +245,93 @@ fn capitalized(s: &str) -> String {
 /// Change a view: name, scale, phase and phase filter, and its `params` as
 /// `view_get` shows them (merged: cut height, section depth, legend types,
 /// schedule fields, sort, filter and totals, sheet number and size,
-/// viewport positions…).
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+/// viewport positions…), the crop, the sun and the render settings.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ViewSet {
     pub view: Ref,
-    /// New name.
+    /// New name. A plan's name is its own: its level and the level's other
+    /// plans keep theirs.
     #[serde(default)]
     pub name: Option<String>,
-    /// Scale denominator (e.g. 100 for 1:100).
+    /// Scale: the denominator (e.g. 100 for 1:100), or text such as
+    /// `"1:100"` or an imperial label like `"1/8\" = 1'-0\""` (96).
     #[serde(default)]
-    pub scale: Option<u32>,
+    pub scale: Option<ScaleArg>,
     /// Fields of the view's parameters to change, shaped like `params` in `view_get`.
     #[serde(default)]
     pub params: Option<Value>,
     /// Phase the view shows (id or name; plans, elevations, sections, 3D views, schedules).
     #[serde(default)]
     pub phase: Option<Ref>,
+    /// Detail level: `coarse` (layered elements cut as one plain region;
+    /// component pieces set for it), `medium` or `fine`.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Visual style: `wireframe` (every edge, no faces), `hidden_line` (white
+    /// faces), `shaded`, `consistent_colors` (material colors, unlit),
+    /// `textures` (appearance colors and surface patterns), or `default`
+    /// (plans hidden line, other views shaded).
+    #[serde(default)]
+    pub visual_style: Option<String>,
     /// Phase filter (id or name), or `null` for none (every status by category).
     #[serde(default, deserialize_with = "refs::nullable", skip_serializing_if = "Option::is_none")]
     pub phase_filter: Option<Option<Ref>>,
+    /// Crop rectangle: two opposite corners in the view's drawing
+    /// coordinates (plans, sections and elevations draw nothing of the model
+    /// outside it), or `null` to show everything. For a detail view this is
+    /// its callout in the parent; for a drafting view a callout points to,
+    /// it moves that callout.
+    #[serde(default, deserialize_with = "refs::nullable", skip_serializing_if = "Option::is_none")]
+    pub crop: Option<Option<[Point; 2]>>,
+    /// The view's sun (plans, ceiling plans, 3D views, elevations and
+    /// sections): the fields to change, shaped like `sun` in `view_get`
+    /// (a view without a sun starts from a still sun on 2026-06-21 at
+    /// 10:00), `{"preset": name}` to take a preset, or `null` to remove it.
+    #[serde(default, deserialize_with = "refs::nullable", skip_serializing_if = "Option::is_none")]
+    pub sun: Option<Option<super::sun::SunArg>>,
+    /// The view's photorealistic render settings (3D views only): the fields
+    /// to change, shaped like `render` in `view_get` (`samples` 1 to 16384,
+    /// `max_depth` 1 to 64, `width`/`height` 16 to 8192 pixels and at most
+    /// 7680x4320 in all, `fov_deg` 10 to 120, `exposure` -10 to 10 stops,
+    /// `tone_map` `Filmic` or `Standard` (or lowercase), `clamp` 0 (off) to 1000, `clay`,
+    /// and `environment` with `sky_strength` and `sun_strength` 0 to 100,
+    /// `ground_color` [r, g, b] and `ground_plane`); a view without settings
+    /// starts from the defaults. `null` removes them.
+    #[serde(default, deserialize_with = "refs::nullable", skip_serializing_if = "Option::is_none")]
+    pub render: Option<Option<Value>>,
+}
+
+/// The render settings `patch` makes of `current` (the defaults when none):
+/// a merge patch over their serde form, refused when it names an unknown
+/// field or leaves a value out of range.
+pub(crate) fn apply_render(current: Option<&RenderSettings>, patch: &Value) -> Result<RenderSettings> {
+    let base = current.cloned().unwrap_or_default();
+    let mut value = serde_json::to_value(&base).map_err(|e| EngineError::invalid(e.to_string()))?;
+    known_fields(&value, patch, "render")?;
+    merge(&mut value, patch);
+    let settings: RenderSettings =
+        serde_json::from_value(value).map_err(|e| EngineError::invalid(format!("render: {e}")))?;
+    if !settings.is_valid() {
+        return Err(EngineError::invalid(t!("msg-render-range")));
+    }
+    Ok(settings)
+}
+
+/// Every key of `patch` is a field of `form` (objects, recursively).
+fn known_fields(form: &Value, patch: &Value, path: &str) -> Result<()> {
+    let (Value::Object(f), Value::Object(p)) = (form, patch) else {
+        return match patch {
+            Value::Object(_) if !form.is_object() => Err(EngineError::invalid(format!("{path}: not an object"))),
+            _ if form.is_object() => Err(EngineError::invalid(format!("{path}: expected an object"))),
+            _ => Ok(()),
+        };
+    };
+    for (k, v) in p {
+        let field = f.get(k).ok_or_else(|| EngineError::invalid(format!("{path}: unknown field '{k}'")))?;
+        known_fields(field, v, &format!("{path}.{k}"))?;
+    }
+    Ok(())
 }
 
 impl Command for ViewSet {
@@ -250,12 +345,30 @@ impl Command for ViewSet {
         if kind.as_ref().is_some_and(|k| std::mem::discriminant(k) != std::mem::discriminant(&view.kind)) {
             return Err(EngineError::invalid("params cannot change the kind of view"));
         }
+        // An underlay shows levels of the project.
+        if let Some(u) = kind.as_ref().and_then(|k| k.underlay())
+            && u.clone().repair(|l| p.levels.iter().any(|x| x.id == l)) > 0
+        {
+            return Err(EngineError::not_found("level"));
+        }
         if let Some(n) = &self.name
             && n.trim().is_empty()
         {
             return Err(EngineError::invalid("the name is empty"));
         }
+        // A schedule's definition within its limits.
+        if let Some(ViewKind::Schedule { def, .. }) = &kind
+            && let Some(message) = def.check()
+        {
+            return Err(EngineError::invalid(message));
+        }
+        let scale = self.scale.as_ref().map(ScaleArg::ratio).transpose()?;
         let phase = self.phase.as_ref().map(|r| refs::phase(p, r)).transpose()?;
+        let detail = self.detail.as_deref().map(refs::detail_level).transpose()?;
+        let visual_style = self.visual_style.as_deref().map(refs::visual_style).transpose()?;
+        if visual_style.is_some() && !cc_core::ViewTemplate::applies_to(&view.kind) {
+            return Err(EngineError::invalid("this view does not show the model"));
+        }
         let phase_filter = match &self.phase_filter {
             Some(Some(r)) => Some(Some(refs::phase_filter(p, r)?)),
             Some(None) => Some(None),
@@ -264,17 +377,47 @@ impl Command for ViewSet {
         if (phase.is_some() || phase_filter.is_some()) && !view.kind.is_phased() {
             return Err(EngineError::invalid("this view has no phase"));
         }
+        let crop = match self.crop {
+            Some(Some(c)) => Some(Some(super::callout::crop_box(c)?)),
+            Some(None) => Some(None),
+            None => None,
+        };
+        let callout_of_drafting = view.is_drafting() && view.callout.is_some();
+        if crop.is_some() && !view.kind.croppable() && !callout_of_drafting {
+            return Err(EngineError::invalid("this view cannot be cropped"));
+        }
+        if crop == Some(None) && view.callout.is_some() {
+            return Err(EngineError::invalid(t!("msg-callout-needs-rect")));
+        }
+        let sun = match &self.sun {
+            Some(_) if !view.kind.takes_sun() => return Err(EngineError::invalid(t!("msg-sun-view"))),
+            Some(Some(arg)) => Some(Some(super::sun::apply_sun(p, view.sun.as_ref(), arg)?)),
+            Some(None) => Some(None),
+            None => None,
+        };
+        let render = match &self.render {
+            Some(_) if !view.kind.takes_render() => return Err(EngineError::invalid(t!("msg-render-view"))),
+            Some(Some(patch)) => Some(Some(apply_render(view.render.as_ref(), patch)?)),
+            Some(None) => Some(None),
+            None => None,
+        };
         // Properties the view's template controls stay as the template has them.
         if let Some(t) = view.template.and_then(|t| p.template(t)) {
             let mut new = view.clone();
             if let Some(f) = phase_filter {
                 new.phase_filter = f;
             }
-            if let Some(sc) = self.scale {
-                new.scale = sc.max(1);
+            if let Some(sc) = scale {
+                new.scale = sc;
             }
             if let Some(k) = &kind {
                 new.kind = k.clone();
+            }
+            if let Some(d) = detail {
+                new.detail = d;
+            }
+            if let Some(st) = visual_style {
+                new.visual_style = st;
             }
             let mut kept = new.clone();
             t.apply(&mut kept);
@@ -287,8 +430,8 @@ impl Command for ViewSet {
             if let Some(n) = self.name {
                 v.name = n.trim().to_string();
             }
-            if let Some(sc) = self.scale {
-                v.scale = sc.max(1);
+            if let Some(sc) = scale {
+                v.scale = sc;
             }
             if let Some(k) = kind {
                 v.kind = k;
@@ -296,8 +439,27 @@ impl Command for ViewSet {
             if let Some(ph) = phase {
                 v.phase = ph;
             }
+            if let Some(d) = detail {
+                v.detail = d;
+            }
+            if let Some(st) = visual_style {
+                v.visual_style = st;
+            }
             if let Some(f) = phase_filter {
                 v.phase_filter = f;
+            }
+            match crop {
+                Some(Some(rect)) if callout_of_drafting => {
+                    v.set_callout_rect(rect);
+                }
+                Some(c) => v.crop = c,
+                None => {}
+            }
+            if let Some(sun) = sun {
+                v.sun = sun;
+            }
+            if let Some(render) = render {
+                v.render = render;
             }
             Ok(())
         })?;
@@ -305,11 +467,19 @@ impl Command for ViewSet {
     }
 }
 
-/// Copy a view (a copied sheet starts without viewports).
+/// Copy a view (a copied sheet starts without viewports), in one undo step.
+/// With `detailing`, what is drawn in it comes along: detail lines, filled
+/// and masking regions, text notes, dimensions (still measuring the same
+/// elements), level marks, detail components and imported drawings; the
+/// result lists them in `copied`.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ViewDuplicate {
+    /// The view to copy (id or name).
     pub view: Ref,
+    /// Copy the elements drawn in the view too (default: only the view).
+    #[serde(default)]
+    pub detailing: bool,
 }
 
 impl Command for ViewDuplicate {
@@ -320,16 +490,37 @@ impl Command for ViewDuplicate {
         let id = refs::view(p, &self.view)?;
         let mut v = p.view(id).cloned().ok_or_else(|| EngineError::not_found("view"))?;
         v.name = t!("copy-of", "name" => v.name);
+        // A callout stands for one view: the copy keeps the crop only.
+        v.callout = None;
         if let ViewKind::Sheet { viewports, number, .. } = &mut v.kind {
             // A view can be placed on only one sheet.
             viewports.clear();
             number.push('a');
         }
-        let new = edit(s, t!("tx-duplicate-view"), |e| {
+        let mut set = match self.detailing {
+            true => {
+                let owned: Vec<_> = p.elements.values().filter(|e| e.owner_view() == Some(id)).map(|e| e.id).collect();
+                p.copy_set(&owned)
+            }
+            false => Vec::new(),
+        };
+        let (new, copied) = edit(s, t!("tx-duplicate-view"), |e| {
             v.id = ViewId(e.alloc_id());
-            Ok(e.add_view(v))
+            let new = e.add_view(v);
+            // The copies take the new view and keep their places.
+            for el in &mut set {
+                el.set_owner_view(new);
+            }
+            let copied = e.paste_elements(&set, &[cc_core::PlanTransform::IDENTITY], None);
+            Ok((new, copied))
         })?;
-        Ok(view_out(s, new))
+        let mut out = view_out(s, new);
+        if self.detailing
+            && let Some(o) = out.as_object_mut()
+        {
+            o.insert("copied".into(), json!(copied.iter().map(|c| c.0).collect::<Vec<_>>()));
+        }
+        Ok(out)
     }
 }
 
@@ -361,7 +552,7 @@ pub fn sheet_of(project: &Project, view: ViewId) -> Option<ViewId> {
     })
 }
 
-fn sheet(p: &Project, r: &Ref) -> Result<ViewId> {
+pub(crate) fn sheet(p: &Project, r: &Ref) -> Result<ViewId> {
     let id = refs::view(p, r)?;
     match p.view(id).map(|v| &v.kind) {
         Some(ViewKind::Sheet { .. }) => Ok(id),
@@ -395,9 +586,10 @@ impl Command for SheetPlaceView {
             return Err(EngineError::rejected(t!("msg-view-already-placed")));
         }
         let center = self.center.map(point).transpose()?;
+        let paper = p.view(sheet_id).and_then(|v| v.paper_mm()).unwrap_or(glam::DVec2::new(420.0, 297.0));
         edit(s, t!("tx-place-view"), |e| {
-            if let Some(ViewKind::Sheet { viewports, size, .. }) = e.view_mut(sheet_id).map(|v| &mut v.kind) {
-                let center = center.unwrap_or(size.size_mm() * glam::DVec2::new(0.4, 0.55));
+            if let Some(ViewKind::Sheet { viewports, .. }) = e.view_mut(sheet_id).map(|v| &mut v.kind) {
+                let center = center.unwrap_or(paper * glam::DVec2::new(0.4, 0.55));
                 viewports.push(Viewport { view, center });
             }
             Ok(())

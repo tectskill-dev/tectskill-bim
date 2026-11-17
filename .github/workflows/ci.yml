@@ -16,9 +16,10 @@ jobs:
     name: Format
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -30,22 +31,30 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      - run: cargo nextest run --workspace --locked --profile ci
+      # nextest does not run doctests
+      - run: cargo test --workspace --doc --locked
 
   ifc:
     name: IFC validation (IfcOpenShell)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
       - name: Install IfcOpenShell (CI only, not a project dependency)
@@ -60,6 +69,10 @@ jobs:
           cargo run --locked -p cc_ifc --example export_ifc -- crates/cc_ifc/tests/fixtures/arcs.ccad target/ifc/arcs.ifc
           cargo run --locked -p cc_ifc --example export_ifc -- crates/cc_ifc/tests/fixtures/roofs.ccad target/ifc/roofs.ifc
           cargo run --locked -p cc_ifc --example export_ifc -- crates/cc_ifc/tests/fixtures/phases.ccad target/ifc/phases.ifc
+          cargo run --locked -p cc_ifc --example export_ifc -- crates/cc_ifc/tests/fixtures/topography.ccad target/ifc/topography.ifc
+          cargo run --locked -p cc_ifc --example export_ifc -- crates/cc_ifc/tests/fixtures/curtains.ccad target/ifc/curtains.ifc
+          cargo run --locked -p cc_ifc --example export_ifc -- crates/cc_ifc/tests/fixtures/profiles.ccad target/ifc/profiles.ifc
+          cargo run --locked -p cc_ifc --example export_ifc -- crates/cc_ifc/tests/fixtures/connections.ccad target/ifc/connections.ifc
           cargo run --locked -p cc_ifc --example export_ifc -- crates/cc_ifc/tests/fixtures/classes.ifc target/ifc/classes.ifc
       - name: Validate
         run: |
@@ -70,8 +83,12 @@ jobs:
           python scripts/validate_ifc.py target/ifc/arcs.ifc
           python scripts/validate_ifc.py target/ifc/roofs.ifc
           python scripts/validate_ifc.py target/ifc/phases.ifc
+          python scripts/validate_ifc.py target/ifc/topography.ifc
+          python scripts/validate_ifc.py target/ifc/curtains.ifc
+          python scripts/validate_ifc.py target/ifc/profiles.ifc
+          python scripts/validate_ifc.py target/ifc/connections.ifc
           python scripts/validate_ifc.py target/ifc/classes.ifc
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: ifc-exports
@@ -82,7 +99,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
       - name: Check Signed-off-by lines

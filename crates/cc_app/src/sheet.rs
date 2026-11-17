@@ -1,6 +1,6 @@
 //! Sheet composer: paper, title block and placed viewports.
 
-use crate::paint::{HIGHLIGHT, PaintOptions, paint_drawing};
+use crate::paint::HIGHLIGHT;
 use crate::state::AppState;
 
 use cc_core::{ViewId, ViewKind};
@@ -28,8 +28,10 @@ pub fn show(ui: &mut Ui, state: &mut AppState, sheet_id: ViewId) {
     let paper_rect = Rect::from_two_pos(to(DVec2::ZERO), to(paper));
     painter.rect_filled(paper_rect.translate(egui::vec2(4.0, 4.0)), 0.0, Color32::from_black_alpha(60));
     painter.rect_filled(paper_rect, 0.0, Color32::WHITE);
-    let opts = PaintOptions { highlight: &BTreeSet::new(), px_per_mm: xf.scale, mono: None, only: None };
-    paint_drawing(&painter.with_clip_rect(paper_rect.intersect(rect)), &sheet.drawing, &xf, &opts);
+    // Kept between frames on whole pixels: what is drawn over it follows.
+    let paper_painter = painter.with_clip_rect(paper_rect.intersect(rect));
+    let xf = state.paint_cache.paint(&paper_painter, sheet_id, &sheet, &sheet.drawing, xf, &BTreeSet::new(), xf.scale);
+    let to = |p: DVec2| xf.to_screen(p);
 
     let placed = &sheet.viewports;
     for p in placed {
@@ -46,7 +48,26 @@ pub fn show(ui: &mut Ui, state: &mut AppState, sheet_id: ViewId) {
     if let Some(cmd) = crate::canvas::view_toolbar(ui, state.zoom_default, rect, sheet_id, None, nav) {
         crate::canvas::zoom(state, sheet_id, cmd, 1.0);
     }
+    resp.context_menu(|ui| {
+        let enabled = crate::title_block_env::sheet_title_block_of(state, sheet_id).is_some();
+        if ui.add_enabled(enabled, egui::Button::new(crate::t!("action-edit-title-block"))).clicked() {
+            crate::title_block_env::edit_sheet(state, sheet_id);
+            ui.close();
+        }
+    });
     if zooming {
+        return;
+    }
+    // A view dragged from the project browser: outline the paper, place it where dropped.
+    if resp.dnd_hover_payload::<crate::browser::ViewDrag>().is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Copy);
+        painter.rect_stroke(paper_rect, 0.0, Stroke::new(2.0, HIGHLIGHT), egui::StrokeKind::Outside);
+    }
+    if let Some(drag) = resp.dnd_release_payload::<crate::browser::ViewDrag>()
+        && let Some(pos) = ui.ctx().pointer_interact_pos()
+    {
+        let center = xf.to_world(pos).clamp(DVec2::ZERO, paper);
+        crate::actions::place_on_sheet_at(state, sheet_id, drag.0, center);
         return;
     }
     // Select and drag viewports.
@@ -57,6 +78,13 @@ pub fn show(ui: &mut Ui, state: &mut AppState, sheet_id: ViewId) {
     if resp.clicked() {
         state.sheet_selection = resp.interact_pointer_pos().and_then(hit).map(|i| (sheet_id, i));
         state.selection.clear();
+    }
+    // A double click on a placed view opens it.
+    if resp.double_clicked()
+        && let Some(i) = resp.interact_pointer_pos().and_then(hit)
+        && let Some(view) = placed.iter().find(|p| p.index == i).map(|p| p.view)
+    {
+        state.open_view(view);
     }
     if resp.drag_started_by(egui::PointerButton::Primary) {
         let origin = ui.input(|i| i.pointer.press_origin());
